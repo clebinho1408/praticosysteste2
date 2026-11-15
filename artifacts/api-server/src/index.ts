@@ -6,6 +6,8 @@ import { sql } from "drizzle-orm";
 import { CPF_NEON_MIGRATION } from "../../../db/cpf-migration.js";
 import { CNH_MODALITY_NEON_SQL } from "../../../db/cnh-exam-modality-migration.js";
 import { YARDS_INTEREST_NEON_SQL } from "../../../db/school-yards-interest-migration.js";
+// @ts-ignore Shared additive migration; outside api-server rootDir.
+import { PII_V3_NEON_SQL } from "../../../db/pii-v3-migration.js";
 
 import { pathToFileURL } from "url";
 
@@ -439,6 +441,7 @@ export async function runMigrations() {
     await db.execute(sql`ALTER TABLE examinadores ADD COLUMN IF NOT EXISTS disponibilidade_rodizio jsonb`);
     await db.execute(sql`ALTER TABLE vagas_cfc ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb`);
     await db.execute(sql`ALTER TABLE vagas_pcd ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb`);
+    await db.execute(sql.raw(PII_V3_NEON_SQL));
 
     logger.info("DB migrations complete");
   } catch (err) {

@@ -12,7 +12,7 @@ import {
   cnhbrasilRequests, cfcRequests, pcdRequests,
   cfcScheduleSlots, pcdScheduleSlots,
 } from "@workspace/db";
-import { eq, and, like, isNotNull, desc, sql } from "drizzle-orm";
+import { eq, and, like, or, isNotNull, desc, sql } from "drizzle-orm";
 import crypto from "crypto";
 import { createHash } from "crypto";
 import type { Response } from "express";
@@ -35,6 +35,8 @@ import { lookupCpf, consumeCpfQuota, cpfSettingError } from "../../../../functio
 import { consumeAuthAttempt, invalidCredentials, validPassword } from "../../../../functions/_auth-security.js";
 import { credentialChange, operationalCleanup } from "../../../../functions/_security-transactions.js";
 import { issuePasswordSession, persistOtpChallenge, consumeOtpSession } from "../../../../functions/_session-issuance.js";
+// @ts-ignore Shared Web Crypto PII encryption helper outside rootDir.
+import { computeCpfHmac, decryptInstructorPii, decryptRequestPii, encryptInstructorPii, encryptRequestPii, maskAuditDetails, maskCpf } from "../../../../db/pii-crypto.js";
 
 function hashCode(code: string): string {
   return createHash('sha256').update(code).digest('hex');
@@ -302,7 +304,7 @@ router.post("/backups", async (req, res) => {
         if (!storedRows || storedRows.length === 0) return res.status(404).json({ error: "Backup não encontrado" });
         restorePayload = storedRows[0].payload;
       }
-      const result = await restoreBackup(db, restorePayload);
+      const result = await restoreBackup(db, restorePayload, { env: process.env });
       return res.json({ success: true, ...result });
     }
     const result = await createBackupSnapshot("manual");
@@ -464,13 +466,19 @@ router.delete("/examiners", async (req, res) => {
 });
 
 // ─── INSTRUCTORS ──────────────────────────────────────────────────────────────
-router.get("/instructors", async (_req, res) => {
+router.get("/instructors", async (req, res) => {
   try {
     const allInstructors = await db.select().from(instructors);
     const allVehicles = await db.select().from(vehicles);
-    const data = allInstructors.map((inst: any) => ({
-      ...inst,
-      vehicles: allVehicles.filter((v: any) => v.instructorId === inst.id)
+    const role = (req as any).sessionUser?.role;
+    const needsMask = role === "CONSULTANT" || role === "EXAMINER";
+    const data = await Promise.all(allInstructors.map(async (inst: any) => {
+      const dec = await decryptInstructorPii(inst, process.env);
+      return {
+        ...dec,
+        ...(needsMask && dec?.cpf ? { cpf: maskCpf(dec.cpf) } : {}),
+        vehicles: allVehicles.filter((v: any) => v.instructorId === inst.id)
+      };
     }));
     return res.json(data);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
@@ -479,7 +487,9 @@ router.post("/instructors", async (req, res) => {
   try {
     const { vehicles: vList, ...instructorData } = req.body;
     const newId = crypto.randomUUID();
-    const item = await db.insert(instructors).values({ id: newId, ...instructorData }).returning();
+    const encryptedData = await encryptInstructorPii(instructorData, process.env);
+    const item = await db.insert(instructors).values({ id: newId, ...encryptedData }).returning();
+    const decryptedItem = await decryptInstructorPii(item[0], process.env);
     let temporaryCredential: { login: string; password: string } | undefined;
     if (instructorData.cpf) {
       const login = instructorData.cpf.replace(/\D/g, "");
@@ -499,13 +509,15 @@ router.post("/instructors", async (req, res) => {
       }
     }
     const allVehicles = await db.select().from(vehicles).where(eq(vehicles.instructorId, newId));
-    return res.json({ ...item[0], vehicles: allVehicles, ...(temporaryCredential ? { temporaryCredential } : {}) });
+    return res.json({ ...decryptedItem, vehicles: allVehicles, ...(temporaryCredential ? { temporaryCredential } : {}) });
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.put("/instructors", async (req, res) => {
   try {
     const { id, createdAt, vehicles: vList, ...updates } = req.body;
-    const item = await db.update(instructors).set(updates).where(eq(instructors.id, id)).returning();
+    const encryptedUpdates = await encryptInstructorPii(updates, process.env);
+    const item = await db.update(instructors).set(encryptedUpdates).where(eq(instructors.id, id)).returning();
+    const decryptedItem = await decryptInstructorPii(item[0], process.env);
     // Sincronizar login do usuário instrutor vinculado quando o CPF muda
     if (updates.cpf !== undefined) {
       try {
@@ -529,7 +541,7 @@ router.put("/instructors", async (req, res) => {
       }
     }
     const allVehicles = await db.select().from(vehicles).where(eq(vehicles.instructorId, id));
-    return res.json({ ...item[0], vehicles: allVehicles });
+    return res.json({ ...decryptedItem, vehicles: allVehicles });
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.delete("/instructors", async (req, res) => {
@@ -700,16 +712,16 @@ function getSlotTable(examType: string) {
   return examType === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
 }
 
-/** Encontra um request pelo ID em qualquer das 3 tabelas de módulo (retorna camelCase via ORM) */
+/** Encontra um request pelo ID em qualquer das 3 tabelas de módulo (retorna camelCase via ORM com PII descriptografado) */
 async function findRequestById(id: string): Promise<{ row: any; modulo: string } | null> {
   const [cnhRows, cfcRows, pcdRows] = await Promise.all([
     db.select().from(cnhbrasilRequests).where(eq(cnhbrasilRequests.id, id)).limit(1),
     db.select().from(cfcRequests).where(eq(cfcRequests.id, id)).limit(1),
     db.select().from(pcdRequests).where(eq(pcdRequests.id, id)).limit(1),
   ]);
-  if (cnhRows.length > 0) return { row: cnhRows[0], modulo: 'CNH_BRASIL' };
+  if (cnhRows.length > 0) return { row: await decryptRequestPii(cnhRows[0], process.env), modulo: 'CNH_BRASIL' };
   if (cfcRows.length > 0) return { row: cfcRows[0], modulo: 'CFC' };
-  if (pcdRows.length > 0) return { row: pcdRows[0], modulo: 'PCD' };
+  if (pcdRows.length > 0) return { row: await decryptRequestPii(pcdRows[0], process.env), modulo: 'PCD' };
   return null;
 }
 
@@ -727,21 +739,38 @@ async function findSlotById(id: string): Promise<{ row: any; module: 'CFC' | 'PC
 router.get("/requests", async (req, res) => {
   try {
     const { cpf } = req.query as any;
+    const role = (req as any).sessionUser?.role;
+    const needsMask = role === "CONSULTANT" || role === "EXAMINER";
+    const formatRow = (r: any) => needsMask && r?.cpf ? { ...r, cpf: maskCpf(r.cpf) } : r;
     if (cpf) {
-      const clean = cpf.replace(/\D/g, "");
+      const clean = String(cpf).replace(/\D/g, "");
       const pattern = `%${clean}%`;
+      const hmac = clean.length === 11 ? await computeCpfHmac(clean, process.env) : null;
+      if (hmac) {
+        const [cnhRows, pcdRows] = await Promise.all([
+          db.select().from(cnhbrasilRequests).where(or(eq(cnhbrasilRequests.cpfHmac, hmac), like(cnhbrasilRequests.cpf, pattern))),
+          db.select().from(pcdRequests).where(or(eq(pcdRequests.cpfHmac, hmac), like(pcdRequests.cpf, pattern))),
+        ]);
+        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, process.env)));
+        return res.json(decrypted.map(formatRow));
+      }
       const [cnhRows, pcdRows] = await Promise.all([
-        db.select().from(cnhbrasilRequests).where(like(cnhbrasilRequests.cpf, pattern)),
-        db.select().from(pcdRequests).where(like(pcdRequests.cpf, pattern)),
+        db.select().from(cnhbrasilRequests),
+        db.select().from(pcdRequests),
       ]);
-      return res.json([...cnhRows, ...pcdRows]);
+      const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, process.env)));
+      return res.json(decrypted.filter(r => String(r?.cpf ?? "").replace(/\D/g, "").includes(clean)).map(formatRow));
     }
     const [cnhRows, cfcRows, pcdRows] = await Promise.all([
       db.select().from(cnhbrasilRequests),
       db.select().from(cfcRequests),
       db.select().from(pcdRequests),
     ]);
-    return res.json([...cnhRows, ...cfcRows, ...pcdRows]);
+    const [decCnh, decPcd] = await Promise.all([
+      Promise.all(cnhRows.map(r => decryptRequestPii(r, process.env))),
+      Promise.all(pcdRows.map(r => decryptRequestPii(r, process.env))),
+    ]);
+    return res.json([...decCnh.map(formatRow), ...cfcRows, ...decPcd.map(formatRow)]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.post("/requests", async (req, res) => {
@@ -753,13 +782,16 @@ router.post("/requests", async (req, res) => {
     for (const k of ALLOWED_REQ_FIELDS) { if (body[k] !== undefined) filtered[k] = body[k]; }
     if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
     if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
-    const safeFiltered = stripDroppedFields(filtered, filtered.modulo);
-    const table = getRequestTable(safeFiltered.modulo);
+    const stripped = stripDroppedFields(filtered, filtered.modulo);
+    const valuesToSave = stripped.modulo === "CFC"
+      ? stripped
+      : await encryptRequestPii(stripped, process.env);
+    const table = getRequestTable(valuesToSave.modulo);
     const item = await db.insert(table).values({
-      id: safeFiltered.id || crypto.randomUUID(), ...safeFiltered,
+      id: valuesToSave.id || crypto.randomUUID(), ...valuesToSave,
       createdAt: new Date(), updatedAt: new Date()
     }).returning();
-    const record = item[0] as any;
+    const record = await decryptRequestPii(item[0] as any, process.env);
     if (record?.modulo === 'CNH_BRASIL') {
       try {
         await db.insert(auditLogs).values({
@@ -768,7 +800,7 @@ router.post("/requests", async (req, res) => {
           userName: (req as any).sessionUser.name,
           userRole: (req as any).sessionUser.role,
           action: 'Foi cadastrado', entity: 'CNH_BRASIL_CANDIDATO', entityId: record.id,
-          details: { cpf: record.cpf ?? null, name: record.studentName ?? null },
+          details: { cpf: maskCpf(record.cpf) || null, name: record.studentName ?? null },
         });
       } catch {}
     }
@@ -885,19 +917,25 @@ router.put("/requests", async (req, res) => {
     if (oldModulo !== newModulo) {
       // Módulo mudou: mover linha atomicamente para a tabela destino
       // Merge do registro antigo (camelCase do ORM) com as atualizações
-      const merged = stripDroppedFields(
+      const mergedPlain = stripDroppedFields(
         { ...found?.row, ...updates, modulo: newModulo, updatedAt: new Date() },
         newModulo
       );
+      const mergedToSave = newModulo === "CFC"
+        ? mergedPlain
+        : await encryptRequestPii(mergedPlain, process.env);
       await db.transaction(async (tx) => {
-        await (tx.insert(newTable) as any).values(merged).onConflictDoNothing();
+        await (tx.insert(newTable) as any).values(mergedToSave).onConflictDoNothing();
         await tx.delete(oldTable).where(eq(oldTable.id, id));
       });
-      record = merged;
+      record = await decryptRequestPii(mergedPlain, process.env);
     } else {
-      const safeUpdates = stripDroppedFields(updates, newModulo);
+      const stripped = stripDroppedFields(updates, newModulo);
+      const safeUpdates = newModulo === "CFC"
+        ? stripped
+        : await encryptRequestPii(stripped, process.env);
       const item = await db.update(oldTable).set(safeUpdates).where(eq(oldTable.id, id)).returning();
-      record = item[0];
+      record = await decryptRequestPii(item[0], process.env);
     }
     if (record?.modulo === 'CNH_BRASIL') {
       try {
@@ -922,7 +960,7 @@ router.put("/requests", async (req, res) => {
             userName: (req as any).sessionUser.name,
             userRole: (req as any).sessionUser.role,
             action, entity: 'CNH_BRASIL_CANDIDATO', entityId: record.id,
-            details: { cpf: record.cpf ?? null, name: record.studentName ?? null },
+            details: { cpf: maskCpf(record.cpf) || null, name: record.studentName ?? null },
           });
         }
       } catch {}
@@ -966,7 +1004,7 @@ router.delete("/requests", async (req, res) => {
           userName: (req as any).sessionUser.name,
           userRole: (req as any).sessionUser.role,
           action: 'Foi excluído', entity: 'CNH_BRASIL_CANDIDATO', entityId: id,
-          details: { cpf: found.row?.cpf ?? null, name: found.row?.studentName ?? null },
+          details: { cpf: maskCpf(found.row?.cpf) || null, name: found.row?.studentName ?? null },
         });
       } catch {}
     }
@@ -1427,7 +1465,14 @@ router.get("/cnh-logs", async (req, res) => {
       ORDER BY criado_em DESC
       LIMIT ${limit} OFFSET ${offset}
     `);
-    return res.json((rows as any).rows ?? rows);
+    const resultRows = ((rows as any).rows ?? rows) as any[];
+    return res.json(resultRows.map(r => {
+      let details = r.details;
+      if (typeof details === "string") {
+        try { details = JSON.parse(details); } catch {}
+      }
+      return { ...r, details: maskAuditDetails(details) };
+    }));
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 

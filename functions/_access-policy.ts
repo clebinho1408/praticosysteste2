@@ -5,6 +5,7 @@
  */
 import { eq } from 'drizzle-orm';
 import { examinerCoversRequest } from './_cfc-interest.js';
+import { maskCpf } from '../db/pii-crypto.js';
 
 export class AccessDenied extends Error {
   constructor(public status = 403, message = 'Acesso negado para esta operação.') { super(message); }
@@ -166,7 +167,17 @@ export async function accessPolicy(db: any, schema: any, user: any) {
             'categoryQuantities', 'status', 'attendanceConfirmed', 'createdAt']),
           interestedExaminers: (row.interestedExaminers ?? []).filter((i: any) => i.examinerId === user.examinerId),
         });
-      } else result.push(row);
+      } else {
+        let projected = row;
+        if (projected && typeof projected === 'object') {
+          const needsCpfMask = (user.role === 'CONSULTANT' || user.role === 'EXAMINER') && ['requests', 'instructors'].includes(route);
+          if (Object.hasOwn(projected, 'cpfHmac') || (needsCpfMask && projected.cpf)) {
+            const { cpfHmac: _hidden, ...rest } = projected;
+            projected = needsCpfMask && rest.cpf ? { ...rest, cpf: maskCpf(rest.cpf) } : rest;
+          }
+        }
+        result.push(projected);
+      }
     }
     return result;
   };
@@ -312,7 +323,7 @@ export function sanitizeMutation(route: string, body: any, schema: any) {
   const tables: Record<string, string> = { schools: 'drivingSchools', examiners: 'examiners',
     instructors: 'instructors', cities: 'cities', 'blocked-dates': 'blockedDates', 'exam-locations': 'examLocations', schedules: 'examSchedules' };
   if (tables[route]) {
-    fields = [...Object.keys(schema[tables[route]]).filter(k => !['createdAt', 'updatedAt'].includes(k)), 'createdAt', 'updatedAt'];
+    fields = [...Object.keys(schema[tables[route]]).filter(k => !['createdAt', 'updatedAt', 'cpfHmac'].includes(k)), 'createdAt', 'updatedAt'];
     if (route === 'instructors') fields.push('vehicles');
     if (route === 'schedules') fields.push('sourceSchoolId');
   }

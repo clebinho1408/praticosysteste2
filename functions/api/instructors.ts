@@ -3,6 +3,7 @@ import { getDb, json, error, parseBody, getQuery } from '../_db.js';
 import { instructors, vehicles, users } from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { hashPassword } from '../_password.js';
+import { decryptInstructorPii, encryptInstructorPii } from '../../db/pii-crypto.js';
 
 export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ request, env }) => {
   try {
@@ -15,10 +16,10 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
     if (method === 'GET') {
       const allInstructors = await db.select().from(instructors);
       const allVehicles = await db.select().from(vehicles);
-      const data = allInstructors.map((inst: any) => ({
-        ...inst,
+      const data = await Promise.all(allInstructors.map(async (inst: any) => ({
+        ...(await decryptInstructorPii(inst, env as any)),
         vehicles: allVehicles.filter((v: any) => v.instructorId === inst.id),
-      }));
+      })));
       return json(data);
     }
 
@@ -26,7 +27,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const body = await parseBody<any>(request);
       const { vehicles: vehiclesList, ...instructorData } = body;
       const newId = crypto.randomUUID();
-      const newItem = await db.insert(instructors).values({ id: newId, ...instructorData }).returning();
+      const encryptedData = await encryptInstructorPii(instructorData, env as any);
+      const newItem = await db.insert(instructors).values({ id: newId, ...encryptedData }).returning();
+      const decryptedItem = await decryptInstructorPii(newItem[0], env as any);
       let temporaryCredential: { login: string; password: string } | undefined;
       if (instructorData.cpf) {
         const login = instructorData.cpf.replace(/\D/g, '');
@@ -53,13 +56,15 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           });
         }
       }
-      return json({ ...newItem[0], vehicles: vehiclesList || [], ...(temporaryCredential ? { temporaryCredential } : {}) });
+      return json({ ...decryptedItem, vehicles: vehiclesList || [], ...(temporaryCredential ? { temporaryCredential } : {}) });
     }
 
     if (method === 'PUT') {
       const body = await parseBody<any>(request);
       const { id, vehicles: vehiclesList, createdAt, updatedAt, ...updates } = body;
-      const updated = await db.update(instructors).set(updates).where(eq(instructors.id, id)).returning();
+      const encryptedUpdates = await encryptInstructorPii(updates, env as any);
+      const updated = await db.update(instructors).set(encryptedUpdates).where(eq(instructors.id, id)).returning();
+      const decryptedUpdated = await decryptInstructorPii(updated[0], env as any);
 
       if (Array.isArray(vehiclesList)) {
         await db.delete(vehicles).where(eq(vehicles.instructorId, id));
@@ -75,7 +80,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           });
         }
       }
-      return json({ ...updated[0], vehicles: vehiclesList || [] });
+      return json({ ...decryptedUpdated, vehicles: vehiclesList || [] });
     }
 
     if (method === 'DELETE') {

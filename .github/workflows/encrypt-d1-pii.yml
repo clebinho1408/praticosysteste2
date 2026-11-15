@@ -1,0 +1,144 @@
+name: Proteger CPFs e Dados Sensíveis no D1 (v3)
+
+on:
+  workflow_dispatch:
+    inputs:
+      d1_database_name:
+        description: "Nome do banco D1 criado no Cloudflare (ex: praticosys-db)"
+        required: true
+        default: "praticosys-db"
+        type: string
+      d1_database_id:
+        description: "UUID do banco D1 (opcional: se vazio, busca automaticamente pelo nome)"
+        required: false
+        type: string
+
+jobs:
+  encrypt-pii-v3:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Aplicar schema v3 e criptografar CPFs existentes no D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          DATA_ENCRYPTION_KEY: ${{ secrets.DATA_ENCRYPTION_KEY }}
+          CPF_HMAC_KEY: ${{ secrets.CPF_HMAC_KEY }}
+          D1_DB_NAME: ${{ inputs.d1_database_name }}
+          D1_DB_ID: ${{ inputs.d1_database_id }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Erro: configure CLOUDFLARE_API_TOKEN e CLOUDFLARE_ACCOUNT_ID nos Secrets do GitHub."
+            exit 1
+          fi
+
+          DB_ID="$D1_DB_ID"
+          if [ -z "$DB_ID" ]; then
+            DB_ID=$(npx --yes wrangler@4 d1 list --json | node -e '
+              const fs = require("fs");
+              const list = JSON.parse(fs.readFileSync(0, "utf8"));
+              const target = process.env.D1_DB_NAME;
+              const found = Array.isArray(list) ? list.find(d => d.name === target) : null;
+              if (!found) {
+                console.error("Banco D1 não encontrado:", target);
+                process.exit(1);
+              }
+              process.stdout.write(found.uuid);
+            ')
+          fi
+
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/wrangler-d1.json", JSON.stringify({
+              name: "praticosys-d1-pii-v3",
+              compatibility_date: "2024-09-23",
+              d1_databases: [{
+                binding: "DB",
+                database_name: process.env.D1_DB_NAME,
+                database_id: process.argv[1]
+              }]
+            }, null, 2));
+          ' "$DB_ID"
+
+          META_JSON=$(npx tsx scripts/apply-d1-pii-v3.ts --print-checksum)
+          EXPECTED_VER=$(node -e 'console.log(JSON.parse(process.argv[1]).version)' "$META_JSON")
+          EXPECTED_CHK=$(node -e 'console.log(JSON.parse(process.argv[1]).checksum)' "$META_JSON")
+
+          MIG_JSON=$(npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT versao, checksum FROM migracoes_d1" --json)
+          STATUS=$(node -e '
+            const payload = JSON.parse(process.argv[1]);
+            const rows = (Array.isArray(payload) ? payload[0]?.results : payload?.results) || [];
+            const map = new Map(rows.map(r => [r.versao, r.checksum]));
+            if (!map.has("d1_schema_v1")) { console.log("NO_BASE"); process.exit(0); }
+            if (!map.has(process.argv[2])) { console.log("PENDING"); process.exit(0); }
+            console.log(map.get(process.argv[2]) === process.argv[3] ? "ALREADY_APPLIED" : "MISMATCH");
+          ' "$MIG_JSON" "$EXPECTED_VER" "$EXPECTED_CHK")
+
+          if [ "$STATUS" = "NO_BASE" ]; then
+            echo "Erro: d1_schema_v1 não encontrado em migracoes_d1."
+            rm -f /tmp/wrangler-d1.json
+            exit 1
+          fi
+
+          if [ "$STATUS" = "MISMATCH" ]; then
+            echo "Erro: a versão $EXPECTED_VER já existe com checksum diferente em migracoes_d1."
+            rm -f /tmp/wrangler-d1.json
+            exit 1
+          fi
+
+          if [ "$STATUS" = "ALREADY_APPLIED" ]; then
+            echo "Schema $EXPECTED_VER já está aplicado neste banco D1 ($D1_DB_NAME)."
+          else
+            npx tsx scripts/apply-d1-pii-v3.ts --out /tmp/d1-pii-v3.sql
+            npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --file=/tmp/d1-pii-v3.sql --yes
+          fi
+
+          if [ -z "$DATA_ENCRYPTION_KEY" ]; then
+            echo "AVISO: DATA_ENCRYPTION_KEY não está configurada nos Secrets do GitHub."
+            echo "O schema v3 foi aplicado, mas os registros antigos não foram criptografados ainda."
+            echo "Adicione DATA_ENCRYPTION_KEY (mesma chave do Cloudflare Pages) nos Secrets do GitHub e execute este workflow novamente."
+            rm -f /tmp/d1-pii-v3.sql /tmp/wrangler-d1.json
+            exit 0
+          fi
+
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT id, cpf, cpf_hmac, telefone, email, endereco FROM solicitacoes_cnhbrasil WHERE (cpf IS NOT NULL AND cpf != '' AND (cpf NOT LIKE 'enc:v1:%' OR cpf_hmac IS NULL)) OR (telefone IS NOT NULL AND telefone != '' AND telefone NOT LIKE 'enc:v1:%') OR (email IS NOT NULL AND email != '' AND email NOT LIKE 'enc:v1:%') OR (endereco IS NOT NULL AND endereco != '' AND endereco NOT LIKE 'enc:v1:%')" --json > /tmp/cnh-dump.json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT id, cpf, cpf_hmac, telefone, email, endereco FROM solicitacoes_pcd WHERE (cpf IS NOT NULL AND cpf != '' AND (cpf NOT LIKE 'enc:v1:%' OR cpf_hmac IS NULL)) OR (telefone IS NOT NULL AND telefone != '' AND telefone NOT LIKE 'enc:v1:%') OR (email IS NOT NULL AND email != '' AND email NOT LIKE 'enc:v1:%') OR (endereco IS NOT NULL AND endereco != '' AND endereco NOT LIKE 'enc:v1:%')" --json > /tmp/pcd-dump.json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT id, cpf, cpf_hmac, telefone FROM instrutores WHERE (cpf IS NOT NULL AND cpf != '' AND (cpf NOT LIKE 'enc:v1:%' OR cpf_hmac IS NULL)) OR (telefone IS NOT NULL AND telefone != '' AND telefone NOT LIKE 'enc:v1:%')" --json > /tmp/inst-dump.json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT id, detalhes FROM logs_auditoria WHERE detalhes LIKE '%\"cpf\":\"%' AND detalhes NOT LIKE '%\"cpf\":\"*%'" --json > /tmp/logs-dump.json
+
+          node -e '
+            const fs = require("fs");
+            const extract = (file) => {
+              const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+              return (Array.isArray(parsed) ? parsed[0]?.results : parsed?.results) || [];
+            };
+            fs.writeFileSync("/tmp/pii-dump.json", JSON.stringify({
+              solicitacoes_cnhbrasil: extract("/tmp/cnh-dump.json"),
+              solicitacoes_pcd: extract("/tmp/pcd-dump.json"),
+              instrutores: extract("/tmp/inst-dump.json"),
+              logs_auditoria: extract("/tmp/logs-dump.json"),
+            }));
+          '
+          rm -f /tmp/cnh-dump.json /tmp/pcd-dump.json /tmp/inst-dump.json /tmp/logs-dump.json
+
+          SUMMARY=$(npx tsx scripts/apply-d1-pii-v3.ts --encrypt-dump /tmp/pii-dump.json --out /tmp/d1-encrypt-updates.sql)
+          echo "Resumo da preparação de criptografia: $SUMMARY"
+          TOTAL=$(node -e 'console.log(JSON.parse(process.argv[1]).totalStatements)' "$SUMMARY")
+          if [ "$TOTAL" -gt 0 ]; then
+            npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --file=/tmp/d1-encrypt-updates.sql --yes
+            echo "Dados sensíveis existentes criptografados/mascarados com sucesso!"
+          else
+            echo "Nenhum registro pendente de criptografia encontrado."
+          fi
+
+          rm -f /tmp/d1-pii-v3.sql /tmp/pii-dump.json /tmp/d1-encrypt-updates.sql /tmp/wrangler-d1.json

@@ -8,6 +8,7 @@ import { migrateCnhModalityD1 } from './cnh-exam-modality-migration.js';
 import { migrateYardsInterestD1 } from './school-yards-interest-migration.js';
 import { migrateAuthSecurityD1 } from './auth-security-migration.js';
 import { migrateCleanupV2D1 } from './cleanup-v2-migration.js';
+import { migratePiiV3D1 } from './pii-v3-migration.js';
 import { INITIAL_D1_V1_STATEMENTS } from './d1-v1-baseline.js';
 
 export const D1_NOW = "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))";
@@ -88,6 +89,7 @@ export async function migrateD1(binding: D1Database): Promise<void> {
     await migrateYardsInterestD1(binding);
     await migrateAuthSecurityD1(binding);
     await migrateCleanupV2D1(binding);
+    await migratePiiV3D1(binding);
     return;
   }
   const existing = await binding.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all<{ name: string }>();
@@ -104,4 +106,5 @@ export async function migrateD1(binding: D1Database): Promise<void> {
   await migrateYardsInterestD1(binding);
   await migrateAuthSecurityD1(binding);
   await migrateCleanupV2D1(binding);
+  await migratePiiV3D1(binding);
 }

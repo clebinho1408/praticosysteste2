@@ -7,6 +7,8 @@ import * as schema from '../db/schema.js';
 import { createD1Db, isD1, verifyD1Schema } from './_d1.js';
 import { CNH_MODALITY_NEON_SQL } from '../db/cnh-exam-modality-migration.js';
 import { YARDS_INTEREST_NEON_SQL } from '../db/school-yards-interest-migration.js';
+import { PII_V3_NEON_SQL } from '../db/pii-v3-migration.js';
+import { maskAuditDetails } from '../db/pii-crypto.js';
 import { readJsonBody } from './_request-body.js';
 
 // ─── Migração de renomeação: inglês → português ────────────────────────────────
@@ -103,6 +105,7 @@ export async function ensureColumnMigrations(db: any): Promise<void> {
   await db.execute(sql`CREATE TABLE IF NOT EXISTS cotas_consulta_cpf (id text PRIMARY KEY, janela_minuto integer NOT NULL, consultas integer NOT NULL DEFAULT 0)`);
   await db.execute(sql.raw(CNH_MODALITY_NEON_SQL));
   await db.execute(sql.raw(YARDS_INTEREST_NEON_SQL));
+  await db.execute(sql.raw(PII_V3_NEON_SQL));
   _columnMigrationsReady = true;
 }
 
@@ -179,7 +182,8 @@ export async function writeAuditLog(
       _auditTableReady = true;
     }
     const id = crypto.randomUUID();
-    const det = details ? JSON.stringify(details) : null;
+    const safeDetails = maskAuditDetails(details);
+    const det = safeDetails ? JSON.stringify(safeDetails) : null;
     await db.execute(sql`
       INSERT INTO logs_auditoria (id, usuario_id, nome_usuario, perfil_usuario, acao, entidade, entidade_id, detalhes, criado_em)
       VALUES (

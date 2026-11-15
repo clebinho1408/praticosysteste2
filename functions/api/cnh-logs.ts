@@ -2,6 +2,7 @@
 // Retorna o log de auditoria do módulo CNH do Brasil (candidatos e bancas).
 import { getDb, json, error, getQuery } from '../_db.js';
 import { sql } from 'drizzle-orm';
+import { maskAuditDetails } from '../../db/pii-crypto.js';
 
 export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ request, env }) => {
   if (request.method !== 'GET') return error('Method Not Allowed', 405);
@@ -36,7 +37,14 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       LIMIT ${boundedLimit}
       OFFSET ${boundedOffset}
     `);
-    return json((rows as any).rows ?? rows);
+    const resultRows = ((rows as any).rows ?? rows) as any[];
+    return json(resultRows.map(r => {
+      let details = r.details;
+      if (typeof details === 'string') {
+        try { details = JSON.parse(details); } catch {}
+      }
+      return { ...r, details: maskAuditDetails(details) };
+    }));
   } catch (e: any) {
     return error(e.message ?? 'Erro interno', 500);
   }

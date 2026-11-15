@@ -35,6 +35,8 @@ import { CNH_MODALITY_VERSION, CNH_MODALITY_STATEMENTS, cnhModalityChecksum } fr
 import { YARDS_INTEREST_VERSION, YARDS_INTEREST_STATEMENTS, yardsInterestChecksum } from '../db/school-yards-interest-migration.js';
 import { AUTH_SECURITY_VERSION, AUTH_SECURITY_DDL, authSecurityChecksum } from '../db/auth-security-migration.js';
 import { CLEANUP_V2_VERSION, CLEANUP_V2_STATEMENTS, cleanupV2Checksum } from '../db/cleanup-v2-migration.js';
+import { PII_V3_VERSION, PII_V3_STATEMENTS, piiV3Checksum } from '../db/pii-v3-migration.js';
+import { computeCpfHmac, decryptField, encryptField, isEncryptedValue, maskAuditDetails } from '../db/pii-crypto.js';
 
 const BACKUP_PART_BYTES = 40_000; // Seguro abaixo do limite de 100 KB por statement do D1
 
@@ -112,6 +114,7 @@ async function buildSchemaStatements(): Promise<string[]> {
     yardsChecksum,
     authChecksum,
     cleanupChecksum,
+    piiChecksum,
   ] = await Promise.all([
     d1Checksum(),
     cpfD1Checksum(),
@@ -120,6 +123,7 @@ async function buildSchemaStatements(): Promise<string[]> {
     yardsInterestChecksum(),
     authSecurityChecksum(),
     cleanupV2Checksum(),
+    piiV3Checksum(),
   ]);
 
   return [
@@ -155,6 +159,10 @@ async function buildSchemaStatements(): Promise<string[]> {
     '-- 7) Reorganização e limpeza de schema D1 (v2)',
     ...CLEANUP_V2_STATEMENTS.map(s => `${s.trim()};`),
     `INSERT OR IGNORE INTO "migracoes_d1" ("versao", "checksum", "aplicado_em") VALUES (${sqlString(CLEANUP_V2_VERSION)}, ${sqlString(cleanupChecksum)}, ${sqlString(nowIso)});`,
+    '',
+    '-- 8) Segurança CPF / índice cego HMAC (v3)',
+    ...PII_V3_STATEMENTS.map(s => `${s.trim()};`),
+    `INSERT OR IGNORE INTO "migracoes_d1" ("versao", "checksum", "aplicado_em") VALUES (${sqlString(PII_V3_VERSION)}, ${sqlString(piiChecksum)}, ${sqlString(nowIso)});`,
     '',
   ];
 }
@@ -209,8 +217,12 @@ async function main() {
 
     for (const tableName of tableNames) {
       const pgCols = pgColumnsByTable.get(tableName) ?? new Set<string>();
+      const hasEncryption = Boolean(process.env.DATA_ENCRYPTION_KEY?.trim());
       const targetCols = d1Tables[tableName].filter(col => {
         if (tableName === 'backups' && (col.name === 'tamanho_armazenado_bytes' || col.name === 'checksum_sha256')) {
+          return true;
+        }
+        if (col.name === 'cpf_hmac' && hasEncryption && ['solicitacoes_cnhbrasil', 'solicitacoes_pcd', 'instrutores'].includes(tableName)) {
           return true;
         }
         return pgCols.has(col.name);
@@ -228,7 +240,24 @@ async function main() {
       if (!selectCols) continue;
 
       const dataRes = await pool.query(`SELECT ${selectCols} FROM ${quote(tableName)}`);
-      const rows = dataRes.rows.map(r => extraTaxaBool ? { ...r, taxa_paga: Boolean(r.taxa_paga || r.taxa_paga_bool) } : r);
+      const rows = await Promise.all(dataRes.rows.map(async r => {
+        const next: Record<string, any> = extraTaxaBool ? { ...r, taxa_paga: Boolean(r.taxa_paga || r.taxa_paga_bool) } : { ...r };
+        if (tableName === 'logs_auditoria' && next.detalhes) {
+          const det = typeof next.detalhes === 'string' ? (() => { try { return JSON.parse(next.detalhes); } catch { return next.detalhes; } })() : next.detalhes;
+          next.detalhes = maskAuditDetails(det);
+        }
+        if (hasEncryption && ['solicitacoes_cnhbrasil', 'solicitacoes_pcd', 'instrutores'].includes(tableName)) {
+          const piiFields = tableName === 'instrutores' ? ['cpf', 'telefone'] : ['cpf', 'telefone', 'email', 'endereco'];
+          if (next.cpf !== undefined) {
+            const plainCpf = isEncryptedValue(next.cpf) ? await decryptField(next.cpf, process.env) : next.cpf;
+            next.cpf_hmac = plainCpf ? await computeCpfHmac(plainCpf, process.env) : null;
+          }
+          for (const f of piiFields) {
+            if (next[f] !== undefined) next[f] = await encryptField(next[f], process.env);
+          }
+        }
+        return next;
+      }));
 
       lines.push(`-- Tabela ${tableName}: ${rows.length} registro(s)`);
       if (rows.length === 0) {

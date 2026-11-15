@@ -1,12 +1,13 @@
 // functions/api/requests.ts  →  GET|POST|PUT|DELETE /api/requests
 import { getDb, json, error, parseBody, getQuery, writeAuditLog, extractActor } from '../_db.js';
 import { cnhbrasilRequests, cfcRequests, pcdRequests, examiners, systemSettings, blockedDates, users } from '../../db/schema.js';
-import { eq, like, and } from 'drizzle-orm';
+import { eq, like, and, or } from 'drizzle-orm';
 import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatch, validateConfirmedEdit, hasCandidateIdentity, clearAppointment } from '../_cfc-confirmed.js';
 import { extraEditError, extraPatch } from '../_cfc-extra.js';
 import { interestError, interestPatch } from '../_cfc-interest.js';
 import { modalityValidationError } from '../_cnh-exam-modality.js';
 import { UpdateExamRequestBody } from '../../lib/api-zod/src/generated/api.js';
+import { computeCpfHmac, decryptRequestPii, encryptRequestPii, maskCpf } from '../../db/pii-crypto.js';
 
 const ALLOWED_FIELDS = [
   'id','studentName','socialName','cpf','phone','email','address','city',
@@ -59,16 +60,16 @@ function getRequestTable(modulo: string) {
   return cnhbrasilRequests;
 }
 
-/** Encontra um request pelo ID em qualquer das 3 tabelas — retorna camelCase via ORM */
-async function findRequestById(db: any, id: string): Promise<{ row: any; modulo: string } | null> {
+/** Encontra um request pelo ID em qualquer das 3 tabelas — retorna camelCase via ORM com PII descriptografado */
+async function findRequestById(db: any, id: string, env?: any): Promise<{ row: any; modulo: string } | null> {
   const [cnhRows, cfcRows, pcdRows] = await Promise.all([
     db.select().from(cnhbrasilRequests).where(eq(cnhbrasilRequests.id, id)).limit(1),
     db.select().from(cfcRequests).where(eq(cfcRequests.id, id)).limit(1),
     db.select().from(pcdRequests).where(eq(pcdRequests.id, id)).limit(1),
   ]);
-  if (cnhRows.length > 0) return { row: cnhRows[0], modulo: 'CNH_BRASIL' };
+  if (cnhRows.length > 0) return { row: await decryptRequestPii(cnhRows[0], env), modulo: 'CNH_BRASIL' };
   if (cfcRows.length > 0) return { row: cfcRows[0], modulo: 'CFC' };
-  if (pcdRows.length > 0) return { row: pcdRows[0], modulo: 'PCD' };
+  if (pcdRows.length > 0) return { row: await decryptRequestPii(pcdRows[0], env), modulo: 'PCD' };
   return null;
 }
 
@@ -82,18 +83,32 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (query.cpf) {
         const clean = query.cpf.replace(/\D/g, '');
         const pattern = `%${clean}%`;
+        const hmac = clean.length === 11 ? await computeCpfHmac(clean, env as any) : null;
+        if (hmac) {
+          const [cnhRows, pcdRows] = await Promise.all([
+            db.select().from(cnhbrasilRequests).where(or(eq(cnhbrasilRequests.cpfHmac, hmac), like(cnhbrasilRequests.cpf, pattern))),
+            db.select().from(pcdRequests).where(or(eq(pcdRequests.cpfHmac, hmac), like(pcdRequests.cpf, pattern))),
+          ]);
+          const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, env as any)));
+          return json(decrypted);
+        }
         const [cnhRows, pcdRows] = await Promise.all([
-          db.select().from(cnhbrasilRequests).where(like(cnhbrasilRequests.cpf, pattern)),
-          db.select().from(pcdRequests).where(like(pcdRequests.cpf, pattern)),
+          db.select().from(cnhbrasilRequests),
+          db.select().from(pcdRequests),
         ]);
-        return json([...cnhRows, ...pcdRows]);
+        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, env as any)));
+        return json(decrypted.filter(r => String(r?.cpf ?? '').replace(/\D/g, '').includes(clean)));
       }
       const [cnhRows, cfcRows, pcdRows] = await Promise.all([
         db.select().from(cnhbrasilRequests),
         db.select().from(cfcRequests),
         db.select().from(pcdRequests),
       ]);
-      return json([...cnhRows, ...cfcRows, ...pcdRows]);
+      const [decCnh, decPcd] = await Promise.all([
+        Promise.all(cnhRows.map((r: any) => decryptRequestPii(r, env as any))),
+        Promise.all(pcdRows.map((r: any) => decryptRequestPii(r, env as any))),
+      ]);
+      return json([...decCnh, ...cfcRows, ...decPcd]);
     }
 
     if (method === 'POST') {
@@ -107,18 +122,21 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         filtered.studentName = filtered.studentName || null;
         filtered.phone = filtered.phone || null;
       }
-      const safeFiltered = stripDroppedFields(filtered, filtered.modulo);
-      const table = getRequestTable(safeFiltered.modulo);
+      const stripped = stripDroppedFields(filtered, filtered.modulo);
+      const valuesToSave = stripped.modulo === 'CFC'
+        ? stripped
+        : await encryptRequestPii(stripped, env as any);
+      const table = getRequestTable(valuesToSave.modulo);
       const newItem = await db.insert(table).values({
-        id: safeFiltered.id || crypto.randomUUID(),
-        ...safeFiltered,
+        id: valuesToSave.id || crypto.randomUUID(),
+        ...valuesToSave,
         createdAt: filtered.createdAt ? new Date(filtered.createdAt) : new Date(),
         updatedAt: new Date(),
       }).returning();
-      const record = newItem[0] as any;
+      const record = await decryptRequestPii(newItem[0] as any, env as any);
       if (record?.modulo === 'CNH_BRASIL') {
         await writeAuditLog(db, extractActor(request, data), 'Foi cadastrado', 'CNH_BRASIL_CANDIDATO', record.id, {
-          cpf: record.cpf ?? null,
+          cpf: maskCpf(record.cpf),
           name: record.studentName ?? null,
         });
       }
@@ -138,7 +156,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       }
 
       // Encontra registro atual (camelCase via ORM)
-      const found = await findRequestById(db, id);
+      const found = await findRequestById(db, id, env as any);
       const role = (data as any)?.sessionUserRole;
       if (body.registerInterest || body.removeInterest) {
         if (!UpdateExamRequestBody.safeParse(body).success || (body.registerInterest && body.removeInterest)) {
@@ -223,22 +241,28 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (oldModulo !== newModulo) {
         // Módulo mudou: mover linha atomicamente para a tabela destino
         // Merge camelCase (ORM) + incoming updates + modulo correto
-        const merged = stripDroppedFields(
+        const mergedPlain = stripDroppedFields(
           { ...found?.row, ...filtered, modulo: newModulo, updatedAt: new Date() },
           newModulo
         );
+        const mergedToSave = newModulo === 'CFC'
+          ? mergedPlain
+          : await encryptRequestPii(mergedPlain, env as any);
         await db.batch([
-          db.insert(newTable).values(merged),
+          db.insert(newTable).values(mergedToSave),
           db.delete(oldTable).where(eq(oldTable.id, id)),
         ]);
-        record = merged;
+        record = await decryptRequestPii(mergedPlain, env as any);
       } else {
-        const safeFiltered = stripDroppedFields({ ...filtered, updatedAt: new Date() }, newModulo);
+        const stripped = stripDroppedFields({ ...filtered, updatedAt: new Date() }, newModulo);
+        const toUpdate = newModulo === 'CFC'
+          ? stripped
+          : await encryptRequestPii(stripped, env as any);
         const updated = await db.update(oldTable)
-          .set(safeFiltered)
+          .set(toUpdate)
           .where(eq(oldTable.id, id))
           .returning();
-        record = updated[0];
+        record = await decryptRequestPii(updated[0], env as any);
       }
 
       if ((record?.modulo ?? newModulo) === 'CNH_BRASIL') {
@@ -246,7 +270,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         if (body.scheduleId && body.status === 'SCHEDULED') action = 'Foi adicionado na Banca';
         else if (body.scheduleId === null && body.status === 'WAITING_SCHEDULING') action = 'Foi excluído da Banca';
         await writeAuditLog(db, extractActor(request, data), action, 'CNH_BRASIL_CANDIDATO', id, {
-          cpf: (record ?? found?.row)?.cpf ?? null,
+          cpf: maskCpf((record ?? found?.row)?.cpf),
           name: (record ?? found?.row)?.studentName ?? null,
         });
       }
@@ -256,7 +280,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
     if (method === 'DELETE') {
       const id = query.id;
       if (!id) return error('ID obrigatório', 400);
-      const found = await findRequestById(db, id);
+      const found = await findRequestById(db, id, env as any);
       const role = (data as any)?.sessionUserRole;
       if (isConfirmedCfc(found?.row, found?.modulo ?? '') && !canManageConfirmed(role)) {
         return error('Somente administradores e supervisores podem excluir provas confirmadas.', 403);
@@ -281,7 +305,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       await db.delete(pcdRequests).where(eq(pcdRequests.id, id));
       if (found?.modulo === 'CNH_BRASIL') {
         await writeAuditLog(db, extractActor(request, data), 'Foi excluído', 'CNH_BRASIL_CANDIDATO', id, {
-          cpf: found.row?.cpf ?? null,
+          cpf: maskCpf(found.row?.cpf),
           name: found.row?.studentName ?? null,
         });
       }

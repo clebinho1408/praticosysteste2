@@ -2,6 +2,7 @@ import { getTableColumns, sql } from 'drizzle-orm';
 import { isD1 } from './_d1.js';
 import { restoreD1Backup } from './_d1-backup.js';
 import { d1Tables } from '../db/d1-schema.js';
+import { computeCpfHmac, decryptField, encryptField, isEncryptedValue, type PiiCryptoEnv } from '../db/pii-crypto.js';
 
 type BackupRow = Record<string, unknown>;
 export type BackupPayload = Record<string, unknown>;
@@ -66,7 +67,7 @@ const TABLE_ALIASES: Record<string, RestoreTable> = {
 };
 
 const COMMON_REQUEST_COLUMNS = [
-  'id', 'nome_candidato', 'nome_social', 'cpf', 'telefone', 'email', 'endereco',
+  'id', 'nome_candidato', 'nome_social', 'cpf', 'cpf_hmac', 'telefone', 'email', 'endereco',
   'cidade', 'tipo_solicitacao', 'tipo_exame', 'categoria_pretendida', 'origem',
   'autoescola_id', 'curso_pratico_concluido', 'horas_praticas',
   'tem_veiculo', 'restricao_cnh', 'instrutor', 'placa_veiculo', 'sem_duplo_comando',
@@ -98,7 +99,7 @@ const TABLE_COLUMNS: Record<RestoreTable, string[]> = {
     'max_vagas_mudanca_padrao', 'criado_em',
     'rodizio_provas', 'disponibilidade_rodizio',
   ],
-  instrutores: ['id', 'nome', 'cpf', 'telefone', 'categoria', 'placa', 'criado_em'],
+  instrutores: ['id', 'nome', 'cpf', 'cpf_hmac', 'telefone', 'categoria', 'placa', 'criado_em'],
   veiculos: [
     'id', 'instrutor_id', 'tipo', 'marca', 'modelo', 'placa', 'ativo', 'transmissao',
     'acessorios', 'duplo_comando', 'procuracao', 'criado_em',
@@ -420,10 +421,30 @@ async function restoreWithBatch(
   if (queries.length > 0) await db.batch(queries as [any, ...any[]]);
 }
 
+async function encryptNormalizedPii(normalized: Record<RestoreTable, BackupRow[]>, env?: PiiCryptoEnv) {
+  if (!env?.DATA_ENCRYPTION_KEY?.trim()) return;
+  const targets: Array<{ table: RestoreTable; fields: string[] }> = [
+    { table: 'solicitacoes_cnhbrasil', fields: ['cpf', 'telefone', 'email', 'endereco'] },
+    { table: 'solicitacoes_pcd', fields: ['cpf', 'telefone', 'email', 'endereco'] },
+    { table: 'instrutores', fields: ['cpf', 'telefone'] },
+  ];
+  for (const { table, fields } of targets) {
+    for (const row of normalized[table] ?? []) {
+      if (row.cpf !== undefined) {
+        const plainCpf = isEncryptedValue(row.cpf) ? await decryptField(row.cpf, env) : row.cpf;
+        row.cpf_hmac = plainCpf ? await computeCpfHmac(plainCpf, env) : null;
+      }
+      for (const f of fields) {
+        if (row[f] !== undefined) row[f] = await encryptField(row[f], env);
+      }
+    }
+  }
+}
+
 export async function restoreBackup(
   db: any,
   input: unknown,
-  options?: { batchTables?: Partial<Record<RestoreTable, any>> },
+  options?: { batchTables?: Partial<Record<RestoreTable, any>>; env?: PiiCryptoEnv },
 ): Promise<{
   restored: Record<string, number>;
   format: 'english' | 'portuguese' | 'mixed' | 'unknown';
@@ -450,9 +471,11 @@ export async function restoreBackup(
         }
       }
     }
+    await encryptNormalizedPii(normalized, options?.env);
     await restoreD1Backup(db, normalized);
     return { restored: restoreCounts(normalized), format };
   }
+  await encryptNormalizedPii(normalized, options?.env);
   if (options?.batchTables) {
     await restoreWithBatch(db, normalized, options.batchTables);
     return { restored: restoreCounts(normalized), format };

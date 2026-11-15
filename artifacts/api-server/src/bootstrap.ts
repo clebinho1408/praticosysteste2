@@ -73,6 +73,7 @@ export async function ensureInMemoryBaseSchema(): Promise<void> {
       id text PRIMARY KEY,
       nome text NOT NULL,
       cpf text NOT NULL,
+      cpf_hmac text,
       telefone text,
       categoria text,
       placa text,

@@ -72,7 +72,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async (context
           payload = storedRows[0].payload;
           }
         }
-        const result = await restoreBackup(db, payload, { batchTables: RESTORE_SCHEMA_TABLES });
+        const result = await restoreBackup(db, payload, { batchTables: RESTORE_SCHEMA_TABLES, env: env as any });
         return json({ success: true, ...result });
       }
       const result = await createBackup(db, 'manual');
