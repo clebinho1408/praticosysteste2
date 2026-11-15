@@ -5,6 +5,11 @@ compatibility_flags = ["nodejs_compat", "cache_option_enabled"]
 # feature is opt-in; without this flag Workers throw before contacting APICPF.
 pages_build_output_dir = "artifacts/praticosys/dist/public"
 
+[[d1_databases]]
+binding = "DB"
+database_name = "praticosys-db"
+database_id = "24984c2f-c50e-48d2-9b62-d6727f1e5fa3"
+
 # Environment variables são configuradas no dashboard do Cloudflare Pages.
 # Nunca commite DATABASE_URL aqui — use "Settings > Environment variables" no painel.
 
