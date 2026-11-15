@@ -1,0 +1,81 @@
+name: Migrar Neon para Cloudflare D1
+
+on:
+  workflow_dispatch:
+    inputs:
+      d1_database_name:
+        description: "Nome do banco D1 criado no Cloudflare (ex: praticosys-db)"
+        required: true
+        type: string
+      d1_database_id:
+        description: "UUID do banco D1 (opcional: se vazio, busca automaticamente pelo nome)"
+        required: false
+        type: string
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Exportar 100% do Neon para arquivo SQL do D1
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "Erro: configure o secret DATABASE_URL em Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+          npx tsx scripts/export-neon-to-d1.ts --out /tmp/d1-migracao.sql
+
+      - name: Importar schema e dados no Cloudflare D1 remoto
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DB_NAME: ${{ inputs.d1_database_name }}
+          D1_DB_ID: ${{ inputs.d1_database_id }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Erro: configure CLOUDFLARE_API_TOKEN e CLOUDFLARE_ACCOUNT_ID nos Secrets do GitHub."
+            exit 1
+          fi
+
+          DB_ID="$D1_DB_ID"
+          if [ -z "$DB_ID" ]; then
+            DB_ID=$(npx --yes wrangler@4 d1 list --json | node -e '
+              const fs = require("fs");
+              const list = JSON.parse(fs.readFileSync(0, "utf8"));
+              const target = process.env.D1_DB_NAME;
+              const found = Array.isArray(list) ? list.find(d => d.name === target) : null;
+              if (!found) {
+                console.error("Banco D1 não encontrado:", target);
+                process.exit(1);
+              }
+              process.stdout.write(found.uuid);
+            ')
+          fi
+
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/wrangler-d1.json", JSON.stringify({
+              name: "praticosys-d1-migrate",
+              compatibility_date: "2024-09-23",
+              d1_databases: [{
+                binding: "DB",
+                database_name: process.env.D1_DB_NAME,
+                database_id: process.argv[1]
+              }]
+            }, null, 2));
+          ' "$DB_ID"
+
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --file=/tmp/d1-migracao.sql --yes
+          rm -f /tmp/d1-migracao.sql /tmp/wrangler-d1.json
