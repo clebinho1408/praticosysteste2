@@ -124,6 +124,16 @@ export async function decryptField(value: unknown, env?: PiiCryptoEnv): Promise<
   return decoder.decode(plainBuffer);
 }
 
+export async function decryptFieldSafe(value: unknown, env?: PiiCryptoEnv): Promise<any> {
+  if (!isEncryptedValue(value)) return value;
+  try {
+    return await decryptField(value, env);
+  } catch (err) {
+    console.error('[pii-crypto] Falha ao descriptografar campo:', err);
+    return value;
+  }
+}
+
 export async function computeCpfHmac(cpf: unknown, env?: PiiCryptoEnv): Promise<string | null> {
   const digits = cleanCpfDigits(cpf);
   if (!digits) return null;
@@ -136,11 +146,20 @@ export async function computeCpfHmac(cpf: unknown, env?: PiiCryptoEnv): Promise<
 const REQUEST_PII_FIELDS = ['cpf', 'phone', 'email', 'address'] as const;
 const INSTRUCTOR_PII_FIELDS = ['cpf', 'phone'] as const;
 
-export async function encryptRequestPii<T extends Record<string, any>>(row: T, env?: PiiCryptoEnv): Promise<T> {
+export type PiiEncryptOptions = { includeCpfHmac?: boolean };
+
+export async function encryptRequestPii<T extends Record<string, any>>(
+  row: T,
+  env?: PiiCryptoEnv,
+  options?: PiiEncryptOptions,
+): Promise<T> {
   const out: Record<string, any> = { ...row };
-  if (out.cpf !== undefined) {
+  const includeCpfHmac = options?.includeCpfHmac ?? true;
+  if (includeCpfHmac && out.cpf !== undefined) {
     const plainCpf = isEncryptedValue(out.cpf) ? await decryptField(out.cpf, env) : out.cpf;
     out.cpfHmac = plainCpf ? await computeCpfHmac(plainCpf, env) : null;
+  } else if (!includeCpfHmac) {
+    delete out.cpfHmac;
   }
   for (const field of REQUEST_PII_FIELDS) {
     if (out[field] !== undefined) out[field] = await encryptField(out[field], env);
@@ -158,11 +177,28 @@ export async function decryptRequestPii<T extends Record<string, any> | null | u
   return out as T;
 }
 
-export async function encryptInstructorPii<T extends Record<string, any>>(row: T, env?: PiiCryptoEnv): Promise<T> {
+export async function decryptRequestPiiSafe<T extends Record<string, any> | null | undefined>(row: T, env?: PiiCryptoEnv): Promise<T> {
+  if (!row || typeof row !== 'object') return row;
   const out: Record<string, any> = { ...row };
-  if (out.cpf !== undefined) {
+  for (const field of REQUEST_PII_FIELDS) {
+    if (out[field] !== undefined) out[field] = await decryptFieldSafe(out[field], env);
+  }
+  delete out.cpfHmac;
+  return out as T;
+}
+
+export async function encryptInstructorPii<T extends Record<string, any>>(
+  row: T,
+  env?: PiiCryptoEnv,
+  options?: PiiEncryptOptions,
+): Promise<T> {
+  const out: Record<string, any> = { ...row };
+  const includeCpfHmac = options?.includeCpfHmac ?? true;
+  if (includeCpfHmac && out.cpf !== undefined) {
     const plainCpf = isEncryptedValue(out.cpf) ? await decryptField(out.cpf, env) : out.cpf;
     out.cpfHmac = plainCpf ? await computeCpfHmac(plainCpf, env) : null;
+  } else if (!includeCpfHmac) {
+    delete out.cpfHmac;
   }
   for (const field of INSTRUCTOR_PII_FIELDS) {
     if (out[field] !== undefined) out[field] = await encryptField(out[field], env);
@@ -175,6 +211,16 @@ export async function decryptInstructorPii<T extends Record<string, any> | null 
   const out: Record<string, any> = { ...row };
   for (const field of INSTRUCTOR_PII_FIELDS) {
     if (out[field] !== undefined) out[field] = await decryptField(out[field], env);
+  }
+  delete out.cpfHmac;
+  return out as T;
+}
+
+export async function decryptInstructorPiiSafe<T extends Record<string, any> | null | undefined>(row: T, env?: PiiCryptoEnv): Promise<T> {
+  if (!row || typeof row !== 'object') return row;
+  const out: Record<string, any> = { ...row };
+  for (const field of INSTRUCTOR_PII_FIELDS) {
+    if (out[field] !== undefined) out[field] = await decryptFieldSafe(out[field], env);
   }
   delete out.cpfHmac;
   return out as T;

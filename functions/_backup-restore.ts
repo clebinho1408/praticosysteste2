@@ -1,5 +1,5 @@
 import { getTableColumns, sql } from 'drizzle-orm';
-import { isD1 } from './_d1.js';
+import { hasD1CpfHmac, isD1 } from './_d1.js';
 import { restoreD1Backup } from './_d1-backup.js';
 import { d1Tables } from '../db/d1-schema.js';
 import { computeCpfHmac, decryptField, encryptField, isEncryptedValue, type PiiCryptoEnv } from '../db/pii-crypto.js';
@@ -472,6 +472,11 @@ export async function restoreBackup(
       }
     }
     await encryptNormalizedPii(normalized, options?.env);
+    for (const table of ['solicitacoes_cnhbrasil', 'solicitacoes_pcd', 'instrutores'] as const) {
+      if ((normalized[table]?.length ?? 0) > 0 && !(await hasD1CpfHmac(db, table))) {
+        for (const row of normalized[table]) delete row.cpf_hmac;
+      }
+    }
     await restoreD1Backup(db, normalized);
     return { restored: restoreCounts(normalized), format };
   }

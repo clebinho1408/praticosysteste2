@@ -1,5 +1,6 @@
 // functions/api/requests.ts  →  GET|POST|PUT|DELETE /api/requests
 import { getDb, json, error, parseBody, getQuery, writeAuditLog, extractActor } from '../_db.js';
+import { hasD1CpfHmac } from '../_d1.js';
 import { cnhbrasilRequests, cfcRequests, pcdRequests, examiners, systemSettings, blockedDates, users } from '../../db/schema.js';
 import { eq, like, and, or } from 'drizzle-orm';
 import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatch, validateConfirmedEdit, hasCandidateIdentity, clearAppointment } from '../_cfc-confirmed.js';
@@ -7,7 +8,7 @@ import { extraEditError, extraPatch } from '../_cfc-extra.js';
 import { interestError, interestPatch } from '../_cfc-interest.js';
 import { modalityValidationError } from '../_cnh-exam-modality.js';
 import { UpdateExamRequestBody } from '../../lib/api-zod/src/generated/api.js';
-import { computeCpfHmac, decryptRequestPii, encryptRequestPii, maskCpf } from '../../db/pii-crypto.js';
+import { computeCpfHmac, decryptRequestPiiSafe, encryptRequestPii, maskCpf } from '../../db/pii-crypto.js';
 
 const ALLOWED_FIELDS = [
   'id','studentName','socialName','cpf','phone','email','address','city',
@@ -60,6 +61,12 @@ function getRequestTable(modulo: string) {
   return cnhbrasilRequests;
 }
 
+function getRequestTableName(modulo: string) {
+  if (modulo === 'PCD') return 'solicitacoes_pcd';
+  if (modulo === 'CFC') return 'solicitacoes_cfc';
+  return 'solicitacoes_cnhbrasil';
+}
+
 /** Encontra um request pelo ID em qualquer das 3 tabelas — retorna camelCase via ORM com PII descriptografado */
 async function findRequestById(db: any, id: string, env?: any): Promise<{ row: any; modulo: string } | null> {
   const [cnhRows, cfcRows, pcdRows] = await Promise.all([
@@ -67,9 +74,9 @@ async function findRequestById(db: any, id: string, env?: any): Promise<{ row: a
     db.select().from(cfcRequests).where(eq(cfcRequests.id, id)).limit(1),
     db.select().from(pcdRequests).where(eq(pcdRequests.id, id)).limit(1),
   ]);
-  if (cnhRows.length > 0) return { row: await decryptRequestPii(cnhRows[0], env), modulo: 'CNH_BRASIL' };
+  if (cnhRows.length > 0) return { row: await decryptRequestPiiSafe(cnhRows[0], env), modulo: 'CNH_BRASIL' };
   if (cfcRows.length > 0) return { row: cfcRows[0], modulo: 'CFC' };
-  if (pcdRows.length > 0) return { row: await decryptRequestPii(pcdRows[0], env), modulo: 'PCD' };
+  if (pcdRows.length > 0) return { row: await decryptRequestPiiSafe(pcdRows[0], env), modulo: 'PCD' };
   return null;
 }
 
@@ -83,20 +90,23 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (query.cpf) {
         const clean = query.cpf.replace(/\D/g, '');
         const pattern = `%${clean}%`;
-        const hmac = clean.length === 11 ? await computeCpfHmac(clean, env as any) : null;
+        const canUseHmac = clean.length === 11
+          && await hasD1CpfHmac(db, 'solicitacoes_cnhbrasil')
+          && await hasD1CpfHmac(db, 'solicitacoes_pcd');
+        const hmac = canUseHmac ? await computeCpfHmac(clean, env as any) : null;
         if (hmac) {
           const [cnhRows, pcdRows] = await Promise.all([
             db.select().from(cnhbrasilRequests).where(or(eq(cnhbrasilRequests.cpfHmac, hmac), like(cnhbrasilRequests.cpf, pattern))),
             db.select().from(pcdRequests).where(or(eq(pcdRequests.cpfHmac, hmac), like(pcdRequests.cpf, pattern))),
           ]);
-          const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, env as any)));
+          const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPiiSafe(r, env as any)));
           return json(decrypted);
         }
         const [cnhRows, pcdRows] = await Promise.all([
           db.select().from(cnhbrasilRequests),
           db.select().from(pcdRequests),
         ]);
-        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, env as any)));
+        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPiiSafe(r, env as any)));
         return json(decrypted.filter(r => String(r?.cpf ?? '').replace(/\D/g, '').includes(clean)));
       }
       const [cnhRows, cfcRows, pcdRows] = await Promise.all([
@@ -105,8 +115,8 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         db.select().from(pcdRequests),
       ]);
       const [decCnh, decPcd] = await Promise.all([
-        Promise.all(cnhRows.map((r: any) => decryptRequestPii(r, env as any))),
-        Promise.all(pcdRows.map((r: any) => decryptRequestPii(r, env as any))),
+        Promise.all(cnhRows.map((r: any) => decryptRequestPiiSafe(r, env as any))),
+        Promise.all(pcdRows.map((r: any) => decryptRequestPiiSafe(r, env as any))),
       ]);
       return json([...decCnh, ...cfcRows, ...decPcd]);
     }
@@ -123,9 +133,12 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         filtered.phone = filtered.phone || null;
       }
       const stripped = stripDroppedFields(filtered, filtered.modulo);
+      const includeCpfHmac = stripped.modulo === 'CFC'
+        ? false
+        : await hasD1CpfHmac(db, getRequestTableName(stripped.modulo));
       const valuesToSave = stripped.modulo === 'CFC'
         ? stripped
-        : await encryptRequestPii(stripped, env as any);
+        : await encryptRequestPii(stripped, env as any, { includeCpfHmac });
       const table = getRequestTable(valuesToSave.modulo);
       const newItem = await db.insert(table).values({
         id: valuesToSave.id || crypto.randomUUID(),
@@ -133,7 +146,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         createdAt: filtered.createdAt ? new Date(filtered.createdAt) : new Date(),
         updatedAt: new Date(),
       }).returning();
-      const record = await decryptRequestPii(newItem[0] as any, env as any);
+      const record = await decryptRequestPiiSafe(newItem[0] as any, env as any);
       if (record?.modulo === 'CNH_BRASIL') {
         await writeAuditLog(db, extractActor(request, data), 'Foi cadastrado', 'CNH_BRASIL_CANDIDATO', record.id, {
           cpf: maskCpf(record.cpf),
@@ -238,6 +251,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const newTable = getRequestTable(newModulo);
 
       let record: any;
+      const includeCpfHmac = newModulo === 'CFC'
+        ? false
+        : await hasD1CpfHmac(db, getRequestTableName(newModulo));
       if (oldModulo !== newModulo) {
         // Módulo mudou: mover linha atomicamente para a tabela destino
         // Merge camelCase (ORM) + incoming updates + modulo correto
@@ -247,22 +263,22 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         );
         const mergedToSave = newModulo === 'CFC'
           ? mergedPlain
-          : await encryptRequestPii(mergedPlain, env as any);
+          : await encryptRequestPii(mergedPlain, env as any, { includeCpfHmac });
         await db.batch([
           db.insert(newTable).values(mergedToSave),
           db.delete(oldTable).where(eq(oldTable.id, id)),
         ]);
-        record = await decryptRequestPii(mergedPlain, env as any);
+        record = await decryptRequestPiiSafe(mergedPlain, env as any);
       } else {
         const stripped = stripDroppedFields({ ...filtered, updatedAt: new Date() }, newModulo);
         const toUpdate = newModulo === 'CFC'
           ? stripped
-          : await encryptRequestPii(stripped, env as any);
+          : await encryptRequestPii(stripped, env as any, { includeCpfHmac });
         const updated = await db.update(oldTable)
           .set(toUpdate)
           .where(eq(oldTable.id, id))
           .returning();
-        record = await decryptRequestPii(updated[0], env as any);
+        record = await decryptRequestPiiSafe(updated[0], env as any);
       }
 
       if ((record?.modulo ?? newModulo) === 'CNH_BRASIL') {

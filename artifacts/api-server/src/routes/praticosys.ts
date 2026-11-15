@@ -36,7 +36,7 @@ import { consumeAuthAttempt, invalidCredentials, validPassword } from "../../../
 import { credentialChange, operationalCleanup } from "../../../../functions/_security-transactions.js";
 import { issuePasswordSession, persistOtpChallenge, consumeOtpSession } from "../../../../functions/_session-issuance.js";
 // @ts-ignore Shared Web Crypto PII encryption helper outside rootDir.
-import { computeCpfHmac, decryptInstructorPii, decryptRequestPii, encryptInstructorPii, encryptRequestPii, maskAuditDetails, maskCpf } from "../../../../db/pii-crypto.js";
+import { computeCpfHmac, decryptInstructorPiiSafe, decryptRequestPiiSafe, encryptInstructorPii, encryptRequestPii, maskAuditDetails, maskCpf } from "../../../../db/pii-crypto.js";
 
 function hashCode(code: string): string {
   return createHash('sha256').update(code).digest('hex');
@@ -473,7 +473,7 @@ router.get("/instructors", async (req, res) => {
     const role = (req as any).sessionUser?.role;
     const needsMask = role === "CONSULTANT" || role === "EXAMINER";
     const data = await Promise.all(allInstructors.map(async (inst: any) => {
-      const dec = await decryptInstructorPii(inst, process.env);
+      const dec = await decryptInstructorPiiSafe(inst, process.env);
       return {
         ...dec,
         ...(needsMask && dec?.cpf ? { cpf: maskCpf(dec.cpf) } : {}),
@@ -489,7 +489,7 @@ router.post("/instructors", async (req, res) => {
     const newId = crypto.randomUUID();
     const encryptedData = await encryptInstructorPii(instructorData, process.env);
     const item = await db.insert(instructors).values({ id: newId, ...encryptedData }).returning();
-    const decryptedItem = await decryptInstructorPii(item[0], process.env);
+    const decryptedItem = await decryptInstructorPiiSafe(item[0], process.env);
     let temporaryCredential: { login: string; password: string } | undefined;
     if (instructorData.cpf) {
       const login = instructorData.cpf.replace(/\D/g, "");
@@ -517,7 +517,7 @@ router.put("/instructors", async (req, res) => {
     const { id, createdAt, vehicles: vList, ...updates } = req.body;
     const encryptedUpdates = await encryptInstructorPii(updates, process.env);
     const item = await db.update(instructors).set(encryptedUpdates).where(eq(instructors.id, id)).returning();
-    const decryptedItem = await decryptInstructorPii(item[0], process.env);
+    const decryptedItem = await decryptInstructorPiiSafe(item[0], process.env);
     // Sincronizar login do usuário instrutor vinculado quando o CPF muda
     if (updates.cpf !== undefined) {
       try {
@@ -719,9 +719,9 @@ async function findRequestById(id: string): Promise<{ row: any; modulo: string }
     db.select().from(cfcRequests).where(eq(cfcRequests.id, id)).limit(1),
     db.select().from(pcdRequests).where(eq(pcdRequests.id, id)).limit(1),
   ]);
-  if (cnhRows.length > 0) return { row: await decryptRequestPii(cnhRows[0], process.env), modulo: 'CNH_BRASIL' };
+  if (cnhRows.length > 0) return { row: await decryptRequestPiiSafe(cnhRows[0], process.env), modulo: 'CNH_BRASIL' };
   if (cfcRows.length > 0) return { row: cfcRows[0], modulo: 'CFC' };
-  if (pcdRows.length > 0) return { row: await decryptRequestPii(pcdRows[0], process.env), modulo: 'PCD' };
+  if (pcdRows.length > 0) return { row: await decryptRequestPiiSafe(pcdRows[0], process.env), modulo: 'PCD' };
   return null;
 }
 
@@ -751,14 +751,14 @@ router.get("/requests", async (req, res) => {
           db.select().from(cnhbrasilRequests).where(or(eq(cnhbrasilRequests.cpfHmac, hmac), like(cnhbrasilRequests.cpf, pattern))),
           db.select().from(pcdRequests).where(or(eq(pcdRequests.cpfHmac, hmac), like(pcdRequests.cpf, pattern))),
         ]);
-        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, process.env)));
+        const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPiiSafe(r, process.env)));
         return res.json(decrypted.map(formatRow));
       }
       const [cnhRows, pcdRows] = await Promise.all([
         db.select().from(cnhbrasilRequests),
         db.select().from(pcdRequests),
       ]);
-      const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPii(r, process.env)));
+      const decrypted = await Promise.all([...cnhRows, ...pcdRows].map(r => decryptRequestPiiSafe(r, process.env)));
       return res.json(decrypted.filter(r => String(r?.cpf ?? "").replace(/\D/g, "").includes(clean)).map(formatRow));
     }
     const [cnhRows, cfcRows, pcdRows] = await Promise.all([
@@ -767,8 +767,8 @@ router.get("/requests", async (req, res) => {
       db.select().from(pcdRequests),
     ]);
     const [decCnh, decPcd] = await Promise.all([
-      Promise.all(cnhRows.map(r => decryptRequestPii(r, process.env))),
-      Promise.all(pcdRows.map(r => decryptRequestPii(r, process.env))),
+      Promise.all(cnhRows.map(r => decryptRequestPiiSafe(r, process.env))),
+      Promise.all(pcdRows.map(r => decryptRequestPiiSafe(r, process.env))),
     ]);
     return res.json([...decCnh.map(formatRow), ...cfcRows, ...decPcd.map(formatRow)]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
@@ -791,7 +791,7 @@ router.post("/requests", async (req, res) => {
       id: valuesToSave.id || crypto.randomUUID(), ...valuesToSave,
       createdAt: new Date(), updatedAt: new Date()
     }).returning();
-    const record = await decryptRequestPii(item[0] as any, process.env);
+    const record = await decryptRequestPiiSafe(item[0] as any, process.env);
     if (record?.modulo === 'CNH_BRASIL') {
       try {
         await db.insert(auditLogs).values({
@@ -928,14 +928,14 @@ router.put("/requests", async (req, res) => {
         await (tx.insert(newTable) as any).values(mergedToSave).onConflictDoNothing();
         await tx.delete(oldTable).where(eq(oldTable.id, id));
       });
-      record = await decryptRequestPii(mergedPlain, process.env);
+      record = await decryptRequestPiiSafe(mergedPlain, process.env);
     } else {
       const stripped = stripDroppedFields(updates, newModulo);
       const safeUpdates = newModulo === "CFC"
         ? stripped
         : await encryptRequestPii(stripped, process.env);
       const item = await db.update(oldTable).set(safeUpdates).where(eq(oldTable.id, id)).returning();
-      record = await decryptRequestPii(item[0], process.env);
+      record = await decryptRequestPiiSafe(item[0], process.env);
     }
     if (record?.modulo === 'CNH_BRASIL') {
       try {

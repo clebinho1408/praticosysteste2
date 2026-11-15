@@ -292,8 +292,9 @@ const RequestManager: React.FC<RequestManagerProps> = ({
       filtered = filtered.filter(r => {
         const name = r.studentName?.trim();
         const cpf = r.cpf?.replace(/\D/g, '');
+        const hasCpf = (!!cpf && cpf !== '00000000000') || Boolean(r.cpf?.includes('*'));
         // Keep records that have a real student name (not empty, null, or 'Vaga Disponível')
-        return name && name !== 'Vaga Disponível' && cpf && cpf !== '00000000000';
+        return name && name !== 'Vaga Disponível' && hasCpf;
       });
 
       // Source Filtering

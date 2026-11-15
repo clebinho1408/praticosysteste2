@@ -18,6 +18,35 @@ export const d1Binding = (db: any): D1Database => {
 };
 
 const verifiedBindings = new WeakSet<object>();
+const CPF_HMAC_TABLES = ['solicitacoes_cnhbrasil', 'solicitacoes_pcd', 'instrutores'] as const;
+const cpfHmacCache = new WeakMap<object, { missing: Set<string>; checkedAt: number }>();
+
+async function loadMissingCpfHmacTables(binding: D1Database): Promise<Set<string>> {
+  const cached = cpfHmacCache.get(binding as unknown as object);
+  if (cached && (cached.missing.size === 0 || Date.now() - cached.checkedAt < 30_000)) {
+    return cached.missing;
+  }
+  try {
+    const results = await binding.batch(
+      CPF_HMAC_TABLES.map(t => binding.prepare(`PRAGMA table_info("${t}")`)),
+    );
+    const missing = new Set<string>();
+    CPF_HMAC_TABLES.forEach((t, idx) => {
+      const cols = (results[idx]?.results ?? []) as Array<{ name?: string }>;
+      if (!cols.some(c => c.name === 'cpf_hmac')) missing.add(t);
+    });
+    cpfHmacCache.set(binding as unknown as object, { missing, checkedAt: Date.now() });
+    return missing;
+  } catch {
+    return new Set(CPF_HMAC_TABLES);
+  }
+}
+
+export async function hasD1CpfHmac(db: any, table: string): Promise<boolean> {
+  if (!isD1(db)) return true;
+  const missing = await loadMissingCpfHmacTables(d1Binding(db));
+  return !missing.has(table);
+}
 
 export async function verifyD1Schema(db: any) {
   if (!isD1(db)) return;
@@ -52,14 +81,15 @@ export async function verifyD1Schema(db: any) {
   if (map.has(PII_V3_VERSION) && map.get(PII_V3_VERSION) !== cPiiV3) {
     throw new Error('Migração D1 de segurança CPF (v3) incompatível. Execute a manutenção de schema.');
   }
+  await loadMissingCpfHmacTables(binding);
   verifiedBindings.add(binding as unknown as object);
   db.$d1Verified = true;
 }
 
 export function createD1Db(binding: D1Database) {
   type Descriptor = { sql: string; params: unknown[]; options: { arrayMode?: boolean } };
-  const prepared = (q: Descriptor) => {
-    const translated = translateD1Sql(q.sql, q.params);
+  const prepared = (q: Descriptor, missingCpfHmacTables?: ReadonlySet<string>) => {
+    const translated = translateD1Sql(q.sql, q.params, { missingCpfHmacTables });
     return binding.prepare(translated.sql).bind(...translated.params as any[]);
   };
   const result = (r: D1Result, q: Descriptor) => ({
@@ -77,7 +107,8 @@ export function createD1Db(binding: D1Database) {
         if (!info.results.some(c => c.name === alter[2])) throw new Error('Coluna D1 ausente; aplique uma migração versionada.');
         return { rows: [], rowCount: 0 };
       }
-      return result(await prepared(descriptor).all(), descriptor);
+      const missingCpfHmacTables = await loadMissingCpfHmacTables(binding);
+      return result(await prepared(descriptor, missingCpfHmacTables).all(), descriptor);
     };
     return Object.assign(descriptor, {
       then(resolve: any, reject: any) { execution ??= run(); return execution.then(resolve, reject); },
@@ -85,7 +116,8 @@ export function createD1Db(binding: D1Database) {
   };
   client.transaction = async (queries: Descriptor[]) => {
     if (queries.length > 40) throw new Error('Lote D1 excede o limite seguro de 40 consultas; nenhuma gravação foi executada.');
-    const results = await binding.batch(queries.map(prepared));
+    const missingCpfHmacTables = await loadMissingCpfHmacTables(binding);
+    const results = await binding.batch(queries.map(q => prepared(q, missingCpfHmacTables)));
     return results.map((r, i) => result(r, queries[i]));
   };
   const db = drizzle(client, { schema });
