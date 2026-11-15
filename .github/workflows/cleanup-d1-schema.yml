@@ -102,6 +102,6 @@ jobs:
           fi
 
           echo "--- Resumo final do schema D1 ---"
-          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT count(*) AS total_tabelas FROM sqlite_master WHERE type = '\''table'\'' AND name NOT LIKE '\''sqlite_%'\'' AND name NOT LIKE '\''_cf_%'\''" --json
-          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT name FROM pragma_table_info('\''solicitacoes_cfc'\'')" --json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT count(*) AS total_tabelas FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%'" --json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT name FROM pragma_table_info('solicitacoes_cfc')" --json
           rm -f /tmp/d1-cleanup-v2.sql /tmp/wrangler-d1.json
