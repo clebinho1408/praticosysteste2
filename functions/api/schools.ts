@@ -6,7 +6,12 @@ import { schoolPauseValidation } from '../_school-schedule.js';
 import { cnhSchoolScaleConflict } from '../_cnh-time-conflicts.js';
 import { schoolYardsValidation } from '../_school-yards.js';
 
+import { isD1 } from '../_d1.js';
+
+let _schoolsSchemaReady = false;
+
 async function ensureSchema(db: any) {
+  if (isD1(db) || _schoolsSchemaReady) return;
   try {
     await db.execute(sql`ALTER TABLE autoescolas ADD COLUMN IF NOT EXISTS email text`);
     await db.execute(sql`ALTER TABLE autoescolas ADD COLUMN IF NOT EXISTS cidade text`);
@@ -20,6 +25,7 @@ async function ensureSchema(db: any) {
     await db.execute(sql`ALTER TABLE autoescolas ADD COLUMN IF NOT EXISTS rodizio_provas boolean NOT NULL DEFAULT false`);
     await db.execute(sql`ALTER TABLE autoescolas ADD COLUMN IF NOT EXISTS perfil_cnh_brasil boolean NOT NULL DEFAULT false`);
     await db.execute(sql`ALTER TABLE autoescolas ADD COLUMN IF NOT EXISTS patios jsonb DEFAULT '[]'::jsonb`);
+    _schoolsSchemaReady = true;
   } catch (e) {
     throw new Error('Não foi possível preparar o cadastro de autoescolas.', { cause: e });
   }

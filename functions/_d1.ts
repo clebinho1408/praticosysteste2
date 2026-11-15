@@ -15,32 +15,35 @@ export const d1Binding = (db: any): D1Database => {
   return db.$d1;
 };
 
+const verifiedBindings = new WeakSet<object>();
+
 export async function verifyD1Schema(db: any) {
   if (!isD1(db)) return;
   if (db.$d1Verified) return;
   const binding = d1Binding(db);
-  const applied = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(D1_VERSION).first<{ checksum: string }>();
-  if (!applied || applied.checksum !== await d1Checksum()) throw new Error('Migrações D1 ausentes ou incompatíveis. Execute a manutenção de schema antes de usar o ambiente.');
-  const cpf = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(CPF_D1_VERSION).first<{ checksum: string }>();
-  if (!cpf || cpf.checksum !== await cpfD1Checksum()) throw new Error('Migração D1 de autopreenchimento ausente ou incompatível. Execute a manutenção de schema.');
-  const tabs = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(CADASTRO_TABS_D1_VERSION).first<{ checksum: string }>();
-  if (!tabs || tabs.checksum !== await cadastroTabsD1Checksum()) throw new Error('Migração D1 de abas de cadastro ausente ou incompatível. Execute a manutenção de schema.');
-  const modality = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(CNH_MODALITY_VERSION).first<{ checksum: string }>();
-  if (!modality || modality.checksum !== await cnhModalityChecksum()) throw new Error('Migração D1 de modalidades CNH ausente ou incompatível. Execute a manutenção de schema.');
-  const yards = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(YARDS_INTEREST_VERSION).first<{ checksum: string }>();
-  if (!yards || yards.checksum !== await yardsInterestChecksum()) throw new Error('Migração D1 de pátios/interesse ausente ou incompatível. Execute a manutenção de schema.');
-  db.$d1Verified = true;
-  const auth = await binding.prepare('SELECT checksum FROM migracoes_d1 WHERE versao = ?')
-    .bind(AUTH_SECURITY_VERSION).first<{ checksum: string }>();
-  if (!auth || auth.checksum !== await authSecurityChecksum()) {
-    db.$d1Verified = false;
-    throw new Error('Migração D1 de segurança ausente. Execute a manutenção local de schema.');
+  if (verifiedBindings.has(binding as unknown as object)) {
+    db.$d1Verified = true;
+    return;
   }
+  const rows = await binding.prepare('SELECT versao, checksum FROM migracoes_d1')
+    .all<{ versao: string; checksum: string }>();
+  const map = new Map((rows.results ?? []).map(r => [r.versao, r.checksum]));
+  const [cBase, cCpf, cTabs, cModality, cYards, cAuth] = await Promise.all([
+    d1Checksum(),
+    cpfD1Checksum(),
+    cadastroTabsD1Checksum(),
+    cnhModalityChecksum(),
+    yardsInterestChecksum(),
+    authSecurityChecksum(),
+  ]);
+  if (map.get(D1_VERSION) !== cBase) throw new Error('Migrações D1 ausentes ou incompatíveis. Execute a manutenção de schema antes de usar o ambiente.');
+  if (map.get(CPF_D1_VERSION) !== cCpf) throw new Error('Migração D1 de autopreenchimento ausente ou incompatível. Execute a manutenção de schema.');
+  if (map.get(CADASTRO_TABS_D1_VERSION) !== cTabs) throw new Error('Migração D1 de abas de cadastro ausente ou incompatível. Execute a manutenção de schema.');
+  if (map.get(CNH_MODALITY_VERSION) !== cModality) throw new Error('Migração D1 de modalidades CNH ausente ou incompatível. Execute a manutenção de schema.');
+  if (map.get(YARDS_INTEREST_VERSION) !== cYards) throw new Error('Migração D1 de pátios/interesse ausente ou incompatível. Execute a manutenção de schema.');
+  if (map.get(AUTH_SECURITY_VERSION) !== cAuth) throw new Error('Migração D1 de segurança ausente. Execute a manutenção local de schema.');
+  verifiedBindings.add(binding as unknown as object);
+  db.$d1Verified = true;
 }
 
 export function createD1Db(binding: D1Database) {

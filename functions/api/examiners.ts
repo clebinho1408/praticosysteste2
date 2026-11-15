@@ -3,7 +3,12 @@ import { getDb, json, error, parseBody, getQuery } from '../_db.js';
 import { examiners } from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 
+import { isD1 } from '../_d1.js';
+
+let _examinersSchemaReady = false;
+
 async function ensureSchema(db: any) {
+  if (isD1(db) || _examinersSchemaReady) return;
   try {
     await db.execute(sql`ALTER TABLE public.examinadores ADD COLUMN IF NOT EXISTS categorias jsonb DEFAULT '[]'::jsonb`);
     await db.execute(sql`ALTER TABLE public.examinadores ADD COLUMN IF NOT EXISTS max_vagas_a_padrao integer`);
@@ -12,6 +17,7 @@ async function ensureSchema(db: any) {
     await db.execute(sql`ALTER TABLE public.examinadores ADD COLUMN IF NOT EXISTS rodizio_provas boolean NOT NULL DEFAULT false`);
     await db.execute(sql`ALTER TABLE public.examinadores ADD COLUMN IF NOT EXISTS disponibilidade_rodizio jsonb`);
     await db.execute(sql`ALTER TABLE public.examinadores ADD COLUMN IF NOT EXISTS periodos_bloqueio jsonb DEFAULT '[]'::jsonb`);
+    _examinersSchemaReady = true;
   } catch {}
 }
 

@@ -15,6 +15,8 @@ const PUBLIC_PATHS = [
   '/api/session',
 ];
 
+let _sessoesTableReady = false;
+
 export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async (context) => {
   const { request, env, next, data } = context as any;
   const url = new URL(request.url);
@@ -39,8 +41,11 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async (context
     await ensureColumnMigrations(db);
     // SDC é um dado do exame de categoria B também no módulo CNH do Brasil.
     await ensureCnhBrasilSdcStorage(db);
-    // Garante que sessoes existe antes de consultar (idempotente)
-    await db.execute(sql`CREATE TABLE IF NOT EXISTS sessoes (id text PRIMARY KEY, usuario_id text NOT NULL, expira_em timestamp NOT NULL, criado_em timestamp DEFAULT now())`).catch(() => {});
+    // Garante que sessoes existe antes de consultar (no D1 já é garantida por verifyD1Schema)
+    if (!(db as any).$d1 && !_sessoesTableReady) {
+      await db.execute(sql`CREATE TABLE IF NOT EXISTS sessoes (id text PRIMARY KEY, usuario_id text NOT NULL, expira_em timestamp NOT NULL, criado_em timestamp DEFAULT now())`).catch(() => {});
+      _sessoesTableReady = true;
+    }
     const user = await readSessionUser(db, schema.users, token);
     if (!user) {
       return error('Sessão expirada ou inválida. Faça login novamente.', 401);
