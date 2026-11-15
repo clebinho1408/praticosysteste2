@@ -1,0 +1,1458 @@
+import { Router } from "express";
+import { UpdateExamRequestBody } from "@workspace/api-zod";
+// @ts-ignore Shared calendar policy, also bundled into Cloudflare and the frontend.
+import { mainSchedulePaused, schoolPauseValidation } from "../../../../functions/_school-schedule.js";
+// @ts-ignore Shared CNH time-conflict policy.
+import { cnhBancaConflict, cnhSchoolScaleConflict } from "../../../../functions/_cnh-time-conflicts.js";
+import { db } from "@workspace/db";
+import {
+  users, drivingSchools, examiners, instructors, vehicles,
+  examSchedules, examRequests, systemSettings, blockedDates,
+  cities, examScheduleSlots, bancaResults, examLocations, otpCodes, auditLogs,
+  cnhbrasilRequests, cfcRequests, pcdRequests,
+  cfcScheduleSlots, pcdScheduleSlots,
+} from "@workspace/db";
+import { eq, and, like, isNotNull, desc, sql } from "drizzle-orm";
+import crypto from "crypto";
+import { createHash } from "crypto";
+import type { Response } from "express";
+import { sendOtpEmail } from "../../../../functions/_resend.js";
+// The Pages Functions and Express server intentionally share this compatibility
+// layer. It lives outside this package so the production bundle uses the same
+// mapping as the development server.
+// @ts-ignore TypeScript rootDir is narrower than the esbuild bundle boundary.
+import { restoreBackup } from "../../../../functions/_backup-restore.js";
+// @ts-ignore Shared compatibility policy for Express and Cloudflare.
+import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatch, validateConfirmedEdit, hasCandidateIdentity, clearAppointment } from "../../../../functions/_cfc-confirmed.js";
+// @ts-ignore Shared compatibility policy for Express and Cloudflare.
+import { extraEditError, extraPatch } from "../../../../functions/_cfc-extra.js";
+import { interestError, interestPatch } from "../../../../functions/_cfc-interest.js";
+import { schoolYardsValidation } from "../../../../functions/_school-yards.js";
+// @ts-ignore Shared read-only session restoration for Express and Pages.
+import { readSessionUser } from "../../../../functions/_session-user.js";
+// @ts-ignore Shared server-only integration for Express and Cloudflare.
+import { lookupCpf, consumeCpfQuota, cpfSettingError } from "../../../../functions/_cpf-lookup.js";
+import { consumeAuthAttempt, invalidCredentials, validPassword } from "../../../../functions/_auth-security.js";
+import { credentialChange, operationalCleanup } from "../../../../functions/_security-transactions.js";
+import { issuePasswordSession, persistOtpChallenge, consumeOtpSession } from "../../../../functions/_session-issuance.js";
+
+function hashCode(code: string): string {
+  return createHash('sha256').update(code).digest('hex');
+}
+
+import { hashPassword, verifyPassword } from '../password.js';
+
+const OTP_MAX_ATTEMPTS = 5;
+
+// ─── BACKUP ───────────────────────────────────────────────────────────────────
+const BACKUP_TABLES = [
+  "autoescolas", "examinadores", "instrutores", "veiculos", "cidades",
+  // Tabelas separadas por módulo
+  "solicitacoes_cnhbrasil", "solicitacoes_cfc", "solicitacoes_pcd",
+  "vagas_cfc", "vagas_pcd",
+  "resultados_banca", "locais_exame", "datas_bloqueadas", "configuracoes",
+  // Tabelas legadas mantidas para segurança/rollback
+  "solicitacoes", "bancas", "vagas_banca",
+];
+const MAX_BACKUPS = 15;
+
+async function createBackupSnapshot(trigger: "auto" | "manual"): Promise<{ skipped?: boolean; id?: string }> {
+  if (trigger === "auto") {
+    const existing = await db.execute(sql`
+      SELECT id FROM backups WHERE tipo_gatilho = 'auto' AND criado_em::date = CURRENT_DATE LIMIT 1
+    `);
+    const rows = (existing as any).rows ?? existing;
+    if (rows && rows.length > 0) return { skipped: true };
+  }
+
+  const payload: Record<string, unknown[]> = {};
+  for (const t of BACKUP_TABLES) {
+    try {
+      const res = await db.execute(sql.raw(`SELECT * FROM ${t}`));
+      payload[t] = (res as any).rows ?? res;
+    } catch { payload[t] = []; }
+  }
+  // Usuários sem senhas
+  try {
+    const res = await db.execute(sql`
+      SELECT id, nome AS name, login, perfil AS role,
+             autoescola_id AS school_id, examinador_id AS examiner_id, instrutor_id AS instructor_id,
+             email, telefone AS phone, dois_fatores_ativo AS two_factor_enabled,
+             forcar_troca_senha AS force_password_change,
+             modulos_permitidos AS allowed_modules, locais_permitidos_ids AS allowed_location_ids,
+             criado_em AS created_at
+      FROM usuarios
+    `);
+    payload["users"] = (res as any).rows ?? res;
+  } catch { payload["users"] = []; }
+
+  const id = crypto.randomUUID();
+  const jsonStr = JSON.stringify(payload);
+  const size = Buffer.byteLength(jsonStr, "utf8");
+  // ON CONFLICT DO NOTHING + índice único parcial garantem no máx. 1 backup 'auto' por dia,
+  // mesmo com logins de admin concorrentes.
+  const inserted = await db.execute(sql`
+    INSERT INTO backups (id, tipo_gatilho, dados, tamanho_bytes)
+    VALUES (${id}, ${trigger}, ${jsonStr}::jsonb, ${size})
+    ON CONFLICT DO NOTHING
+    RETURNING id
+  `);
+  const insertedRows = (inserted as any).rows ?? inserted;
+  if (!insertedRows || insertedRows.length === 0) return { skipped: true };
+  await db.execute(sql`
+    DELETE FROM backups
+    WHERE id NOT IN (SELECT id FROM backups ORDER BY criado_em DESC LIMIT ${MAX_BACKUPS})
+  `);
+  return { id };
+}
+
+/** Dispara backup automático em segundo plano (não bloqueia o login) */
+function triggerAutoBackup() {
+  void createBackupSnapshot("auto").catch(() => {});
+}
+
+const router = Router();
+
+// ─── SSE ─────────────────────────────────────────────────────────────────────
+let sseClients: Response[] = [];
+const addSseClient = (res: Response) => {
+  sseClients.push(res);
+  res.on("close", () => { sseClients = sseClients.filter(c => c !== res); });
+};
+const broadcast = (event: string, data: any) => {
+  // Invalidation only. Every recipient refetches through the scoped API.
+  sseClients.forEach(c => c.write(`event: ${event}\ndata: {}\n\n`));
+};
+
+router.get("/events", (_req, res) => {
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.flushHeaders();
+  addSseClient(res);
+});
+
+// ─── AUTH ─────────────────────────────────────────────────────────────────────
+router.post("/auth", async (req, res) => {
+  try {
+    const { login, password } = req.body ?? {};
+    if (typeof login !== 'string' || typeof password !== 'string' || !login || !password || login.length > 200 || password.length > 200) {
+      return res.status(400).json({ error: "Login e senha são obrigatórios" });
+    }
+    // Express does not trust client-supplied proxy headers.
+    if (!await consumeAuthAttempt(db, req.socket.remoteAddress ?? 'unknown', login)) {
+      return res.status(429).json({ error: "Muitas tentativas. Tente novamente em até 10 minutos." });
+    }
+    const result = await db.select().from(users).where(eq(users.login, login));
+    if (result.length === 0) {
+      await hashPassword(password);
+      return res.status(401).json({ error: invalidCredentials });
+    }
+    const user = result[0] as any;
+
+    // Helper local para gerar e enviar OTP (reutilizado no bootstrap e login normal)
+    const do2FA = async (u: any) => {
+      const rawCode = String(crypto.randomInt(100000, 1000000));
+      const hashedCode = hashCode(rawCode);
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000);
+      await db.execute(sql`UPDATE codigos_otp SET usado = true WHERE usuario_id = ${u.id} AND usado = false`);
+      const resendKey = process.env.RESEND_API_KEY;
+      if (!resendKey) {
+        throw new Error("SEND_FAILED");
+      }
+      const delivery = await sendOtpEmail(
+        resendKey,
+        u.email,
+        rawCode,
+        "PráticoSys",
+        process.env.RESEND_FROM_EMAIL || "onboarding@resend.dev",
+      );
+      if (!delivery.ok) {
+        throw new Error("SEND_FAILED");
+      }
+      if (!await persistOtpChallenge(db, u, hashedCode, expiresAt)) throw new Error("CREDENTIAL_CHANGED");
+      const maskEmail = (e: string) => { const [l, d] = e.split("@"); return `${l.slice(0, 2)}***@${d}`; };
+      return { requiresOtp: true, userId: u.id, sentTo: maskEmail(u.email) };
+    };
+
+    if (typeof user.password !== 'string' || !user.password.trim()) {
+      await hashPassword(password);
+      return res.status(401).json({ error: invalidCredentials });
+    }
+
+    // Verifica senha (suporta migração transparente de texto puro → bcrypt)
+    if (user.password) {
+      const check = await verifyPassword(password, user.password);
+      if (!check.ok) return res.status(401).json({ error: invalidCredentials });
+      if (check.needsRehash && check.hash) {
+        // Re-criptografa silenciosamente (migração de senha legada)
+        await db.update(users).set({ password: check.hash }).where(sql`${users.id} = ${user.id} AND ${users.password} = ${user.password}`);
+        user.password = check.hash;
+      }
+    }
+
+    // 2FA ativo mas sem e-mail — bloqueia para evitar bypass silencioso
+    if (user.twoFactorEnabled && !user.email) {
+      return res.status(403).json({ error: "2FA ativo sem e-mail cadastrado. Contate o administrador." });
+    }
+
+    // Verificação em 2 etapas
+    if (user.twoFactorEnabled && user.email) {
+      try { return res.json(await do2FA(user)); }
+      catch (err: any) {
+        if (err.message === 'CREDENTIAL_CHANGED') return res.status(401).json({ error: invalidCredentials });
+        return res.status(424).json({ error: "Falha ao enviar código de verificação. Tente novamente." });
+      }
+    }
+
+    // Login direto (sem 2FA)
+    const sessionToken = await issuePasswordSession(db, user);
+    if (!sessionToken) return res.status(401).json({ error: invalidCredentials });
+    if (user.role === "ADMIN") triggerAutoBackup();
+    const { password: _p, ...safe } = user as any;
+    return res.status(200).json({ ...safe, sessionToken });
+  } catch (err: any) {
+    return res.status(503).json({ error: "Não foi possível concluir a autenticação." });
+  }
+});
+
+router.get("/session", async (req, res): Promise<void> => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("Vary", "Authorization");
+  try {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "").trim() || null;
+    const user = await readSessionUser(db, users, token);
+    if (!user) {
+      res.status(401).json({ error: "Sessão expirada ou inválida. Faça login novamente." });
+      return;
+    }
+    res.json(user);
+  } catch {
+    res.status(503).json({ error: "Não foi possível verificar sua sessão. Tente novamente." });
+  }
+});
+
+// Logout — invalida sessão no servidor
+router.delete("/session", async (req, res) => {
+  try {
+    const token = req.headers.authorization?.replace(/^Bearer\s+/i, "").trim();
+    if (token) {
+      await db.execute(sql`DELETE FROM sessoes WHERE id = ${token}`);
+    }
+    return res.json({ success: true });
+  } catch { return res.status(503).json({ error: "Não foi possível encerrar a sessão no servidor." }); }
+});
+
+// Validação do código OTP (consumo atômico + rate limiting)
+router.post("/verify-otp", async (req, res) => {
+  try {
+    const { userId, code } = req.body ?? {};
+    if (typeof userId !== 'string' || typeof code !== 'string' || !userId || !/^\d{6}$/.test(code)) return res.status(400).json({ error: "userId e code são obrigatórios" });
+    if (!await consumeAuthAttempt(db, req.socket.remoteAddress ?? 'unknown', userId, 'otp')) return res.status(429).json({ error: "Muitas tentativas. Tente novamente em até 10 minutos." });
+
+    const inputHash = hashCode(code.trim());
+
+    const result = await db.select().from(users).where(eq(users.id, userId));
+    const sessionToken = result.length ? await consumeOtpSession(db, result[0], inputHash) : null;
+    if (!sessionToken) {
+      await db.execute(sql`
+        UPDATE codigos_otp
+        SET
+          tentativas_falhas = COALESCE(tentativas_falhas, 0) + 1,
+          usado = CASE
+            WHEN COALESCE(tentativas_falhas, 0) + 1 >= ${OTP_MAX_ATTEMPTS} THEN true
+            ELSE usado
+          END
+        WHERE usuario_id = ${userId} AND usado = false AND expira_em > NOW()
+      `);
+      return res.status(401).json({ error: "Código inválido, expirado ou tentativas esgotadas. Faça login novamente." });
+    }
+
+    if ((result[0] as any).role === "ADMIN") triggerAutoBackup();
+    const { password: _p, ...safe } = result[0] as any;
+    return res.json({ ...safe, sessionToken });
+  } catch (err: any) {
+    return res.status(503).json({ error: "Não foi possível concluir a autenticação." });
+  }
+});
+
+// ─── BACKUPS (somente ADMIN) ─────────────────────────────────────────────────
+router.get("/backups", async (req, res) => {
+  if ((req as any).sessionUser?.role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const { id } = req.query as any;
+    if (id) {
+      const result = await db.execute(sql`SELECT id, dados AS payload, criado_em AS created_at FROM backups WHERE id = ${id} LIMIT 1`);
+      const rows = (result as any).rows ?? result;
+      if (!rows || rows.length === 0) return res.status(404).json({ error: "Backup não encontrado" });
+      return res.json(rows[0]);
+    }
+    const result = await db.execute(sql`
+      SELECT id, tipo_gatilho AS trigger_type, tamanho_bytes AS size_bytes, criado_em AS created_at FROM backups ORDER BY criado_em DESC
+    `);
+    return res.json((result as any).rows ?? result);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/backups", async (req, res) => {
+  if ((req as any).sessionUser?.role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const { payload, backupId } = req.body ?? {};
+    if (payload !== undefined || backupId) {
+      let restorePayload = payload;
+      if (backupId) {
+        const stored = await db.execute(sql`SELECT dados AS payload FROM backups WHERE id = ${backupId} LIMIT 1`);
+        const storedRows = (stored as any).rows ?? stored;
+        if (!storedRows || storedRows.length === 0) return res.status(404).json({ error: "Backup não encontrado" });
+        restorePayload = storedRows[0].payload;
+      }
+      const result = await restoreBackup(db, restorePayload);
+      return res.json({ success: true, ...result });
+    }
+    const result = await createBackupSnapshot("manual");
+    return res.json({ success: true, ...result });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── USERS ────────────────────────────────────────────────────────────────────
+router.get("/users", async (req, res) => {
+  const role = (req as any).sessionUser?.role;
+  if (role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const data = await db.select().from(users);
+    return res.json(data.map(({ password: _p, ...rest }: any) => rest));
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/users", async (req, res) => {
+  if ((req as any).sessionUser?.role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const body = req.body;
+    if (body.twoFactorEnabled && !body.email) return res.status(400).json({ error: "Verificação em 2 etapas requer e-mail cadastrado." });
+    if (!validPassword(body.password)) return res.status(400).json({ error: "Informe uma senha temporária de 6 a 72 bytes." });
+    const item = await db.insert(users).values({ ...body, id: crypto.randomUUID(), password: await hashPassword(body.password), forcePasswordChange: true }).returning();
+    const { password: _p, ...safe } = item[0] as any;
+    return res.json(safe);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+// Qualquer usuário autenticado pode alterar APENAS a própria senha
+// (usado no primeiro acesso e após reset pelo admin)
+router.post("/users/change-own-password", async (req, res) => {
+  try {
+    const sessionUser = (req as any).sessionUser;
+    if (!sessionUser?.id) return res.status(401).json({ error: "Não autenticado." });
+    const { password, currentPassword, confirmSessionRevocation } = req.body;
+    if (!validPassword(password)) return res.status(400).json({ error: "A senha deve ter de 6 a 72 bytes." });
+    if (confirmSessionRevocation !== true) return res.status(409).json({ error: "Confirme o encerramento dos outros acessos; este aparelho continuará conectado." });
+    if (!await consumeAuthAttempt(db, req.socket.remoteAddress ?? 'unknown', sessionUser.id, 'credential-change')) {
+      return res.status(429).json({ error: "Muitas tentativas. Tente novamente em até 10 minutos." });
+    }
+    const [current] = await db.select().from(users).where(eq(users.id, sessionUser.id)).limit(1);
+    if (!current) return res.status(404).json({ error: "Usuário não encontrado." });
+    if (!current.forcePasswordChange && (typeof currentPassword !== 'string' || !(await verifyPassword(currentPassword, current.password ?? '')).ok)) return res.status(403).json({ error: "Senha atual inválida." });
+    const hashed = await hashPassword(password);
+    const token = req.headers.authorization?.slice(7).trim() ?? '';
+    const item = await credentialChange(db, users, sessionUser.id, { password: hashed, forcePasswordChange: false }, token);
+    if (!item.length) return res.status(404).json({ error: "Usuário não encontrado." });
+    const { password: _p, ...safe } = item[0] as any;
+    return res.json(safe);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+router.put("/users", async (req, res) => {
+  if ((req as any).sessionUser?.role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const { id, createdAt, confirmSessionRevocation, ...updates } = req.body;
+    if (!id) return res.status(400).json({ error: "ID obrigatório" });
+    // 2FA exige e-mail
+    if (updates.twoFactorEnabled && !updates.email) {
+      const existing = await db.select().from(users).where(eq(users.id, id));
+      if (!((existing[0] as any)?.email)) return res.status(400).json({ error: "Verificação em 2 etapas requer e-mail cadastrado." });
+    }
+    // Se a atualização inclui senha em texto puro, criptografar antes de salvar
+    if (Object.hasOwn(updates, 'password')) {
+      if (!validPassword(updates.password)) return res.status(400).json({ error: "Informe uma senha de 6 a 72 bytes, não um hash." });
+      if (confirmSessionRevocation !== true) return res.status(409).json({ error: "Confirme o encerramento das sessões deste usuário." });
+      updates.password = await hashPassword(updates.password);
+      updates.forcePasswordChange = true;
+    }
+    const item = Object.hasOwn(updates, 'password') ? await credentialChange(db, users, id, updates) :
+      await db.update(users).set(updates).where(eq(users.id, id)).returning();
+    if (!item.length) return res.status(404).json({ error: "Usuário não encontrado." });
+    const { password: _p, ...safe } = item[0] as any;
+    return res.json(safe);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/users", async (req, res) => {
+  if ((req as any).sessionUser?.role !== "ADMIN") return res.status(403).json({ error: "Acesso negado — apenas administradores" });
+  try {
+    const { id } = req.query as any;
+    await db.delete(users).where(eq(users.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── SCHOOLS ──────────────────────────────────────────────────────────────────
+router.get("/schools", async (_req, res) => {
+  try { return res.json(await db.select().from(drivingSchools)); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/schools", async (req, res) => {
+  if ((req as any).authorizedRoute !== "schools") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const invalid = schoolPauseValidation(req.body);
+    if (invalid) return res.status(400).json({ error: invalid });
+    const invalidYards = schoolYardsValidation(req.body);
+    if (invalidYards) return res.status(400).json({ error: invalidYards });
+    const conflict = cnhSchoolScaleConflict({ ...req.body, id: undefined }, await db.select().from(drivingSchools));
+    if (conflict) return res.status(409).json({ error: conflict });
+    const item = await db.insert(drivingSchools).values({ id: crypto.randomUUID(), ...req.body }).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/schools", async (req, res) => {
+  if ((req as any).authorizedRoute !== "schools") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const invalid = schoolPauseValidation(req.body);
+    if (invalid) return res.status(400).json({ error: invalid });
+    const invalidYards = schoolYardsValidation(req.body);
+    if (invalidYards) return res.status(400).json({ error: invalidYards });
+    const { id, createdAt, ...updates } = req.body;
+    const existing = await db.select().from(drivingSchools);
+    const current = existing.find(school => school.id === id);
+    if (!current) return res.status(404).json({ error: "Autoescola não encontrada." });
+    const conflict = cnhSchoolScaleConflict({ ...current, ...updates, id }, existing);
+    if (conflict) return res.status(409).json({ error: conflict });
+    const item = await db.update(drivingSchools).set(updates).where(eq(drivingSchools.id, id)).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/schools", async (req, res) => {
+  if ((req as any).authorizedRoute !== "schools") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const { id } = req.query as any;
+    await db.delete(drivingSchools).where(eq(drivingSchools.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── EXAMINERS ────────────────────────────────────────────────────────────────
+router.get("/examiners", async (_req, res) => {
+  try {
+    try { await db.execute(sql`ALTER TABLE examinadores ADD COLUMN IF NOT EXISTS max_vagas_mudanca_padrao integer`); } catch {}
+    return res.json(await db.select().from(examiners));
+  }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/examiners", async (req, res) => {
+  if ((req as any).authorizedRoute !== "examiners") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const item = await db.insert(examiners).values({ id: crypto.randomUUID(), ...req.body }).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/examiners", async (req, res) => {
+  if ((req as any).authorizedRoute !== "examiners") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const { id, createdAt, ...updates } = req.body;
+    const item = await db.update(examiners).set(updates).where(eq(examiners.id, id)).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/examiners", async (req, res) => {
+  if ((req as any).authorizedRoute !== "examiners") return res.status(403).json({ error: "Acesso negado." });
+  try {
+    const { id } = req.query as any;
+    await db.delete(examiners).where(eq(examiners.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── INSTRUCTORS ──────────────────────────────────────────────────────────────
+router.get("/instructors", async (_req, res) => {
+  try {
+    const allInstructors = await db.select().from(instructors);
+    const allVehicles = await db.select().from(vehicles);
+    const data = allInstructors.map((inst: any) => ({
+      ...inst,
+      vehicles: allVehicles.filter((v: any) => v.instructorId === inst.id)
+    }));
+    return res.json(data);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/instructors", async (req, res) => {
+  try {
+    const { vehicles: vList, ...instructorData } = req.body;
+    const newId = crypto.randomUUID();
+    const item = await db.insert(instructors).values({ id: newId, ...instructorData }).returning();
+    let temporaryCredential: { login: string; password: string } | undefined;
+    if (instructorData.cpf) {
+      const login = instructorData.cpf.replace(/\D/g, "");
+      if (login) {
+        const password = crypto.randomUUID();
+        const created = await db.insert(users).values({
+          id: crypto.randomUUID(), name: instructorData.name, login,
+          password: await hashPassword(password), forcePasswordChange: true,
+          role: "INSTRUCTOR", instructorId: newId,
+        }).onConflictDoNothing().returning({ id: users.id });
+        if (created.length) temporaryCredential = { login, password };
+      }
+    }
+    if (vList && Array.isArray(vList)) {
+      for (const v of vList) {
+        await db.insert(vehicles).values({ id: crypto.randomUUID(), instructorId: newId, ...v });
+      }
+    }
+    const allVehicles = await db.select().from(vehicles).where(eq(vehicles.instructorId, newId));
+    return res.json({ ...item[0], vehicles: allVehicles, ...(temporaryCredential ? { temporaryCredential } : {}) });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/instructors", async (req, res) => {
+  try {
+    const { id, createdAt, vehicles: vList, ...updates } = req.body;
+    const item = await db.update(instructors).set(updates).where(eq(instructors.id, id)).returning();
+    // Sincronizar login do usuário instrutor vinculado quando o CPF muda
+    if (updates.cpf !== undefined) {
+      try {
+        const cpfNum = (updates.cpf ?? '').replace(/\D/g, '');
+        if (cpfNum) {
+          await db.execute(sql`
+            UPDATE usuarios SET login = ${cpfNum}
+            WHERE instrutor_id = ${id} AND perfil = 'INSTRUCTOR'
+          `);
+        }
+      } catch {}
+    }
+    if (vList && Array.isArray(vList)) {
+      for (const v of vList) {
+        if (v.id) {
+          const { id: vid, instructorId, createdAt: _c, ...vUpdates } = v;
+          await db.update(vehicles).set(vUpdates).where(eq(vehicles.id, vid));
+        } else {
+          await db.insert(vehicles).values({ id: crypto.randomUUID(), instructorId: id, ...v });
+        }
+      }
+    }
+    const allVehicles = await db.select().from(vehicles).where(eq(vehicles.instructorId, id));
+    return res.json({ ...item[0], vehicles: allVehicles });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/instructors", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    await db.delete(vehicles).where(eq(vehicles.instructorId, id));
+    await db.delete(instructors).where(eq(instructors.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── SCHEDULES ────────────────────────────────────────────────────────────────
+const calcStatus = (dateStr: string, timeStr: string, cur: string) => {
+  if (cur === "CANCELLED") return "CANCELLED";
+  const cleanDate = dateStr.split("T")[0];
+  const now = new Date();
+  const examDate = new Date(`${cleanDate}T${timeStr}`);
+  const ms = 60 * 60 * 1000;
+  if (now > new Date(examDate.getTime() + 4 * ms)) return "CONCLUDED";
+  if (now > new Date(examDate.getTime() - 12 * ms)) return "CLOSED";
+  return "OPEN";
+};
+
+router.get("/schedules", async (_req, res) => {
+  try {
+    const schedules = await db.select().from(examSchedules);
+    for (const s of schedules) {
+      const calc = calcStatus(s.date, s.time, s.status);
+      if (calc !== s.status) {
+        if (calc === "CONCLUDED" && s.status !== "CONCLUDED") {
+          // Atualiza status nas 3 tabelas de módulo (e na legada por segurança)
+          for (const t of [cnhbrasilRequests, cfcRequests, pcdRequests, examRequests] as any[]) {
+            await db.update(t)
+              .set({ status: "WAITING_RESULT", updatedAt: new Date() })
+              .where(and(eq(t.scheduleId, s.id), eq(t.status, "SCHEDULED")));
+          }
+        }
+        await db.update(examSchedules).set({ status: calc }).where(eq(examSchedules.id, s.id));
+        s.status = calc;
+      }
+    }
+    return res.json(schedules);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/schedules", async (req, res) => {
+  try {
+    const { sourceSchoolId, ...body } = req.body ?? {};
+    if (body.type === "COMMON") {
+      if (!["ADMIN", "SUPERVISOR"].includes((req as any).sessionUser?.role)) {
+        return res.status(403).json({ error: "Acesso negado para criar bancas CNH do Brasil." });
+      }
+      if (typeof sourceSchoolId !== "string" || !sourceSchoolId) {
+        return res.status(400).json({ error: "Selecione uma autoescola com Perfil CNH do Brasil." });
+      }
+      const school = (await db.select().from(drivingSchools)
+        .where(eq(drivingSchools.id, sourceSchoolId)).limit(1))[0];
+      if (!school?.cnhBrasilProfile) {
+        return res.status(409).json({ error: "A autoescola não possui Perfil CNH do Brasil ativo." });
+      }
+    }
+    const cleanDate = body.date.split("T")[0];
+    const conflict = cnhBancaConflict({ ...body, id: undefined }, await db.select().from(examSchedules));
+    if (conflict) return res.status(409).json({ error: conflict });
+    const initialStatus = calcStatus(cleanDate, body.time, "OPEN");
+    const last = await db.select({ code: examSchedules.code }).from(examSchedules)
+      .where(isNotNull(examSchedules.code)).orderBy(desc(examSchedules.createdAt)).limit(1);
+    let nextNum = 1001;
+    if (last[0]?.code) {
+      const num = parseInt(last[0].code.replace(/\D/g, ""), 10);
+      if (!isNaN(num)) nextNum = num + 1;
+    }
+    const code = `B${nextNum}`;
+    const item = await db.insert(examSchedules).values({
+      id: crypto.randomUUID(), code, ...body, date: cleanDate, status: initialStatus
+    }).returning();
+    broadcast("schedules_updated", item[0]);
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/schedules", async (req, res) => {
+  try {
+    const body = req.body;
+    const { id, action, reason, createdAt, ...updates } = body;
+    if (
+      (req as any).sessionUser?.role === "SUPERVISOR" &&
+      (action === "CANCEL" || updates.status === "CANCELLED")
+    ) {
+      return res.status(403).json({ error: "Supervisores não podem cancelar bancas." });
+    }
+    if (action === "CANCEL") {
+      const item = await db.update(examSchedules)
+        .set({ status: "CANCELLED", cancellationReason: reason })
+        .where(eq(examSchedules.id, id)).returning();
+      broadcast("schedules_updated", item[0]);
+      return res.json(item[0]);
+    }
+    const existing = await db.select().from(examSchedules);
+    const current = existing.find(schedule => schedule.id === id);
+    if (!current) return res.status(404).json({ error: "Banca não encontrada." });
+    const normalized = { ...updates, ...(updates.date ? { date: updates.date.split("T")[0] } : {}) };
+    const conflict = cnhBancaConflict({ ...current, ...normalized, id }, existing);
+    if (conflict) return res.status(409).json({ error: conflict });
+    const item = await db.update(examSchedules).set(normalized).where(eq(examSchedules.id, id)).returning();
+    broadcast("schedules_updated", item[0]);
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/schedules", async (req, res) => {
+  if ((req as any).sessionUser?.role === "SUPERVISOR") {
+    return res.status(403).json({ error: "Supervisores não podem excluir bancas." });
+  }
+  try {
+    const { id } = req.query as any;
+    await db.delete(examSchedules).where(eq(examSchedules.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── REQUESTS ─────────────────────────────────────────────────────────────────
+import { modalityValidationError } from "../../../../functions/_cnh-exam-modality.js";
+const ALLOWED_REQ_FIELDS = [
+  "id", "studentName", "socialName", "cpf", "phone", "email", "address", "city",
+  "requestType", "examType", "intendedCategory", "source", "schoolId",
+  "paidFee", "completedPracticalCourse", "practicalHours", "hasVehicle",
+  "cnhRestriction", "instructor", "vehiclePlate", "semDuploComando", "checklistVehicle",
+  "practicalCourseInserted", "taxaPaga", "disabilityType", "specialNeeds",
+  "status", "result", "scheduleId", "scheduledDate", "scheduledTime",
+  "scheduledCategory", "examinerId", "attendanceConfirmed", "cancellationReason",
+  "observation", "categoryQuantities", "examHistory", "scheduledBy", "queueUpdatedAt",
+  "modulo", "rowColor", "examModalityA", "examModalityB"
+];
+
+/** Campos removidos de cada tabela de módulo — não podem ser gravados nelas */
+const MODULE_DROPPED_FIELDS: Record<string, string[]> = {
+  CNH_BRASIL: ['disabilityType', 'specialNeeds', 'categoryQuantities', 'interestedExaminers'],
+  CFC:        ['disabilityType', 'specialNeeds', 'examModalityA', 'examModalityB'],
+  PCD:        ['semDuploComando', 'categoryQuantities', 'examModalityA', 'examModalityB', 'interestedExaminers'],
+};
+
+/** Remove campos que não existem mais na tabela do módulo alvo */
+function stripDroppedFields(obj: any, modulo: string): any {
+  const dropped = MODULE_DROPPED_FIELDS[modulo] ?? [];
+  if (dropped.length === 0) return obj;
+  const out = { ...obj };
+  for (const f of dropped) delete out[f];
+  return out;
+}
+
+function deriveModulo(data: any): string {
+  if (data.examType === 'PCD' || data.schoolId === 'PCD') return 'PCD';
+  if (!data.schoolId || data.schoolId === '' || data.schoolId === 'CNH_BRASIL') return 'CNH_BRASIL';
+  return 'CFC';
+}
+
+/** Retorna a tabela Drizzle correta conforme o módulo */
+function getRequestTable(modulo: string) {
+  if (modulo === 'PCD') return pcdRequests;
+  if (modulo === 'CFC') return cfcRequests;
+  return cnhbrasilRequests;
+}
+
+/** Retorna a tabela de slots correta conforme o examType */
+function getSlotTable(examType: string) {
+  return examType === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
+}
+
+/** Encontra um request pelo ID em qualquer das 3 tabelas de módulo (retorna camelCase via ORM) */
+async function findRequestById(id: string): Promise<{ row: any; modulo: string } | null> {
+  const [cnhRows, cfcRows, pcdRows] = await Promise.all([
+    db.select().from(cnhbrasilRequests).where(eq(cnhbrasilRequests.id, id)).limit(1),
+    db.select().from(cfcRequests).where(eq(cfcRequests.id, id)).limit(1),
+    db.select().from(pcdRequests).where(eq(pcdRequests.id, id)).limit(1),
+  ]);
+  if (cnhRows.length > 0) return { row: cnhRows[0], modulo: 'CNH_BRASIL' };
+  if (cfcRows.length > 0) return { row: cfcRows[0], modulo: 'CFC' };
+  if (pcdRows.length > 0) return { row: pcdRows[0], modulo: 'PCD' };
+  return null;
+}
+
+/** Encontra um slot pelo ID em qualquer das 2 tabelas de slots (retorna camelCase via ORM) */
+async function findSlotById(id: string): Promise<{ row: any; module: 'CFC' | 'PCD' } | null> {
+  const [cfcRows, pcdRows] = await Promise.all([
+    db.select().from(cfcScheduleSlots).where(eq(cfcScheduleSlots.id, id)).limit(1),
+    db.select().from(pcdScheduleSlots).where(eq(pcdScheduleSlots.id, id)).limit(1),
+  ]);
+  if (cfcRows.length > 0) return { row: cfcRows[0], module: 'CFC' };
+  if (pcdRows.length > 0) return { row: pcdRows[0], module: 'PCD' };
+  return null;
+}
+
+router.get("/requests", async (req, res) => {
+  try {
+    const { cpf } = req.query as any;
+    if (cpf) {
+      const clean = cpf.replace(/\D/g, "");
+      const pattern = `%${clean}%`;
+      const [cnhRows, cfcRows, pcdRows] = await Promise.all([
+        db.select().from(cnhbrasilRequests).where(like(cnhbrasilRequests.cpf, pattern)),
+        db.select().from(cfcRequests).where(like(cfcRequests.cpf, pattern)),
+        db.select().from(pcdRequests).where(like(pcdRequests.cpf, pattern)),
+      ]);
+      return res.json([...cnhRows, ...cfcRows, ...pcdRows]);
+    }
+    const [cnhRows, cfcRows, pcdRows] = await Promise.all([
+      db.select().from(cnhbrasilRequests),
+      db.select().from(cfcRequests),
+      db.select().from(pcdRequests),
+    ]);
+    return res.json([...cnhRows, ...cfcRows, ...pcdRows]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/requests", async (req, res) => {
+  try {
+    const modalityError = modalityValidationError(req.body);
+    if (modalityError) return res.status(400).json({ error: modalityError });
+    const body = req.body;
+    const filtered: any = {};
+    for (const k of ALLOWED_REQ_FIELDS) { if (body[k] !== undefined) filtered[k] = body[k]; }
+    if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
+    const safeFiltered = stripDroppedFields(filtered, filtered.modulo);
+    const table = getRequestTable(safeFiltered.modulo);
+    const item = await db.insert(table).values({
+      id: safeFiltered.id || crypto.randomUUID(), ...safeFiltered,
+      createdAt: new Date(), updatedAt: new Date()
+    }).returning();
+    const record = item[0] as any;
+    if (record?.modulo === 'CNH_BRASIL') {
+      try {
+        await db.insert(auditLogs).values({
+          id: crypto.randomUUID(),
+          userId: (req as any).sessionUser.id,
+          userName: (req as any).sessionUser.name,
+          userRole: (req as any).sessionUser.role,
+          action: 'Foi cadastrado', entity: 'CNH_BRASIL_CANDIDATO', entityId: record.id,
+          details: { cpf: record.cpf ?? null, name: record.studentName ?? null },
+        });
+      } catch {}
+    }
+    broadcast("requests_updated", record);
+    return res.json(record);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+// Campos que representam edição real do cadastro do candidato
+// (excluem campos de banca, cores, presença e estado interno)
+const AUDIT_TRACKED_FIELDS = [
+  'studentName','socialName','cpf','phone','email','address','city',
+  'requestType','examType','intendedCategory','source',
+  'paidFee','completedPracticalCourse','practicalHours','hasVehicle',
+  'cnhRestriction','instructor','vehiclePlate','checklistVehicle',
+  'practicalCourseInserted','taxaPaga','disabilityType','specialNeeds',
+  'observation','cancellationReason','examModalityA','examModalityB',
+];
+
+router.put("/requests", async (req, res) => {
+  try {
+    const modalityError = modalityValidationError(req.body);
+    if (modalityError) return res.status(400).json({ error: modalityError });
+    const body = req.body;
+    if (!body?.id) return res.status(400).json({ error: "ID required" });
+    const { id, createdAt, ...rawUpdates } = body;
+    const updates: any = {};
+    for (const k of ALLOWED_REQ_FIELDS) { if (rawUpdates[k] !== undefined) updates[k] = rawUpdates[k]; }
+    updates.updatedAt = new Date();
+
+    // Busca registro para saber qual tabela atualizar e para auditoria
+    const found = await findRequestById(id);
+    const role = (req as any).sessionUser?.role;
+    if (body.registerInterest || body.removeInterest) {
+      if (!UpdateExamRequestBody.safeParse(body).success || (body.registerInterest && body.removeInterest)) {
+        return res.status(400).json({ error: "Operação de interesse inválida." });
+      }
+      // "Tenho interesse": identidade vem da sessão, nunca do corpo da requisição.
+      const sessionUserId = (req as any).sessionUser?.id;
+      const [sessionUser] = sessionUserId
+        ? await db.select({ examinerId: users.examinerId }).from(users).where(eq(users.id, sessionUserId)).limit(1)
+        : [];
+      const [examiner] = sessionUser?.examinerId
+        ? await db.select({ id: examiners.id, name: examiners.name }).from(examiners).where(eq(examiners.id, sessionUser.examinerId)).limit(1)
+        : [];
+      const invalid = interestError(found?.row, found?.modulo ?? "", role, examiner, body.removeInterest === true);
+      if (invalid) return res.status(invalid.status).json({ error: invalid.error });
+      const rows = await db.update(cfcRequests).set({ ...interestPatch(found!.row, examiner!, new Date(), body.removeInterest === true), updatedAt: new Date() })
+        .where(and(eq(cfcRequests.id, id), eq(cfcRequests.status, "WAITING_SCHEDULING"))).returning();
+      if (!rows.length) return res.status(409).json({ error: "O pedido mudou. Atualize a lista." });
+      broadcast("requests_updated", rows[0]);
+      return res.json(rows[0]);
+    }
+    if (body.extraEdit) {
+      const invalid = extraEditError(found?.row, found?.modulo ?? "", role, body);
+      if (invalid) return res.status(invalid.status).json({ error: invalid.error });
+      const rows = await db.update(cfcRequests).set({ ...extraPatch(body), updatedAt: new Date() })
+        .where(and(eq(cfcRequests.id, id), eq(cfcRequests.status, "WAITING_SCHEDULING"))).returning();
+      if (!rows.length) return res.status(409).json({ error: "O pedido mudou. Atualize a lista." });
+      broadcast("requests_updated", rows[0]);
+      return res.json(rows[0]);
+    }
+    const denied = confirmedAccessError(found?.row, found?.modulo ?? "", false, role, body);
+    if (denied) return res.status(body.confirmedEdit && !isConfirmedCfc(found?.row, found?.modulo ?? "") ? 409 : 403).json({ error: denied });
+    if (body.confirmedEdit) {
+      if (!canManageConfirmed(role)) return res.status(403).json({ error: "Acesso negado." });
+      const invalid = await validateConfirmedEdit(db, { examiners, systemSettings, blockedDates }, found!.row, body);
+      if (invalid) return res.status(400).json({ error: invalid });
+      const rows = await db.update(cfcRequests).set({ ...confirmedPatch(body), updatedAt: new Date() })
+        .where(and(eq(cfcRequests.id, id), eq(cfcRequests.status, "SCHEDULED"), eq(cfcRequests.attendanceConfirmed, true))).returning();
+      if (!rows.length) return res.status(409).json({ error: "O agendamento mudou. Atualize a lista." });
+      broadcast("requests_updated", rows[0]);
+      return res.json(rows[0]);
+    }
+    const isResultConfirmation =
+      rawUpdates.result !== undefined &&
+      Array.isArray(rawUpdates.examHistory);
+    const isCurrentlyScheduled = found?.row?.status === "SCHEDULED";
+    if (
+      (req as any).sessionUser?.role === "SUPERVISOR" &&
+      (
+        rawUpdates.scheduleId === null ||
+        (
+          isCurrentlyScheduled &&
+          rawUpdates.scheduleId !== undefined &&
+          rawUpdates.scheduleId !== found?.row?.scheduleId
+        ) ||
+        (
+          isCurrentlyScheduled &&
+          rawUpdates.status === "WAITING_SCHEDULING" &&
+          !isResultConfirmation
+        )
+      )
+    ) {
+      return res.status(403).json({ error: "Supervisores não podem remover candidatos da banca." });
+    }
+    const oldModulo = found?.modulo ?? deriveModulo(rawUpdates);
+    // Deriva módulo destino a partir dos dados mesclados (old + incoming)
+    // para capturar mudanças em examType/schoolId sem campo modulo explícito
+    const mergedExamType = rawUpdates.examType ?? found?.row?.examType;
+    const mergedSchoolId = rawUpdates.schoolId ?? found?.row?.schoolId;
+    const newModulo = updates.modulo || deriveModulo({ examType: mergedExamType, schoolId: mergedSchoolId });
+    if (
+      (req as any).sessionUser?.role === "SUPERVISOR" &&
+      isCurrentlyScheduled &&
+      newModulo !== found?.modulo
+    ) {
+      return res.status(403).json({ error: "Supervisores não podem mover candidatos agendados para outro módulo." });
+    }
+    const oldTable = getRequestTable(oldModulo);
+    const newTable = getRequestTable(newModulo);
+
+    let record: any;
+    if (oldModulo !== newModulo) {
+      // Módulo mudou: mover linha atomicamente para a tabela destino
+      // Merge do registro antigo (camelCase do ORM) com as atualizações
+      const merged = stripDroppedFields(
+        { ...found?.row, ...updates, modulo: newModulo, updatedAt: new Date() },
+        newModulo
+      );
+      await db.transaction(async (tx) => {
+        await (tx.insert(newTable) as any).values(merged).onConflictDoNothing();
+        await tx.delete(oldTable).where(eq(oldTable.id, id));
+      });
+      record = merged;
+    } else {
+      const safeUpdates = stripDroppedFields(updates, newModulo);
+      const item = await db.update(oldTable).set(safeUpdates).where(eq(oldTable.id, id)).returning();
+      record = item[0];
+    }
+    if (record?.modulo === 'CNH_BRASIL') {
+      try {
+        let action: string | null = null;
+        if (body.scheduleId && body.status === 'SCHEDULED') {
+          action = 'Foi adicionado na Banca';
+        } else if (body.scheduleId === null && body.status === 'WAITING_SCHEDULING') {
+          action = 'Foi excluído da Banca';
+        } else {
+          const changed = AUDIT_TRACKED_FIELDS.some(f => {
+            const oldVal = (found?.row as any)?.[f];
+            const newVal = rawUpdates[f];
+            if (newVal === undefined) return false;
+            return String(oldVal ?? '') !== String(newVal ?? '');
+          });
+          if (changed) action = 'Foi modificado';
+        }
+        if (action) {
+          await db.insert(auditLogs).values({
+            id: crypto.randomUUID(),
+            userId: (req as any).sessionUser.id,
+            userName: (req as any).sessionUser.name,
+            userRole: (req as any).sessionUser.role,
+            action, entity: 'CNH_BRASIL_CANDIDATO', entityId: record.id,
+            details: { cpf: record.cpf ?? null, name: record.studentName ?? null },
+          });
+        }
+      } catch {}
+    }
+    broadcast("requests_updated", record);
+    return res.json(record);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/requests", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID obrigatório" });
+    const found = await findRequestById(id);
+    const role = (req as any).sessionUser?.role;
+    if (isConfirmedCfc(found?.row, found?.modulo ?? "") && !canManageConfirmed(role)) {
+      return res.status(403).json({ error: "Somente administradores e supervisores podem excluir provas confirmadas." });
+    }
+    if (req.query.confirmedDelete === "true") {
+      if (!canManageConfirmed(role)) return res.status(403).json({ error: "Acesso negado." });
+      if (!isConfirmedCfc(found?.row, found?.modulo ?? "")) return res.status(409).json({ error: "O agendamento não está mais confirmado." });
+      const condition = and(eq(cfcRequests.id, id), eq(cfcRequests.status, "SCHEDULED"), eq(cfcRequests.attendanceConfirmed, true));
+      const affected = hasCandidateIdentity(found!.row)
+        ? await db.update(cfcRequests).set({ ...clearAppointment, updatedAt: new Date() }).where(condition).returning()
+        : await db.delete(cfcRequests).where(condition).returning();
+      if (!affected.length) return res.status(409).json({ error: "O agendamento mudou. Atualize a lista." });
+      broadcast("requests_updated", { id });
+      return res.json({ success: true });
+    }
+    if ((req as any).sessionUser?.role === "SUPERVISOR") {
+      return res.status(403).json({ error: "Supervisores não podem excluir candidatos." });
+    }
+    // Apaga da tabela correta (e das outras como segurança)
+    await db.delete(cnhbrasilRequests).where(eq(cnhbrasilRequests.id, id));
+    await db.delete(cfcRequests).where(eq(cfcRequests.id, id));
+    await db.delete(pcdRequests).where(eq(pcdRequests.id, id));
+    if (found?.modulo === 'CNH_BRASIL') {
+      try {
+        await db.insert(auditLogs).values({
+          id: crypto.randomUUID(),
+          userId: (req as any).sessionUser.id,
+          userName: (req as any).sessionUser.name,
+          userRole: (req as any).sessionUser.role,
+          action: 'Foi excluído', entity: 'CNH_BRASIL_CANDIDATO', entityId: id,
+          details: { cpf: found.row?.cpf ?? null, name: found.row?.studentName ?? null },
+        });
+      } catch {}
+    }
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── SETTINGS ─────────────────────────────────────────────────────────────────
+router.post("/cpf-lookup", async (req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  try {
+    const identity = (req as any).sessionUser;
+    const [user] = await db.select({ id: users.id, role: users.role, allowedModules: users.allowedModules })
+      .from(users).where(eq(users.id, identity?.id ?? ''));
+    const [settings] = await db.select({ enabled: systemSettings.cnhCpfAutofillEnabled })
+      .from(systemSettings).where(eq(systemSettings.id, 1));
+    const result = await lookupCpf({
+      body: req.body, user, enabled: settings?.enabled === true,
+      key: process.env.APICPF_API_KEY, consumeQuota: () => consumeCpfQuota(db, user.id),
+    });
+    return res.status(result.status).json(result.body);
+  } catch { return res.status(503).json({ error: 'Não foi possível consultar o CPF. Preencha o nome manualmente.' }); }
+});
+router.get("/settings", async (_req, res) => {
+  try {
+    const data = await db.select().from(systemSettings).where(eq(systemSettings.id, 1));
+    if (data.length === 0) {
+      const def = await db.insert(systemSettings).values({ id: 1, agencyName: "DETRAN" }).returning();
+      return res.json(def[0]);
+    }
+    return res.json(data[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/settings", async (req, res) => {
+  try {
+    const invalid = cpfSettingError(req.body, (req as any).sessionUser?.role);
+    if (invalid) return res.status((req as any).sessionUser?.role !== 'ADMIN' ? 403 : 400).json({ error: invalid });
+    const { id: _id, ...updates } = req.body;
+    const existing = await db.select().from(systemSettings).where(eq(systemSettings.id, 1));
+    if (existing.length === 0) {
+      const item = await db.insert(systemSettings).values({ id: 1, ...updates }).returning();
+      return res.json(item[0]);
+    }
+    const item = await db.update(systemSettings).set(updates).where(eq(systemSettings.id, 1)).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── BLOCKED DATES ────────────────────────────────────────────────────────────
+router.get("/blocked-dates", async (_req, res) => {
+  try { return res.json(await db.select().from(blockedDates).orderBy(blockedDates.date)); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/blocked-dates", async (req, res) => {
+  try {
+    const { date, description, isHoliday } = req.body;
+    if (!date) return res.status(400).json({ error: "Data é obrigatória" });
+    const existing = await db.select().from(blockedDates).where(eq(blockedDates.date, date));
+    if (existing.length > 0) return res.status(400).json({ error: "Data já bloqueada" });
+    const item = { id: crypto.randomUUID(), date, description: description || "", isHoliday: !!isHoliday, createdAt: new Date() };
+    await db.insert(blockedDates).values(item);
+    return res.status(201).json(item);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/blocked-dates", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    await db.update(blockedDates).set(req.body).where(eq(blockedDates.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/blocked-dates", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    await db.delete(blockedDates).where(eq(blockedDates.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── CITIES ───────────────────────────────────────────────────────────────────
+router.get("/cities", async (_req, res) => {
+  try { return res.json(await db.select().from(cities)); }
+  catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/cities", async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) return res.status(400).json({ error: "Nome é obrigatório" });
+    const norm = name.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    const item = { id: crypto.randomUUID(), name: norm, createdAt: new Date() };
+    await db.insert(cities).values(item);
+    return res.status(201).json(item);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/cities", async (req, res) => {
+  try {
+    const { id, name } = req.body;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    const norm = name?.toUpperCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+    await db.update(cities).set({ name: norm }).where(eq(cities.id, id));
+    return res.json({ id, name: norm });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/cities", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    await db.delete(cities).where(eq(cities.id, id));
+    return res.status(204).end();
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── BANCA RESULTS ────────────────────────────────────────────────────────────
+router.get("/banca-results", async (req, res) => {
+  try {
+    const { scheduleId, schoolId } = req.query as any;
+    let q = db.select().from(bancaResults);
+    if (scheduleId && schoolId) {
+      // @ts-ignore
+      q = q.where(and(eq(bancaResults.scheduleId, scheduleId), eq(bancaResults.schoolId, schoolId)));
+    } else if (scheduleId) {
+      // @ts-ignore
+      q = q.where(eq(bancaResults.scheduleId, scheduleId));
+    } else if (schoolId) {
+      // @ts-ignore
+      q = q.where(eq(bancaResults.schoolId, schoolId));
+    }
+    return res.json(await q);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/banca-results", async (req, res) => {
+  try {
+    const { scheduleId, schoolId, category, ...rest } = req.body;
+    if (!scheduleId || !schoolId || !category) return res.status(400).json({ error: "scheduleId, schoolId, category required" });
+    const existing = await db.select().from(bancaResults)
+      .where(and(eq(bancaResults.scheduleId, scheduleId), eq(bancaResults.schoolId, schoolId), eq(bancaResults.category, category)));
+    if (existing.length > 0) {
+      const updated = await db.update(bancaResults).set({ ...rest, updatedAt: new Date() })
+        .where(eq(bancaResults.id, existing[0].id)).returning();
+      return res.json(updated[0]);
+    }
+    const item = await db.insert(bancaResults).values({ id: crypto.randomUUID(), scheduleId, schoolId, category, ...rest }).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/banca-results", async (req, res) => {
+  try {
+    const { id, createdAt, ...updates } = req.body;
+    const item = await db.update(bancaResults).set({ ...updates, updatedAt: new Date() })
+      .where(eq(bancaResults.id, id)).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── RISK AREA ────────────────────────────────────────────────────────────────
+router.get("/risk-area", (_req, res) => res.json({ enabled: false, areas: [] }));
+router.post("/risk-area", async (req, res) => {
+  if ((req as any).sessionUser?.role !== 'ADMIN') return res.status(403).json({ error: "Acesso negado." });
+  if (!['RESET_DATA', 'CLEANUP_PHANTOM_REQUESTS'].includes(req.body.action)) return res.status(400).json({ error: "Ação inválida." });
+  try {
+    const [settings] = await db.select().from(systemSettings).where(eq(systemSettings.id, 1));
+    if (settings?.riskAreaKey && settings.riskAreaKey !== req.body.securityKey) return res.status(403).json({ error: "Chave de segurança inválida." });
+    return res.json(await operationalCleanup(db, req.body.action));
+  } catch { return res.status(503).json({ error: "Não foi possível concluir a limpeza." }); }
+});
+
+// ─── VEHICLE LOOKUP ───────────────────────────────────────────────────────────
+import https from "https";
+const PLATE_RE = /^[A-Z]{3}[0-9]{4}$|^[A-Z]{3}[0-9][A-Z][0-9]{2}$|^[A-Z]{3}[0-9]{2}[A-Z][0-9]$/;
+
+router.get("/vehicle-lookup", async (req, res) => {
+  const plate = ((req.query as any).plate || "").toString().toUpperCase().replace(/[^A-Z0-9]/g, "");
+  if (!plate || plate.length < 7) return res.status(400).json({ error: "Placa inválida" });
+  if (!PLATE_RE.test(plate)) return res.status(400).json({ error: "Formato de placa inválido" });
+  try {
+    const data = await new Promise<any>((resolve, reject) => {
+      const r = https.get(`https://apicarros.com/v1/consulta/${plate}/json`, {
+        headers: { Accept: "application/json", "User-Agent": "Mozilla/5.0" },
+        rejectUnauthorized: false,
+      }, (resp) => {
+        let body = "";
+        resp.on("data", (c) => { body += c; });
+        resp.on("end", () => resolve({ status: resp.statusCode, body }));
+      });
+      r.on("error", reject);
+      r.setTimeout(9000, () => r.destroy(new Error("timeout")));
+    });
+    if (data.status === 404) return res.status(404).json({ error: "Veículo não encontrado" });
+    if (data.status !== 200) return res.status(503).json({ error: "Serviço indisponível" });
+    const d = JSON.parse(data.body);
+    return res.json({
+      plate: d.placa || plate, brand: d.marca || "", model: d.modelo || "",
+      color: d.cor || "", year: d.anoModelo || "", state: d.uf || "", city: d.municipio || "",
+    });
+  } catch (err: any) { return res.status(503).json({ error: "Serviço indisponível" }); }
+});
+
+// ─── SCHEDULE SLOTS ───────────────────────────────────────────────────────────
+router.get("/schedule-slots", async (req, res) => {
+  try {
+    const { schoolId, scheduledDate } = req.query as any;
+    // UNION das tabelas CFC e PCD via ORM (CNH Brasil não usa slots)
+    let cfcQ = db.select().from(cfcScheduleSlots) as any;
+    let pcdQ = db.select().from(pcdScheduleSlots) as any;
+    if (schoolId) {
+      cfcQ = cfcQ.where(eq(cfcScheduleSlots.schoolId, schoolId));
+      pcdQ = pcdQ.where(eq(pcdScheduleSlots.schoolId, schoolId));
+    }
+    if (scheduledDate) {
+      cfcQ = cfcQ.where(eq(cfcScheduleSlots.scheduledDate, scheduledDate));
+      pcdQ = pcdQ.where(eq(pcdScheduleSlots.scheduledDate, scheduledDate));
+    }
+    const [cfcRows, pcdRows] = await Promise.all([cfcQ, pcdQ]);
+    return res.json([...(cfcRows as any[]), ...(pcdRows as any[])]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/schedule-slots", async (req, res) => {
+  try {
+    const body = req.body;
+    if (body?.automaticFixed) {
+      const role = (req as any).sessionUser?.role;
+      if (!["ADMIN", "SUPERVISOR", "OPERATOR"].includes(role)) {
+        return res.status(403).json({ error: "Acesso negado para gerar escalas." });
+      }
+      const { schoolId, date, slots } = body.automaticFixed;
+      if (typeof schoolId !== "string" || !schoolId || !/^\d{4}-\d{2}-\d{2}$/.test(date) ||
+        !Array.isArray(slots) || slots.length < 1 || slots.length > 20 ||
+        slots.some((s: any) => !s || typeof s.examinerId !== "string" || !s.examinerId ||
+          !/^(?:[01]\d|2[0-3]):[0-5]\d$/.test(s.scheduledTime)) ||
+        new Set(slots.map((s: any) => s.scheduledTime)).size !== slots.length) {
+        return res.status(400).json({ error: "Dados inválidos para a escala fixa." });
+      }
+      const school = (await db.select().from(drivingSchools)
+        .where(eq(drivingSchools.id, schoolId)).limit(1))[0];
+      if (!school) return res.status(404).json({ error: "Autoescola não encontrada." });
+      if (mainSchedulePaused(school, date)) {
+        return res.status(409).json({ error: "Escala Principal pausada nesta data. Consulte a data novamente." });
+      }
+      const day = ["DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SAB"][new Date(`${date}T00:00:00`).getDay()];
+      const schedule = school.provisionalSchedule?.active ? school.provisionalSchedule :
+        school.mainSchedule?.active ? school.mainSchedule : null;
+      const configured = schedule?.days?.includes(day)
+        ? (schedule.slots ?? []).filter((s: any) => !s.day || s.day === day) : [];
+      if (!configured.length || configured.length !== slots.length) {
+        return res.status(409).json({ error: "A escala da autoescola mudou. Consulte a data novamente." });
+      }
+      if (!school.examRotation) {
+        const ordered = (items: string[]) => items.sort().join("|");
+        if (ordered(configured.map((s: any) => `${s.examiner}:${s.time}`)) !==
+          ordered(slots.map((s: any) => `${s.examinerId}:${s.scheduledTime}`))) {
+          return res.status(409).json({ error: "Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa." });
+        }
+      }
+      const city = school.examRotation
+        ? (await db.select().from(cities)).find(c => c.name.trim() === school.city?.trim())
+        : null;
+      if (school.examRotation && !city) {
+        return res.status(409).json({ error: "Cidade da autoescola não cadastrada para o rodízio." });
+      }
+      const existing = await db.select().from(cfcScheduleSlots).where(and(
+        eq(cfcScheduleSlots.schoolId, schoolId), eq(cfcScheduleSlots.scheduledDate, date),
+        eq(cfcScheduleSlots.requestType, "FIXA")));
+      if (existing.some(s => s.status !== "CANCELLED")) {
+        return res.status(409).json({ error: "Esta autoescola já possui uma escala fixa nesta data." });
+      }
+      for (const examinerId of new Set<string>(slots.map((s: any) => s.examinerId))) {
+        const [booked, examinerRows] = await Promise.all([
+          db.select().from(cfcScheduleSlots).where(and(
+            eq(cfcScheduleSlots.examinerId, examinerId), eq(cfcScheduleSlots.scheduledDate, date))),
+          db.select().from(examiners).where(eq(examiners.id, examinerId)).limit(1),
+        ]);
+        const active = booked.filter(s => s.status !== "CANCELLED");
+        const assigned = slots.filter((s: any) => s.examinerId === examinerId);
+        if (school.examRotation) {
+          const examiner = examinerRows[0];
+          const availability = examiner?.rotationAvailability;
+          const times = availability?.examsPerDay === 2
+            ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime];
+          if (!examiner?.examRotation || examiner.canExamCommon === false ||
+            !availability?.days?.includes(day) || !availability.cityIds?.includes(city!.id) ||
+            ![1, 2].includes(availability.examsPerDay) ||
+            assigned.some((s: any) => !times.includes(s.scheduledTime))) {
+            return res.status(409).json({ error: "Rodízio de Provas desativado ou disponibilidade incompatível para o examinador." });
+          }
+        }
+        const capacity = examinerRows[0]?.examRotation
+          ? examinerRows[0].rotationAvailability?.examsPerDay : null;
+        if (assigned.some((s: any) => active.some(b => b.scheduledTime === s.scheduledTime)) ||
+          (capacity && active.length + assigned.length > capacity)) {
+          return res.status(409).json({ error: "O examinador já possui prova nesse horário ou atingiu a capacidade diária." });
+        }
+      }
+      // Um único INSERT grava todas as provas da autoescola ou nenhuma. IDs estáveis
+      // impedem que duas gerações simultâneas, que leram o mesmo estado, dupliquem a escala.
+      const created = await db.insert(cfcScheduleSlots).values(slots.map((s: any, index: number) => ({
+        id: `auto-fixed:${schoolId}:${date}:${existing.length}:${index}`,
+        schoolId, scheduledDate: date, scheduledTime: s.scheduledTime, examinerId: s.examinerId,
+        examType: "COMMON", requestType: "FIXA", intendedCategory: "A,B",
+        status: "SCHEDULED", attendanceConfirmed: true, observation: "",
+        createdAt: new Date(), updatedAt: new Date(),
+      }))).returning();
+      return res.json(created);
+    }
+    if ((body?.requestType || "FIXA") === "FIXA" &&
+      !["ADMIN", "SUPERVISOR", "OPERATOR"].includes((req as any).sessionUser?.role)) {
+      return res.status(403).json({ error: "Acesso negado para criar escala fixa." });
+    }
+    const table = getSlotTable(body.examType || '');
+    const item = await db.insert(table).values({
+      id: body.id || crypto.randomUUID(),
+      schoolId: body.schoolId, examType: body.examType,
+      requestType: body.requestType || "FIXA", intendedCategory: body.intendedCategory,
+      scheduledDate: body.scheduledDate, scheduledTime: body.scheduledTime,
+      examinerId: body.examinerId, scheduleId: body.scheduleId,
+      scheduledCategory: body.scheduledCategory, status: body.status || "SCHEDULED",
+      attendanceConfirmed: body.attendanceConfirmed ?? false,
+      cancellationReason: body.cancellationReason, observation: body.observation,
+      createdAt: new Date(), updatedAt: new Date(),
+    }).returning();
+    return res.json(item[0]);
+  } catch (err: any) {
+    if (err.code === "23505" || err.cause?.code === "23505") {
+      return res.status(409).json({ error: "A escala fixa já foi gerada por outra pessoa. Atualize os agendamentos." });
+    }
+    return res.status(500).json({ error: err.message });
+  }
+});
+router.put("/schedule-slots", async (req, res) => {
+  try {
+    const { id, createdAt, ...updates } = req.body;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    const allowed = ["schoolId","examType","requestType","intendedCategory","scheduledDate",
+      "scheduledTime","examinerId","scheduleId","scheduledCategory","status",
+      "attendanceConfirmed","cancellationReason","observation"];
+    const filtered: any = {};
+    for (const k of allowed) { if (updates[k] !== undefined) filtered[k] = updates[k]; }
+    // Descobre em qual tabela está o slot e atualiza (ORM devolve camelCase)
+    const foundSlot = await findSlotById(id);
+    const role = (req as any).sessionUser?.role;
+    if (req.body.extraEdit) {
+      const invalid = extraEditError(foundSlot?.row, foundSlot?.module ?? "", role, req.body);
+      if (invalid) return res.status(invalid.status).json({ error: invalid.error });
+      const rows = await db.update(cfcScheduleSlots).set({ ...extraPatch(req.body), updatedAt: new Date() })
+        .where(and(eq(cfcScheduleSlots.id, id), eq(cfcScheduleSlots.status, "WAITING_SCHEDULING"))).returning();
+      if (!rows.length) return res.status(409).json({ error: "O pedido mudou. Atualize a lista." });
+      broadcast("requests_updated", rows[0]);
+      return res.json(rows[0]);
+    }
+    const denied = confirmedAccessError(foundSlot?.row, foundSlot?.module ?? "", true, role, req.body);
+    if (denied) return res.status(req.body.confirmedEdit && !isConfirmedCfc(foundSlot?.row, "", true) ? 409 : 403).json({ error: denied });
+    if (req.body.confirmedEdit) {
+      if (!canManageConfirmed(role)) return res.status(403).json({ error: "Acesso negado." });
+      const invalid = await validateConfirmedEdit(db, { examiners, systemSettings, blockedDates }, foundSlot!.row, req.body);
+      if (invalid) return res.status(400).json({ error: invalid });
+      const table = foundSlot!.module === "PCD" ? pcdScheduleSlots : cfcScheduleSlots;
+      const rows = await db.update(table).set({ ...confirmedPatch(req.body), updatedAt: new Date() })
+        .where(and(eq(table.id, id), eq(table.status, "SCHEDULED"), eq(table.attendanceConfirmed, true))).returning();
+      if (!rows.length) return res.status(409).json({ error: "O agendamento mudou. Atualize a lista." });
+      broadcast("requests_updated", rows[0]);
+      return res.json(rows[0]);
+    }
+    const oldSlotModule = foundSlot?.module;
+    const newExamType = filtered.examType ?? foundSlot?.row?.examType ?? '';
+    const newSlotModule: 'CFC' | 'PCD' = newExamType === 'PCD' ? 'PCD' : 'CFC';
+    const oldSlotTable = oldSlotModule === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
+    const newSlotTable = newSlotModule === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
+
+    let slotResult: any;
+    if (oldSlotModule && oldSlotModule !== newSlotModule) {
+      // examType mudou de categoria: mover slot atomicamente para a tabela correta
+      const merged = { ...foundSlot!.row, ...filtered, updatedAt: new Date() };
+      await db.transaction(async (tx) => {
+        await (tx.insert(newSlotTable) as any).values(merged).onConflictDoNothing();
+        await tx.delete(oldSlotTable).where(eq(oldSlotTable.id, id));
+      });
+      slotResult = merged;
+    } else {
+      const item = await db.update(oldSlotTable).set({ ...filtered, updatedAt: new Date() })
+        .where(eq(oldSlotTable.id, id)).returning();
+      slotResult = item[0] ?? { id, ...updates };
+    }
+    return res.json(slotResult);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/schedule-slots", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    const found = await findSlotById(id);
+    const role = (req as any).sessionUser?.role;
+    if (isConfirmedCfc(found?.row, found?.module ?? "", true) && !canManageConfirmed(role)) {
+      return res.status(403).json({ error: "Somente administradores e supervisores podem excluir provas confirmadas." });
+    }
+    if (req.query.confirmedDelete === "true") {
+      if (!canManageConfirmed(role)) return res.status(403).json({ error: "Acesso negado." });
+      if (!isConfirmedCfc(found?.row, found?.module ?? "", true)) return res.status(409).json({ error: "O agendamento não está mais confirmado." });
+      const table = found!.module === "PCD" ? pcdScheduleSlots : cfcScheduleSlots;
+      const removed = await db.delete(table).where(and(eq(table.id, id), eq(table.status, "SCHEDULED"),
+        eq(table.attendanceConfirmed, true))).returning();
+      if (!removed.length) return res.status(409).json({ error: "O agendamento mudou. Atualize a lista." });
+      broadcast("requests_updated", { id });
+      return res.json({ success: true });
+    }
+    // Apaga das 2 tabelas — apenas uma terá o registro
+    await db.delete(cfcScheduleSlots).where(eq(cfcScheduleSlots.id, id));
+    await db.delete(pcdScheduleSlots).where(eq(pcdScheduleSlots.id, id));
+    return res.json({ success: true });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── EXAM LOCATIONS ───────────────────────────────────────────────────────────
+router.get("/exam-locations", async (_req, res) => {
+  try {
+    return res.json(await db.select().from(examLocations));
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.post("/exam-locations", async (req, res) => {
+  try {
+    const { cityId, address, mapsUrl, regionsServed } = req.body;
+    if (!cityId) return res.status(400).json({ error: "cityId é obrigatório" });
+    const item = await db.insert(examLocations).values({
+      id: crypto.randomUUID(), cityId, address: address || null,
+      mapsUrl: mapsUrl || null, regionsServed: regionsServed || [],
+    }).returning();
+    return res.status(201).json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.put("/exam-locations", async (req, res) => {
+  try {
+    const { id, createdAt, ...updates } = req.body;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    const item = await db.update(examLocations).set(updates).where(eq(examLocations.id, id)).returning();
+    return res.json(item[0]);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+router.delete("/exam-locations", async (req, res) => {
+  try {
+    const { id } = req.query as any;
+    if (!id) return res.status(400).json({ error: "ID required" });
+    await db.delete(examLocations).where(eq(examLocations.id, id));
+    return res.status(204).end();
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── CNH BRASIL LOGS ──────────────────────────────────────────────────────────
+router.get("/cnh-logs", async (req, res) => {
+  try {
+    const limit = Math.max(1, Math.min(300, parseInt((req.query.limit as string) || "100") || 100));
+    const offset = Math.max(0, Math.min(100_000, parseInt((req.query.offset as string) || "0") || 0));
+    const rows = await db.execute(sql`
+      SELECT id, usuario_id AS user_id, nome_usuario AS user_name, perfil_usuario AS user_role,
+             acao AS action, entidade AS entity, entidade_id AS entity_id,
+             detalhes AS details, criado_em AS created_at
+      FROM logs_auditoria
+      WHERE entidade LIKE 'CNH_BRASIL%'
+      ORDER BY criado_em DESC
+      LIMIT ${limit} OFFSET ${offset}
+    `);
+    return res.json((rows as any).rows ?? rows);
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+// ─── SETUP (protegido por SESSION_SECRET) ─────────────────────────────────────
+// Requer header Authorization: Bearer <SESSION_SECRET>.
+// Cria usuário admin apenas se não existir — não define senha (definida no primeiro login).
+router.all("/setup", async (req, res) => {
+  const sessionSecret = process.env.SESSION_SECRET;
+  const authHeader = req.headers["authorization"] ?? "";
+  if (!sessionSecret || authHeader !== `Bearer ${sessionSecret}`) {
+    return res.status(401).json({ error: "Acesso não autorizado. Forneça o header Authorization: Bearer <SESSION_SECRET>." });
+  }
+  if (req.method !== 'POST' || !validPassword(req.body?.initialPassword)) return res.status(400).json({ error: "Informe uma senha inicial de 6 a 72 bytes via POST." });
+  try {
+    const existing = await db.select().from(users).where(eq(users.login, "admin"));
+    if (existing.length && !existing[0].password?.trim()) {
+      await db.update(users).set({ password: await hashPassword(req.body.initialPassword), forcePasswordChange: true })
+        .where(sql`${users.id} = ${existing[0].id} AND (${users.password} IS NULL OR ${users.password} = '')`);
+    }
+    if (existing.length === 0) {
+      await db.insert(users).values({
+        id: crypto.randomUUID(), name: "Administrador", login: "admin",
+        password: await hashPassword(req.body.initialPassword), role: "ADMIN", forcePasswordChange: true,
+      });
+    }
+    return res.json({ success: true, message: "Setup ok" });
+  } catch (err: any) { return res.status(500).json({ error: err.message }); }
+});
+
+export default router;

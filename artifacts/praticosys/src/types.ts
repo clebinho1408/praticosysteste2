@@ -1,0 +1,352 @@
+
+export enum UserRole {
+  ADMIN = 'ADMIN',
+  SUPERVISOR = 'SUPERVISOR',
+  OPERATOR = 'OPERATOR',
+  CONSULTANT = 'CONSULTANT',
+  SCHOOL = 'SCHOOL',
+  EXAMINER = 'EXAMINER',
+  INSTRUCTOR = 'INSTRUCTOR'
+}
+
+export enum ExamType {
+  COMMON = 'COMMON',
+  PCD = 'PCD'
+}
+
+export enum RequestSource {
+  STUDENT_DIRECT = 'STUDENT_DIRECT',
+  SCHOOL = 'SCHOOL'
+}
+
+export enum RequestType {
+  FIXA = 'FIXA',
+  EXTRA = 'EXTRA',
+  REPOSICAO = 'REPOSICAO'
+}
+
+export enum ExamStatus {
+  IN_ANALYSIS = 'IN_ANALYSIS',               // Cadastros em Análise
+  WAITING_SCHEDULING = 'WAITING_SCHEDULING', // Aguardando Agendamento
+  SCHEDULED = 'SCHEDULED',                   // Agendado
+  WAITING_RESULT = 'WAITING_RESULT',         // Aguardando Resultado
+  RETEST = 'RETEST',                         // Reteste
+  DONE = 'DONE',                             // Realizado
+  CANCELLED = 'CANCELLED'                    // Cancelado
+}
+
+export type ExamResult = 'APTO' | 'INAPTO' | 'FALTOU' | 'CANCELADO';
+
+export type OperatorModule = 'cnh' | 'cfc' | 'pcd' | 'cadastro';
+
+export interface User {
+  id: string;
+  name: string;
+  role: UserRole;
+  schoolId?: string; // If role is SCHOOL
+  examinerId?: string; // If role is EXAMINER
+  instructorId?: string; // If role is INSTRUCTOR
+  login: string;
+  password?: string;
+  forcePasswordChange?: boolean;
+  allowedModules?: OperatorModule[]; // Only for OPERATOR role
+  allowedLocationIds?: string[]; // Restricts CNH do Brasil bancas visible to this user (empty = all)
+  allowedCadastroTabs?: string[]; // Sub-tabs within Cadastros module: 'autoescolas' | 'examinadores' | 'instrutores'
+  email?: string;
+  phone?: string;
+  twoFactorEnabled?: boolean;
+}
+
+export interface ScheduleSpecificDate {
+  id: string;
+  date: string;    // 'YYYY-MM-DD'
+  time: string;    // 'HH:mm'
+  examiner: string; // examiner id
+}
+
+export interface SchoolSchedule {
+  frequency: '1_WEEK' | '2_WEEK' | '3_WEEK' | '2_DAY' | '15_DAYS';
+  days: string[]; // ['SEG', 'TER', ...]
+  slots: { time: string; examiner: string; day?: string }[];
+  active: boolean;
+  pausedDates?: string[]; // Main schedule only: whole-day exceptions, without toggling active.
+  specificDates?: ScheduleSpecificDate[]; // used by provisional schedule
+  activateFrom?: string; // 'YYYY-MM-DD' — provisional: auto-activate on this date (undefined = manual only)
+}
+
+export type SchoolYardType = 'MOTO' | 'CARRO' | 'MUDANCA';
+
+export interface SchoolYard {
+  id: string;
+  type: SchoolYardType; // MOTO = Cat. A | CARRO = Cat. B | MUDANCA = Cat. C, D, E
+  address: string;
+  reference?: string;
+}
+
+export interface DrivingSchool {
+  id: string;
+  name: string;
+  phone: string;
+  email: string;
+  address: string;
+  city?: string;
+  services: string[]; // ['A', 'B', 'C', 'D', 'E']
+  doNotCreateUser?: boolean;
+  examRotation?: boolean;
+  cnhBrasilProfile?: boolean;
+  
+  // Pátios (legado — campos únicos; mantidos apenas para compatibilidade de dados)
+  motoYardAddress?: string;
+  carYardAddress?: string;
+  categoryChangeYardAddress?: string; // C, D, E
+  // Pátios (atual — lista com tipo, endereço e referência)
+  yards?: SchoolYard[];
+  
+  // Escalas
+  mainSchedule?: SchoolSchedule;
+  provisionalSchedule?: SchoolSchedule;
+}
+
+export interface ExaminerRotationAvailability {
+  days: string[]; // SEG, TER, QUA, QUI, SEX, SAB, DOM
+  defaultTime: string; // HH:mm — primeira prova
+  secondDefaultTime?: string; // HH:mm — segunda prova, quando houver
+  examsPerDay: 1 | 2;
+  cityIds: string[];
+}
+
+export type BlockedPeriodSlot = 'ALL_DAY' | 'MORNING' | 'AFTERNOON';
+
+export interface ExaminerBlockedPeriod {
+  id: string;              // UUID gerado no cliente
+  startDate: string;       // 'YYYY-MM-DD'
+  endDate: string;         // 'YYYY-MM-DD'
+  description: string;
+  period?: BlockedPeriodSlot; // undefined / 'ALL_DAY' = dia inteiro; 'MORNING' = só manhã; 'AFTERNOON' = só tarde
+}
+
+export interface Examiner {
+  id: string;
+  name: string;
+  registrationNumber: string; // Matrícula
+  canExamCommon?: boolean;
+  canExamPCD?: boolean;
+  categories?: string[]; // ['A', 'B', 'C', 'D', 'E', 'PCD']
+  defaultMaxSlotsA?: number | null; // Vagas padrão Cat. A por examinador
+  defaultMaxSlotsB?: number | null; // Vagas padrão Cat. B por examinador
+  defaultMaxSlotsMudanca?: number | null; // Vagas padrão Cat. C, D, E (Mud. Cat.)
+  examRotation?: boolean;
+  rotationAvailability?: ExaminerRotationAvailability | null;
+  blockedPeriods?: ExaminerBlockedPeriod[]; // Datas de bloqueio do examinador
+}
+
+export interface Vehicle {
+  id: string;
+  instructorId: string;
+  type: 'CAR' | 'MOTO';
+  brand: string;
+  model: string;
+  plate: string;
+  active: boolean;
+  transmission?: 'AUTOMATICA' | 'MANUAL';
+  accessories?: string[];
+  duploComando?: boolean; // Somente para CAR
+  procuracao?: boolean; // Veículo credenciado/autorizado pelo Detran (nome legado preservado)
+  anoFabricacao?: string; // Ano de fabricação (ex: "2002")
+}
+
+export interface Instructor {
+  id: string;
+  name: string;
+  cpf: string;
+  phone: string;
+  category?: string; // New: A, B, AB
+  plate: string; // Legacy/Default plate
+  vehicles?: Vehicle[]; // New: List of vehicles
+}
+
+export interface ExamLocation {
+  id: string;
+  cityId: string;
+  address?: string;
+  mapsUrl?: string;
+  regionsServed: string[]; // Array of city IDs
+  createdAt?: string;
+}
+
+export interface ExamSchedule {
+  id: string;
+  code?: string; // New: Unique code (e.g., B6324)
+  date: string;
+  time: string;
+  examinerIds: string[]; // Changed to array to support up to 3 examiners
+  maxSlotsA: number; // Limit for Moto
+  maxSlotsB: number; // Limit for Car
+  type: ExamType;
+  status: 'OPEN' | 'CLOSED' | 'CONCLUDED' | 'CANCELLED';
+  cancellationReason?: string; // New: Reason if cancelled
+  locationId?: string | null; // Local Padrão (exam location)
+}
+
+export interface ExamResultEntry {
+  id: string;
+  date: string;
+  time: string;
+  result: ExamResult;
+  category?: string; // New: A, B, etc.
+  examinerId?: string;
+  examiners?: string; // Names of examiners
+  observation?: string;
+  scheduleCode?: string; // New: Code of the schedule (e.g., B6324)
+  scheduleId?: string; // New: ID of the schedule
+}
+
+export interface InterestedExaminer {
+  examinerId: string;
+  name: string;
+  registeredAt: string; // ISO
+}
+
+export interface ExamRequest {
+  id: string;
+  studentName: string;
+  socialName?: string; // New
+  cpf: string;
+  phone: string;
+  email: string;
+  address?: string; 
+  city?: string;
+  examType: ExamType;
+  intendedCategory?: string; // New (A, B, etc.)
+  source: RequestSource;
+  requestType: RequestType; // New
+  schoolId?: string; 
+  desiredDate: string;
+  
+  // Extra Common Fields
+  paidFee?: boolean; 
+  completedPracticalCourse?: boolean; 
+  practicalHours?: number; 
+  hasVehicle?: boolean; // Renamed concept in UI to "Pedal Duplo"
+  cnhRestriction?: string; // New
+  instructor?: string; // New: Mandatory
+  examModalityA?: 'STANDARD' | 'PCD' | 'REABILITACAO' | null;
+  examModalityB?: 'STANDARD' | 'PCD' | 'REABILITACAO' | null;
+  vehiclePlate?: string; // New: Mandatory
+  semDuploComando?: boolean; // SDC — Sem Duplo Comando (Cat B)
+  // Checklists de pré-agendamento (CNH do Brasil — Instrutor)
+  checklistVehicle?: boolean;        // CHECKLIST VEÍCULO
+  practicalCourseInserted?: boolean; // CURSO PRÁTICO INSERIDO
+  taxaPaga?: boolean;                // TAXA
+  
+  // PCD Specifics
+  disabilityType?: string;
+  specialNeeds?: string;
+  
+  // Admin/Processing fields
+  status: ExamStatus;
+  result?: ExamResult; // Current/Latest result
+  
+  // History of exams (Multiple attempts)
+  examHistory: ExamResultEntry[];
+
+  scheduleId?: string | null; 
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  scheduledCategory?: string | null; // New: Specific category for this schedule instance (A or B)
+  examinerId?: string | null; // Kept for backward compatibility or primary examiner
+  observation?: string;
+  categoryQuantities?: Record<string, number> | null;
+  modulo?: string | null; // 'CFC' | 'PCD' | 'CNH_BRASIL'
+  // Examinadores que marcaram "Tenho interesse" em um pedido de prova extra (somente CFC)
+  interestedExaminers?: InterestedExaminer[] | null;
+
+  attendanceConfirmed?: boolean; // New: Confirmed via WhatsApp/Phone
+  cancellationReason?: string; // Reason for cancellation
+  
+  createdAt: string;
+  updatedAt: string;
+  // Timestamp da última vez que o candidato estava na fila (WAITING_SCHEDULING).
+  // Salvo ao entrar na banca; restaurado em updatedAt ao cancelar a banca.
+  queueUpdatedAt?: string | null;
+  // Usuário do sistema que colocou o candidato na banca
+  scheduledBy?: string | null;
+}
+
+export interface Restriction {
+  code: string;
+  description: string;
+}
+
+export interface SystemSettings {
+  agencyName: string; // Renamed from systemName
+  agencyAddress?: string; // New: Address for reports
+  logoUrl: string;    // New: Logo URL for reports
+  
+  maintenanceMode: boolean;
+  minDaysForScheduling: number;
+  maxDailySlots: number; // Global cap (legacy)
+  defaultMaxSlotsA: number; // New: Default slots for Moto
+  defaultMaxSlotsB: number; // New: Default slots for Car
+  defaultMaxSlotsMudanca: number; // New: Default slots for Category Change (C, D, E)
+  
+  whatsappMessageTemplate: string;
+  cfcWhatsappMessageTemplate?: string; // New: Template for CFC Practical Exam
+  defaultExamAddress: string; // New: Default physical address
+  defaultExamAddressLink: string; // New: Google Maps Link
+  restrictions: Restriction[]; // New: List of CNH restrictions
+  
+  // PCD Practical Exam Settings
+  pcdExamName?: string;
+  pcdDefaultExamAddress?: string;
+  pcdDefaultExamAddressLink?: string;
+  pcdMainSchedule?: SchoolSchedule;
+  
+  // CNH Brasil Practical Exam Settings
+  cnhBrasilMainSchedule?: SchoolSchedule;
+  blockWeekends?: boolean;
+  riskAreaKey?: string;
+
+  // Ano de Fabricação Máximo por Categoria
+  cnhCpfAutofillEnabled?: boolean;
+  anoFabricacaoMaximo?: {
+    A?: number | null;
+    B?: number | null;
+    CDE?: number | null;
+  };
+}
+
+export interface BlockedDate {
+  id: string;
+  date: string; // YYYY-MM-DD
+  description: string;
+  isHoliday: boolean;
+  createdAt?: string;
+}
+
+export interface City {
+  id: string;
+  name: string;
+  createdAt?: string;
+}
+
+export interface BancaResult {
+  id: string;
+  scheduleId: string;
+  schoolId: string;
+  category: string; // A, B, MUDANCA
+  totalSlots: number;
+  usedSlots: number;
+  approved: number;
+  failed: number;
+  absent: number;
+  cancelled: number;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
+export interface AuthState {
+  user: User | null;
+  token?: string | null;
+  isAuthenticated: boolean;
+}

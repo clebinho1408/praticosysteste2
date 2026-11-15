@@ -1,6 +1,6 @@
 {
-  "name": "",
-  "description": "",
+  "name": "PráticoSys",
+  "description": "Sistema de Gestão de Exames Práticos — gerenciamento de candidatos, bancas de prova, examinadores e autoescolas.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

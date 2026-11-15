@@ -1,0 +1,3974 @@
+
+import React, { useEffect, useState, useMemo } from 'react';
+import { api } from '../services/api';
+import { 
+  ExamRequest, 
+  ExamType, 
+  Examiner, 
+  City,
+  ExamStatus, 
+  DrivingSchool,
+  User, 
+  UserRole,
+  RequestType,
+  SystemSettings,
+  BlockedDate,
+  BancaResult
+} from '../types';
+import { activeSchoolSchedule, fixedScaleDay, planFixedScales, rotationCandidates } from '../lib/cfcFixedRotation';
+import { businessDate, mainSchedulePaused } from '../../../../functions/_school-schedule';
+import type { FixedCommitment } from '../lib/cfcFixedRotation';
+import { isDateBlocked, isDateInPast } from '../lib/dateBlocking';
+import { examinerCoversRequest } from '../../../../functions/_cfc-interest';
+import { examinerDateInRange, compareExaminerSchedule } from '../lib/examinerSchedule';
+import { effectiveYards, YARD_TYPE_LABEL } from '../../../../functions/_school-yards';
+import { 
+  Plus, 
+  Filter, 
+  ChevronDown, 
+  ChevronUp, 
+  Calendar,
+  AlertTriangle,
+  Clock,
+  CheckCircle2,
+  CheckCircle,
+  FileText,
+  XCircle,
+  Trash2,
+  X,
+  Save,
+  RefreshCw,
+  MessageCircle,
+  Copy,
+  Bell,
+  MapPin,
+  ExternalLink,
+  Pencil,
+  UserX,
+  Users,
+  ThumbsUp
+} from 'lucide-react';
+import DatePicker from '../components/DatePicker';
+import ConfirmedAppointmentModal from '../components/cfc/ConfirmedAppointmentModal';
+import ExtraRequestModal from '../components/cfc/ExtraRequestModal';
+import { confirmedVacancies } from '../lib/cfcConfirmedVacancies';
+
+// Global reference to keep track of the WhatsApp window
+let whatsappWindowRef: Window | null = null;
+
+/**
+ * Verifica se um examinador está bloqueado em uma data+hora específica,
+ * respeitando o turno do bloqueio (dia inteiro, só manhã ou só tarde).
+ * - MORNING  → bloqueia agendamentos com horário antes das 12:00
+ * - AFTERNOON → bloqueia agendamentos com horário a partir das 12:00
+ * - ALL_DAY / undefined → bloqueia qualquer horário do dia
+ * @param periods  Lista de períodos de bloqueio do examinador
+ * @param date     'YYYY-MM-DD'
+ * @param time     'HH:MM' (opcional; se omitido trata como dia inteiro)
+ */
+function isExaminerBlocked(
+  periods: { startDate: string; endDate: string; period?: string }[],
+  date: string,
+  time?: string,
+): boolean {
+  return periods.some(p => {
+    if (date < p.startDate || date > p.endDate) return false;
+    if (!p.period || p.period === 'ALL_DAY') return true;
+    if (!time) return true; // sem horário → considera bloqueado por precaução
+    const [h, m] = time.split(':').map(Number);
+    const totalMin = h * 60 + m;
+    if (p.period === 'MORNING') return totalMin < 12 * 60;
+    if (p.period === 'AFTERNOON') return totalMin >= 12 * 60;
+    return true;
+  });
+}
+
+function getBlockReason(
+  periods: { startDate: string; endDate: string; period?: string; description?: string }[],
+  date: string,
+  time?: string,
+): string {
+  const p = periods.find(p => {
+    if (date < p.startDate || date > p.endDate) return false;
+    if (!p.period || p.period === 'ALL_DAY') return true;
+    if (!time) return true;
+    const [h, m] = time.split(':').map(Number);
+    const totalMin = h * 60 + m;
+    if (p.period === 'MORNING') return totalMin < 12 * 60;
+    if (p.period === 'AFTERNOON') return totalMin >= 12 * 60;
+    return true;
+  });
+  if (!p) return '';
+  const turno = p.period === 'MORNING' ? ' (manhã)' : p.period === 'AFTERNOON' ? ' (tarde)' : '';
+  return (p.description ? `${p.description}${turno}` : `BLOQUEADO${turno}`);
+}
+
+interface CFCSchedulingCenterProps {
+  user: User;
+}
+
+const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
+  const isConsultant = user.role === UserRole.CONSULTANT;
+  const canManageConfirmed = user.role === UserRole.ADMIN || user.role === UserRole.SUPERVISOR;
+  const canEditExtraRequest = [UserRole.ADMIN, UserRole.SUPERVISOR, UserRole.OPERATOR].includes(user.role);
+  const [extraToEdit, setExtraToEdit] = useState<ExamRequest & { _isSlot?: boolean } | null>(null);
+  const [confirmedAction, setConfirmedAction] = useState<{ item: ExamRequest; mode: 'edit' | 'delete' } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [requests, setRequests] = useState<ExamRequest[]>([]);
+  const [schools, setSchools] = useState<DrivingSchool[]>([]);
+  const [examiners, setExaminers] = useState<Examiner[]>([]);
+  const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(null);
+  const [blockedDates, setBlockedDates] = useState<BlockedDate[]>([]);
+  
+  // Expanded sections state
+  const [expandedSections, setExpandedSections] = useState<Record<string, boolean>>({
+    afastamento: false,
+    extras: false,
+    waiting: false,
+    confirmed: false,
+    done: false,
+    cancelled: false
+  });
+
+  const [expandedDays, setExpandedDays] = useState<Record<string, boolean>>({
+    'Segunda-feira': false,
+    'Terça-feira': false,
+    'Quarta-feira': false,
+    'Quinta-feira': false,
+    'Sexta-feira': false
+  });
+
+  // Filters state
+  const [filters, setFilters] = useState({
+    status: 'ALL',
+    schoolId: user.role === UserRole.SCHOOL ? user.schoolId || '' : 'ALL',
+    examinerId: user.role === UserRole.EXAMINER ? user.examinerId || '' : 'ALL',
+    startDate: '',
+    endDate: ''
+  });
+
+  // Modal states
+  const [isNewModalOpen, setIsNewModalOpen] = useState(false);
+  const [isTypeSelectionModalOpen, setIsTypeSelectionModalOpen] = useState(false);
+  const [isEditModalOpen, setIsEditModalOpen] = useState(false);
+  const [isConfirmModalOpen, setIsConfirmModalOpen] = useState(false);
+  const [isNotificationModalOpen, setIsNotificationModalOpen] = useState(false);
+  const [copiedRequestId, setCopiedRequestId] = useState<string | null>(null);
+  const prevWaitingIdsRef = React.useRef<string[]>([]);
+  // Refs para evitar que o polling (fetchData) resete as seleções do modal de geração
+  
+  // Initialize prevWaitingIdsRef from localStorage on mount
+  useEffect(() => {
+    if (user.role === UserRole.SCHOOL) {
+      const storedIds = JSON.parse(localStorage.getItem(`cfc_notified_requests_${user.id}`) || '[]');
+      prevWaitingIdsRef.current = storedIds;
+    }
+  }, [user.id, user.role]);
+  const [isCancelModalOpen, setIsCancelModalOpen] = useState(false);
+  const [isCancelChoiceModalOpen, setIsCancelChoiceModalOpen] = useState(false);
+  const [cancelRequest, setCancelRequest] = useState<ExamRequest | null>(null);
+  const [cancelReason, setCancelReason] = useState('');
+  const [createReposition, setCreateReposition] = useState(false);
+  const [createExtra, setCreateExtra] = useState(false);
+  const [isAutoGenerateModalOpen, setIsAutoGenerateModalOpen] = useState(false);
+  const [isLimitWarningModalOpen, setIsLimitWarningModalOpen] = useState(false);
+  const [isExtraLimitReachedModalOpen, setIsExtraLimitReachedModalOpen] = useState(false);
+  const [extraLimitReachedType, setExtraLimitReachedType] = useState('');
+  const [awareOfLimits, setAwareOfLimits] = useState(false);
+  const [autoGenerateDate, setAutoGenerateDate] = useState('');
+  const [selectedSchoolsForAutoGenerate, setSelectedSchoolsForAutoGenerate] = useState<string[]>([]);
+  const [schoolsForAutoGenerate, setSchoolsForAutoGenerate] = useState<DrivingSchool[]>([]);
+  const [schoolsWith15Days, setSchoolsWith15Days] = useState<DrivingSchool[]>([]);
+  const [autoGenerateLookupLoading, setAutoGenerateLookupLoading] = useState(false);
+  const [autoGenerateLookupError, setAutoGenerateLookupError] = useState('');
+  const [autoGenerateSnapshot, setAutoGenerateSnapshot] = useState<{
+    schools: DrivingSchool[];
+    examiners: Examiner[];
+    cities: City[];
+    commitments: FixedCommitment[];
+  } | null>(null);
+  const autoGenerateRunningRef = React.useRef(false);
+  const rotationSummaries = useMemo(() => {
+    if (!autoGenerateSnapshot || !autoGenerateDate) return {};
+    const { schools, examiners, cities, commitments } = autoGenerateSnapshot;
+    const { plans, issues } = planFixedScales({
+      date: autoGenerateDate, selectedSchoolIds: selectedSchoolsForAutoGenerate,
+      schools, examiners, cities, commitments,
+    });
+    const summaries: Record<string, string> = {};
+    for (const { school, slots } of plans) {
+      if (school.examRotation) summaries[school.id] = `Rodízio pronto: ${slots.length} prova(s) com horário e examinador livres.`;
+    }
+    for (const { school, reason } of issues) {
+      if (school.examRotation) summaries[school.id] = reason;
+    }
+    for (const school of schools.filter(s => s.examRotation &&
+      !selectedSchoolsForAutoGenerate.includes(s.id))) {
+      const { eligible, reason } = rotationCandidates(school, fixedScaleDay(autoGenerateDate), examiners, cities);
+      summaries[school.id] = reason ?? `Rodízio configurado: ${eligible.length} examinador(es). Selecione para verificar os horários.`;
+    }
+    return summaries;
+  }, [autoGenerateSnapshot, selectedSchoolsForAutoGenerate, autoGenerateDate]);
+  const [activeEditTab, setActiveEditTab] = useState('dados');
+  const [isFromDoneCard, setIsFromDoneCard] = useState(false);
+  const [bancaResults, setBancaResults] = useState<BancaResult[]>([]);
+  const [allBancaResults, setAllBancaResults] = useState<BancaResult[]>([]);
+  
+  const showReposition = useMemo(() => {
+    if (user.role !== UserRole.SCHOOL) return true;
+    
+    const now = new Date();
+    const tenDaysInMs = 10 * 24 * 60 * 60 * 1000;
+    
+    return blockedDates.some(bd => {
+      if (!bd.isHoliday) return false;
+      const holidayDate = new Date(bd.date + 'T00:00:00');
+      const diff = Math.abs(now.getTime() - holidayDate.getTime());
+      return diff <= tenDaysInMs;
+    });
+  }, [user.role, blockedDates]);
+  
+  const [confirmConfig, setConfirmConfig] = useState<{
+    title: string;
+    message: string;
+    onConfirm: () => void;
+    type: 'blue' | 'red' | 'green';
+  } | null>(null);
+
+  const [selectedRequest, setSelectedRequest] = useState<ExamRequest | null>(null);
+  const [selectedSchoolForAddress, setSelectedSchoolForAddress] = useState<DrivingSchool | null>(null);
+  const [examinerFilter, setExaminerFilter] = useState<'DAY' | 'TOMORROW' | 'WEEK'>('WEEK');
+  // "Tenho interesse" (examinador) — confirmação e envio
+  const [interestTarget, setInterestTarget] = useState<ExamRequest | null>(null);
+  const [removingInterest, setRemovingInterest] = useState(false);
+  const [interestSaving, setInterestSaving] = useState(false);
+  const [interestError, setInterestError] = useState('');
+  // Modal de examinadores interessados (Admin/Supervisor/Operador)
+  const [interestedModalRequest, setInterestedModalRequest] = useState<ExamRequest | null>(null);
+
+  const updateBancaResult = (category: string, field: string, value: number) => {
+    setBancaResults(prev => {
+      const existing = prev.find(r => r.category === category);
+      let updatedResult: BancaResult;
+
+      const targetScheduleId = selectedRequest?.scheduleId || selectedRequest?.id || '';
+      const defaultTotalSlots = category === 'A' ? (systemSettings?.defaultMaxSlotsA || 10) : 
+                                category === 'B' ? (systemSettings?.defaultMaxSlotsB || 10) :
+                                category === 'MUDANCA' ? (systemSettings?.defaultMaxSlotsMudanca || 10) : 0;
+
+      const currentTotalSlots = existing?.totalSlots || defaultTotalSlots;
+      
+      // If field is usedSlots, limit it to totalSlots
+      let safeValue = Math.max(0, value);
+      if (field === 'usedSlots') {
+        safeValue = Math.min(safeValue, currentTotalSlots);
+      }
+
+      if (existing) {
+        updatedResult = { ...existing, [field]: safeValue };
+      } else {
+        updatedResult = {
+          id: `temp-${Math.random().toString(36).substr(2, 9)}`,
+          scheduleId: targetScheduleId,
+          schoolId: selectedRequest?.schoolId || '',
+          category,
+          totalSlots: defaultTotalSlots,
+          usedSlots: 0,
+          approved: 0,
+          failed: 0,
+          absent: 0,
+          cancelled: 0,
+          [field]: safeValue
+        } as BancaResult;
+      }
+
+      // Validation logic: Apto + Inapto + Cancelado + Falta <= Vagas Usadas
+      const usedSlots = updatedResult.usedSlots || 0;
+      
+      if (field === 'usedSlots') {
+        let currentSum = (updatedResult.approved || 0) + (updatedResult.failed || 0) + (updatedResult.cancelled || 0) + (updatedResult.absent || 0);
+        
+        // If sum is 0, auto-populate Apto with usedSlots
+        if (currentSum === 0 && safeValue > 0) {
+          updatedResult.approved = safeValue;
+        } else if (currentSum > safeValue) {
+          // Adjust if sum exceeds new usedSlots
+          updatedResult.approved = Math.min(updatedResult.approved || 0, safeValue);
+          updatedResult.failed = Math.min(updatedResult.failed || 0, safeValue - (updatedResult.approved || 0));
+          updatedResult.cancelled = Math.min(updatedResult.cancelled || 0, safeValue - (updatedResult.approved || 0) - (updatedResult.failed || 0));
+          updatedResult.absent = Math.min(updatedResult.absent || 0, safeValue - (updatedResult.approved || 0) - (updatedResult.failed || 0) - (updatedResult.cancelled || 0));
+        }
+      } else if (['approved', 'failed', 'cancelled', 'absent'].includes(field)) {
+        if (field === 'failed' || field === 'cancelled' || field === 'absent') {
+          const newFailed = field === 'failed' ? safeValue : (updatedResult.failed || 0);
+          const newCancelled = field === 'cancelled' ? safeValue : (updatedResult.cancelled || 0);
+          const newAbsent = field === 'absent' ? safeValue : (updatedResult.absent || 0);
+          
+          // Ensure failed + cancelled + absent doesn't exceed usedSlots
+          if (newFailed + newCancelled + newAbsent > usedSlots) {
+            const otherSum = (field === 'failed' ? newCancelled + newAbsent : field === 'cancelled' ? newFailed + newAbsent : newFailed + newCancelled);
+            (updatedResult as any)[field] = Math.max(0, usedSlots - otherSum);
+          }
+          
+          // Auto-calculate approved
+          updatedResult.approved = Math.max(0, usedSlots - (updatedResult.failed || 0) - (updatedResult.cancelled || 0) - (updatedResult.absent || 0));
+        } else if (field === 'approved') {
+          // If manually changing approved, just ensure it doesn't exceed available
+          const otherSum = (updatedResult.failed || 0) + (updatedResult.cancelled || 0) + (updatedResult.absent || 0);
+          if (otherSum + safeValue > usedSlots) {
+            updatedResult.approved = Math.max(0, usedSlots - otherSum);
+          }
+        }
+      }
+
+      if (existing) {
+        return prev.map(r => r.category === category ? updatedResult : r);
+      } else {
+        return [...prev, updatedResult];
+      }
+    });
+  };
+
+  const [newRequest, setNewRequest] = useState({
+    schoolId: user.role === UserRole.SCHOOL ? user.schoolId || '' : '',
+    categories: [] as string[],
+    categoryQuantities: {} as Record<string, number>,
+    examType: '',
+    examinerId: '',
+    date: '',
+    time: '',
+    observation: '',
+    requestType: RequestType.EXTRA
+  });
+
+  useEffect(() => {
+    const fetchBancaResults = async () => {
+      const targetScheduleId = selectedRequest?.scheduleId || selectedRequest?.id;
+      if (isEditModalOpen && targetScheduleId && selectedRequest?.schoolId && systemSettings) {
+        try {
+          const results = await api.getBancaResults(targetScheduleId, selectedRequest.schoolId);
+          
+          // Pre-populate with defaults if missing
+          const cats = selectedRequest.intendedCategory?.split(',') || [];
+          const neededCategories: string[] = [];
+          if (cats.includes('A') || cats.length === 0 || (cats.length === 1 && cats[0] === '')) neededCategories.push('A');
+          if (cats.includes('B')) neededCategories.push('B');
+          if (cats.some(c => ['C', 'D', 'E'].includes(c))) neededCategories.push('MUDANCA');
+          
+          const finalResults = results.map(r => ({
+            ...r,
+            totalSlots: r.totalSlots > 0 ? r.totalSlots :
+                        r.category === 'A' ? (systemSettings.defaultMaxSlotsA || 10) : 
+                        r.category === 'B' ? (systemSettings.defaultMaxSlotsB || 10) :
+                        r.category === 'MUDANCA' ? (systemSettings.defaultMaxSlotsMudanca || 10) : r.totalSlots
+          }));
+          
+          neededCategories.forEach(cat => {
+            if (!finalResults.find(r => r.category === cat)) {
+              finalResults.push({
+                id: `temp-${Math.random().toString(36).substr(2, 9)}`,
+                scheduleId: targetScheduleId,
+                schoolId: selectedRequest.schoolId!,
+                category: cat,
+                totalSlots: cat === 'A' ? (systemSettings.defaultMaxSlotsA || 10) : 
+                            cat === 'B' ? (systemSettings.defaultMaxSlotsB || 10) :
+                            cat === 'MUDANCA' ? (systemSettings.defaultMaxSlotsMudanca || 10) : 0,
+                usedSlots: 0,
+                approved: 0,
+                failed: 0,
+                absent: 0,
+                cancelled: 0
+              });
+            }
+          });
+          
+          setBancaResults(finalResults);
+        } catch (error) {
+          console.error('Error fetching banca results:', error);
+        }
+      }
+    };
+    fetchBancaResults();
+  }, [isEditModalOpen, selectedRequest?.scheduleId, selectedRequest?.id, selectedRequest?.schoolId, systemSettings]);
+
+  useEffect(() => {
+    if (isEditModalOpen && selectedRequest && activeEditTab !== 'dados') {
+      const cats = selectedRequest.intendedCategory?.split(',') || [];
+      const isCatA = activeEditTab === 'catA' && (cats.includes('A') || cats.length === 0 || (cats.length === 1 && cats[0] === ''));
+      const isCatB = activeEditTab === 'catB' && cats.includes('B');
+      const isMudanca = activeEditTab === 'mudanca' && cats.some(c => ['C', 'D', 'E'].includes(c));
+      
+      if (!isCatA && !isCatB && !isMudanca) {
+        if (isFromDoneCard) {
+          if (cats.includes('A')) setActiveEditTab('catA');
+          else if (cats.includes('B')) setActiveEditTab('catB');
+          else if (cats.some(c => ['C', 'D', 'E'].includes(c))) setActiveEditTab('mudanca');
+          else setActiveEditTab('catA');
+        } else {
+          setActiveEditTab('dados');
+        }
+      }
+    }
+  }, [selectedRequest?.intendedCategory, isEditModalOpen, activeEditTab, isFromDoneCard]);
+
+  const fetchData = async (silent = false) => {
+    if (!silent) setLoading(true);
+    try {
+      const [reqs, slots, schs, exms, settings, blocked, results] = await Promise.all([
+        api.getRequests(),
+        api.getScheduleSlots().catch(() => [] as any[]),   // nova tabela — fallback vazio se não existir ainda
+        api.getSchoolsAsync(),
+        api.getExaminersAsync(),
+        api.getSettings(),
+        api.getBlockedDates(),
+        api.getBancaResults()
+      ]);
+
+      // Converte schedule-slots para o mesmo formato de ExamRequest
+      // Campo extra _isSlot=true identifica que é uma vaga de escala (sem candidato real)
+      // IMPORTANTE: preserva attendanceConfirmed do banco — não forçar false aqui
+      const slotsAsRequests: any[] = (slots || []).map((s: any) => ({
+        ...s,
+        studentName: null,
+        cpf: null,
+        phone: null,
+        source: 'SCHOOL',
+        // attendanceConfirmed vem do banco — PCD e CNH_BRASIL são gravados com true
+        _isSlot: true,          // flag para módulo CNH filtrar e nunca mostrar como candidato
+      }));
+
+      // Filter for CFC: usa coluna modulo quando disponível, fallback para lógica legada
+      const isCfcCandidate = (r: any) => {
+        if (r.modulo) return r.modulo === 'CFC';
+        // Slots de escala PCD gerados pelo CFC (schoolId='PCD', _isSlot=true) → incluir antes do check de examType
+        if ((r as any)._isSlot && r.schoolId === 'PCD') return true;
+        // fallback legado para registros sem modulo (após backfill, raro)
+        if (r.examType === ExamType.PCD) return false;
+        if (!r.schoolId) return false;
+        if (r.schoolId === 'CNH_BRASIL') return !!(r as any)._isSlot;
+        if (r.schoolId === 'PCD') return false;
+        return r.examType === ExamType.COMMON;
+      };
+
+      // Candidatos reais da tabela exam_requests
+      let cfcReqs = reqs.filter(isCfcCandidate);
+      
+      // Slots de escala da tabela exam_schedule_slots (vagas sem candidato)
+      const cfcSlots = slotsAsRequests.filter(isCfcCandidate);
+
+      // Auto-update logic: move to DONE if 24h passed since confirmed exam
+      const now = new Date();
+      const updatePromises = [];
+      
+      for (const req of [UserRole.ADMIN, UserRole.SUPERVISOR, UserRole.OPERATOR].includes(user.role) ? cfcReqs : []) {
+        if (req.status === ExamStatus.SCHEDULED && req.attendanceConfirmed && req.scheduledDate && req.scheduledTime) {
+          const examDateTime = new Date(`${req.scheduledDate}T${req.scheduledTime}:00`);
+          const hoursDiff = (now.getTime() - examDateTime.getTime()) / (1000 * 60 * 60);
+          if (hoursDiff >= 24) {
+            updatePromises.push(api.updateRequest(req.id, { status: ExamStatus.DONE }));
+          }
+        }
+      }
+      
+      if (updatePromises.length > 0) {
+        await Promise.all(updatePromises);
+        const updatedReqs = await api.getRequests();
+        cfcReqs = updatedReqs.filter(isCfcCandidate);
+      }
+      
+      // Mescla candidatos reais + slots de escala — slots sempre no final
+      setRequests([...cfcReqs, ...cfcSlots]);
+      setSchools(schs);
+      setSystemSettings(settings);
+      setBlockedDates(blocked);
+      setAllBancaResults(results);
+
+      // ── Auto-remove expired blockedPeriods from examiners (Afastamento/Férias cleanup) ──
+      const todayStr = businessDate();
+      const examinersWithExpired = exms.filter(ex => {
+        const periods = Array.isArray(ex.blockedPeriods) ? ex.blockedPeriods : [];
+        return periods.some(p => p.endDate < todayStr);
+      });
+      if (examinersWithExpired.length > 0 && (user.role === UserRole.ADMIN ||
+        (user.role === UserRole.SUPERVISOR && user.allowedModules?.includes('cadastro') && user.allowedCadastroTabs?.includes('examinadores')))) {
+        await Promise.all(examinersWithExpired.map(ex => {
+          const activePeriods = (ex.blockedPeriods || []).filter(p => p.endDate >= todayStr);
+          return api.updateExaminer(ex.id, { blockedPeriods: activePeriods });
+        }));
+        const updatedExaminers = await api.getExaminersAsync();
+        setExaminers(updatedExaminers);
+      } else {
+        setExaminers(exms);
+      }
+
+      // ── Auto-ativar escala provisória quando activateFrom <= hoje ──
+      let currentSchools = schs;
+      const schoolsToActivateProv = currentSchools.filter(s => {
+        const prov = s.provisionalSchedule;
+        if (!prov || prov.active) return false;
+        if (!prov.activateFrom) return false;
+        return prov.activateFrom <= todayStr;
+      });
+      if (schoolsToActivateProv.length > 0 && (user.role === UserRole.ADMIN ||
+        (user.role === UserRole.SUPERVISOR && user.allowedModules?.includes('cadastro') && user.allowedCadastroTabs?.includes('autoescolas')))) {
+        await Promise.all(schoolsToActivateProv.map(s => {
+          const updatedProv = { ...s.provisionalSchedule!, active: true };
+          const updatedMain = s.mainSchedule ? { ...s.mainSchedule, active: false } : s.mainSchedule;
+          return api.updateSchool(s.id, { provisionalSchedule: updatedProv, mainSchedule: updatedMain });
+        }));
+        currentSchools = await api.getSchoolsAsync();
+      }
+
+      // ── Auto-desativar provisória quando todas as specificDates passaram ──
+      const schoolsNeedingSwitch = currentSchools.filter(s => {
+        const prov = s.provisionalSchedule;
+        if (!prov?.active) return false;
+        const dates = Array.isArray(prov.specificDates) ? prov.specificDates : [];
+        if (dates.length === 0) return false;
+        return dates.every((d: any) => d.date < todayStr);
+      });
+      if (schoolsNeedingSwitch.length > 0 && (user.role === UserRole.ADMIN ||
+        (user.role === UserRole.SUPERVISOR && user.allowedModules?.includes('cadastro') && user.allowedCadastroTabs?.includes('autoescolas')))) {
+        await Promise.all(schoolsNeedingSwitch.map(s => {
+          const updatedProv = { ...s.provisionalSchedule!, active: false };
+          const updatedMain = s.mainSchedule ? { ...s.mainSchedule, active: true } : s.mainSchedule;
+          return api.updateSchool(s.id, { provisionalSchedule: updatedProv, mainSchedule: updatedMain });
+        }));
+        currentSchools = await api.getSchoolsAsync();
+      }
+      if (schoolsToActivateProv.length > 0 || schoolsNeedingSwitch.length > 0) {
+        setSchools(currentSchools);
+      }
+    } catch (error) {
+      console.error('Error fetching data:', error);
+    } finally {
+      if (!silent) setLoading(false);
+    }
+  };
+
+  const daysOfWeek = ['Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado', 'Domingo', 'Outros/Sem Data'];
+
+  const hasAutoExpandedWaiting = React.useRef(false);
+
+  useEffect(() => {
+    fetchData();
+    // Polling 8s — garante atualização em tempo real para todos os roles
+    // (Examinadores, Autoescolas, Admin, Supervisor, Operador, Consultor)
+    const interval = setInterval(() => fetchData(true), 60000);
+    return () => clearInterval(interval);
+  }, []);
+
+  const toggleSection = (section: string) => {
+    setExpandedSections(prev => ({ ...prev, [section]: !prev[section] }));
+  };
+
+  const toggleDay = (day: string) => {
+    setExpandedDays(prev => ({ ...prev, [day]: !prev[day] }));
+  };
+
+  // Logic to group and filter data
+  const filteredRequests = requests.filter(r => {
+    // Strict separation: Exclude CNH Brasil and PCD and orphan STUDENT_DIRECT candidates
+    const isExplicitCnh = r.schoolId === 'CNH_BRASIL';
+    const isExplicitPcd = r.schoolId === 'PCD' || r.examType === 'PCD';
+    const isOrphan = !r.schoolId;
+
+    // Slots de escala PCD/CNH_BRASIL com attendanceConfirmed=true devem aparecer em Provas Confirmadas
+    // Apenas deixamos passar se for slot gerado automaticamente (sem candidato real)
+    if ((isExplicitCnh || isExplicitPcd) && (r as any)._isSlot) {
+      // Só deixa passar para o card de confirmados — filtramos os outros cards abaixo
+      if (r.status === ExamStatus.SCHEDULED && r.attendanceConfirmed) return true;
+      return false;
+    }
+
+    if (isExplicitCnh || isExplicitPcd || isOrphan) {
+      return false;
+    }
+    
+    if (user.role === UserRole.SCHOOL && r.schoolId !== user.schoolId) return false;
+    
+    if (user.role === UserRole.EXAMINER) {
+      // Para examinadores, provas que não estão em WAITING_SCHEDULING (extras) precisam pertencer a ele
+      if (r.status !== ExamStatus.WAITING_SCHEDULING && r.examinerId !== user.examinerId) return false;
+    }
+
+    if (filters.schoolId !== 'ALL' && r.schoolId !== filters.schoolId) return false;
+    
+    // Status filter logic
+    if (filters.status !== 'ALL') {
+      if (filters.status === 'WAITING_SCHEDULING') {
+        if (r.status !== ExamStatus.WAITING_SCHEDULING) return false;
+      } else if (filters.status === 'WAITING_CONFIRMATION') {
+        if (r.status !== ExamStatus.SCHEDULED || r.attendanceConfirmed) return false;
+      } else if (filters.status === 'CONFIRMED') {
+        if (r.status !== ExamStatus.SCHEDULED || !r.attendanceConfirmed) return false;
+      } else if (filters.status === 'DONE') {
+        if (r.status !== ExamStatus.DONE) return false;
+      } else if (filters.status === 'CANCELLED') {
+        if (r.status !== ExamStatus.CANCELLED) return false;
+      }
+    }
+
+    // Date range filter
+    if (filters.startDate && r.scheduledDate && r.scheduledDate < filters.startDate) return false;
+    if (filters.endDate && r.scheduledDate && r.scheduledDate > filters.endDate) return false;
+
+    // Examiner filter
+    if (filters.examinerId !== 'ALL') {
+      if (user.role === UserRole.EXAMINER) {
+        if (r.status !== ExamStatus.WAITING_SCHEDULING && r.examinerId !== filters.examinerId) return false;
+      } else {
+        if (r.examinerId !== filters.examinerId) return false;
+      }
+    }
+
+    return true;
+  });
+
+  // Examinador logado (para filtrar pedidos por categoria e saber se já registrou interesse)
+  const currentExaminer = user.role === UserRole.EXAMINER
+    ? examiners.find(ex => ex.id === user.examinerId) ?? null
+    : null;
+
+  const extras = filteredRequests
+    .filter(r => r.status === ExamStatus.WAITING_SCHEDULING)
+    // Examinador: só vê pedidos cujas categorias ele atende (ex.: AB → só pedidos A, B ou A,B)
+    .filter(r => user.role !== UserRole.EXAMINER || examinerCoversRequest(currentExaminer?.categories, r.intendedCategory))
+    .sort((a, b) => {
+      // Reposição first
+      if (a.requestType === RequestType.REPOSICAO && b.requestType !== RequestType.REPOSICAO) return -1;
+      if (a.requestType !== RequestType.REPOSICAO && b.requestType === RequestType.REPOSICAO) return 1;
+      // Then by createdAt (oldest first)
+      return new Date(a.createdAt).getTime() - new Date(b.createdAt).getTime();
+    });
+  const waitingConfirmation = filteredRequests.filter(r => r.status === ExamStatus.SCHEDULED && !r.attendanceConfirmed);
+
+  const isPastScheduledDateTime = (r: ExamRequest) => {
+    if (!r.scheduledDate) return false;
+    const time = r.scheduledTime || '00:00';
+    const dateTime = new Date(`${r.scheduledDate}T${time}:00`);
+    return dateTime.getTime() < Date.now();
+  };
+
+  const confirmed = filteredRequests.filter(r => {
+    if (r.status !== ExamStatus.SCHEDULED || !r.attendanceConfirmed) return false;
+    if (isPastScheduledDateTime(r)) return false;
+    
+    if (user.role === UserRole.EXAMINER) {
+      return examinerDateInRange(r.scheduledDate, examinerFilter);
+    }
+    return true;
+  }).sort((a, b) => user.role === UserRole.EXAMINER ? compareExaminerSchedule(a, b) : 0);
+  const done = filteredRequests.filter(r => {
+    if (r.status === ExamStatus.DONE) return true;
+    if (r.status === ExamStatus.SCHEDULED && r.attendanceConfirmed && isPastScheduledDateTime(r)) return true;
+    return false;
+  });
+  const cancelled = filteredRequests.filter(r => r.status === ExamStatus.CANCELLED);
+
+  useEffect(() => {
+    if (user.role === UserRole.SCHOOL) {
+      const currentIds = waitingConfirmation.map(r => r.id);
+      const storedIds = JSON.parse(localStorage.getItem(`cfc_notified_requests_${user.id}`) || '[]');
+      const hasNew = currentIds.some(id => !storedIds.includes(id));
+      
+      if (hasNew) {
+        setIsNotificationModalOpen(true);
+        // Play notification sound
+        const audio = new Audio('https://assets.mixkit.co/active_storage/sfx/2869/2869-preview.mp3');
+        audio.play().catch(e => console.error('Error playing notification sound:', e));
+      }
+    }
+  }, [waitingConfirmation, user.role, user.id]);
+
+  useEffect(() => {
+    if (user.role === UserRole.SCHOOL && waitingConfirmation.length > 0 && !hasAutoExpandedWaiting.current) {
+      hasAutoExpandedWaiting.current = true;
+      setExpandedSections(prev => ({ ...prev, waiting: true }));
+    }
+  }, [waitingConfirmation, user.role]);
+
+  // Group confirmed by day of week
+  const groupedByDayOfWeek: Record<string, ExamRequest[]> = {
+    'Segunda-feira': [],
+    'Terça-feira': [],
+    'Quarta-feira': [],
+    'Quinta-feira': [],
+    'Sexta-feira': [],
+    'Sábado': [],
+    'Domingo': [],
+    'Outros/Sem Data': []
+  };
+
+  confirmed.forEach(r => {
+    if (!r.scheduledDate) {
+      groupedByDayOfWeek['Outros/Sem Data'].push(r);
+      return;
+    }
+    const date = new Date(r.scheduledDate + 'T00:00:00');
+    if (isNaN(date.getTime())) {
+      groupedByDayOfWeek['Outros/Sem Data'].push(r);
+      return;
+    }
+    const dayIndex = date.getDay();
+    // 0 = Sunday, 1 = Monday, ..., 5 = Friday, 6 = Saturday
+    if (dayIndex >= 1 && dayIndex <= 5) {
+      const dayName = daysOfWeek[dayIndex - 1];
+      groupedByDayOfWeek[dayName].push(r);
+    } else if (dayIndex === 6) {
+      groupedByDayOfWeek['Sábado'].push(r);
+    } else if (dayIndex === 0) {
+      groupedByDayOfWeek['Domingo'].push(r);
+    } else {
+      groupedByDayOfWeek['Outros/Sem Data'].push(r);
+    }
+  });
+
+  const getSchoolName = (id?: string | null) => {
+    if (id === 'PCD') return systemSettings?.pcdExamName || 'PROVA DIRECAO PCD';
+    if (id === 'CNH_BRASIL') return 'CNH DO BRASIL';
+    return schools.find(s => s.id === id)?.name || 'ESCOLA EXCLUÍDA/NÃO VINCULADA';
+  };
+  const getExaminerName = (idOrName?: string | null) => {
+    if (!idOrName) return 'SEM EXAMINADOR VINCULADO';
+    const examiner = examiners.find(e => e.id === idOrName || e.name === idOrName);
+    return examiner ? examiner.name : idOrName;
+  };
+
+  const formatDate = (dateStr?: string | null) => {
+    if (!dateStr) return 'DATA NÃO INFORMADA';
+    const [, month, day] = dateStr.split('-');
+    return `${day}/${month}`;
+  };
+
+  const parseQtyFromObs = (obs?: string | null): Record<string, number> | null => {
+    if (!obs) return null;
+    const match = obs.match(/^\[Qtd:(.*?)\]/);
+    if (!match) return null;
+    const result: Record<string, number> = {};
+    match[1].split(',').forEach(part => {
+      const [cat, qty] = part.split('=');
+      if (cat && qty) result[cat.trim()] = parseInt(qty) || 0;
+    });
+    return Object.keys(result).length > 0 ? result : null;
+  };
+
+  const cleanObsFromQty = (obs?: string | null): string => {
+    if (!obs) return '';
+    return obs.replace(/^\[Qtd:.*?\]\s*/, '');
+  };
+
+  const getExamTypeLabel = (req: ExamRequest) => {
+    if (req.examType === ExamType.PCD) return 'PCD';
+    const categories = req.intendedCategory?.split(',') ?? [];
+    const hab = categories.some(c => ['A', 'B'].includes(c));
+    const mudanca = categories.some(c => ['C', 'D', 'E'].includes(c));
+    if (hab && mudanca) return 'Misto (1º Hab. e Mud. Cat.)';
+    if (mudanca) return 'Mudança Categoria';
+    return hab || req.schoolId === 'CNH_BRASIL' ? '1º Habilitação' : '-';
+  };
+
+  // Sort each day by examiner name and then by time
+  daysOfWeek.forEach(day => {
+    groupedByDayOfWeek[day].sort((a, b) => {
+      const examinerA = getExaminerName(a.examinerId).toUpperCase();
+      const examinerB = getExaminerName(b.examinerId).toUpperCase();
+      if (examinerA < examinerB) return -1;
+      if (examinerA > examinerB) return 1;
+      
+      const timeA = a.scheduledTime || '00:00';
+      const timeB = b.scheduledTime || '00:00';
+      return timeA.localeCompare(timeB);
+    });
+  });
+
+  waitingConfirmation.sort((a, b) => {
+    const examinerA = getExaminerName(a.examinerId).toUpperCase();
+    const examinerB = getExaminerName(b.examinerId).toUpperCase();
+    if (examinerA < examinerB) return -1;
+    if (examinerA > examinerB) return 1;
+    
+    const timeA = a.scheduledTime || '00:00';
+    const timeB = b.scheduledTime || '00:00';
+    return timeA.localeCompare(timeB);
+  });
+
+  const getRowClass = (req: ExamRequest) => {
+    if (req.requestType === RequestType.REPOSICAO) return 'bg-purple-50/70 hover:bg-purple-100/70 transition-colors';
+    if (req.requestType === RequestType.FIXA) return 'bg-blue-50/70 hover:bg-blue-100/70 transition-colors';
+    return 'bg-orange-50/70 hover:bg-orange-100/70 transition-colors';
+  };
+
+  const renderRequestTypeText = (req: ExamRequest) => {
+    if (req.requestType === RequestType.REPOSICAO) {
+      return <span className="text-purple-800 font-black uppercase text-[10px] tracking-wider">Reposição</span>;
+    }
+    if (req.requestType === RequestType.FIXA) {
+      return <span className="text-blue-800 font-black uppercase text-[10px] tracking-wider">Fixa</span>;
+    }
+    return <span className="text-orange-800 font-black uppercase text-[10px] tracking-wider">Extra</span>;
+  };
+
+  const handleWhatsAppMessage = (req: ExamRequest) => {
+    if (!systemSettings?.cfcWhatsappMessageTemplate) {
+      alert('Modelo de mensagem WhatsApp não configurado.');
+      return;
+    }
+
+    const school = schools.find(s => s.id === req.schoolId);
+    if (!school || !school.phone) {
+      alert('Telefone da autoescola não encontrado.');
+      return;
+    }
+
+    let message = systemSettings.cfcWhatsappMessageTemplate;
+    const examinerName = getExaminerName(req.examinerId);
+    const type = req.observation?.includes('Fixa') ? 'Fixa' : 'Extra';
+    
+    const examType = req.intendedCategory?.includes('C') || req.intendedCategory?.includes('D') || req.intendedCategory?.includes('E') 
+      ? 'Mudança Categoria' 
+      : '1º Habilitação';
+    
+    message = message.replace(/{AUTOESCOLA}/g, school.name);
+    message = message.replace(/{DATA}/g, formatDate(req.scheduledDate));
+    message = message.replace(/{HORARIO}/g, req.scheduledTime || '08:00');
+    message = message.replace(/{EXAMINADOR}/g, examinerName);
+    message = message.replace(/{EXAME}/g, examType);
+    message = message.replace(/{TIPO}/g, type);
+
+    const phone = school.phone.replace(/\D/g, '');
+    const finalPhone = phone.startsWith('55') ? phone : `55${phone}`;
+    
+    const url = `https://wa.me/${finalPhone}?text=${encodeURIComponent(message)}`;
+    
+    // Se já existe uma janela do WhatsApp aberta por este sistema, fecha ela primeiro
+    if (whatsappWindowRef && !whatsappWindowRef.closed) {
+      whatsappWindowRef.close();
+    }
+    
+    // Abre uma nova janela e guarda a referência
+    whatsappWindowRef = window.open(url, '_blank');
+    if (whatsappWindowRef) {
+      whatsappWindowRef.focus();
+    }
+  };
+
+  const handleCopyConfirmationMessage = (req: ExamRequest) => {
+    const schoolName = getSchoolName(req.schoolId);
+    const agencyName = systemSettings?.agencyName || 'DETRAN';
+    const tipo = req.requestType === RequestType.FIXA ? 'Fixa'
+      : req.requestType === RequestType.REPOSICAO ? 'Reposição'
+      : 'Extra';
+    const data = formatDate(req.scheduledDate);
+    const horario = req.scheduledTime || '08:00';
+    const exame = getExamTypeLabel(req);
+    const examinerName = getExaminerName(req.examinerId);
+    const vagas = req.categoryQuantities && Object.keys(req.categoryQuantities).length > 0
+      ? Object.entries(req.categoryQuantities).map(([cat, qty]) => `${qty}${cat}`).join(', ')
+      : '—';
+
+    const lines = [
+      `👋😊 Olá, *${schoolName}*!`,
+      ``,
+      `📋 _Estamos confirmando o agendamento da sua *Prova Prática*, do tipo *${tipo}*, marcada para:_`,
+      ``,
+      `> 📅 *${data}*`,
+      `> 🕒 *${horario}*`,
+      `> 📝 Exame: *${exame}*`,
+      `> 🧑‍🧒‍🧒 Vagas Liberadas: *${vagas}*`,
+      `> 👨‍💼 Examinador: *${examinerName}*`,
+      ``,
+      `✅ _*POSSO CONFIRMAR?*_`,
+    ];
+
+    const text = lines.join('\n');
+
+    navigator.clipboard.writeText(text).then(() => {
+      setCopiedRequestId(req.id);
+      setTimeout(() => setCopiedRequestId(null), 2000);
+    }).catch(() => {
+      alert('Não foi possível copiar. Verifique as permissões do navegador.');
+    });
+  };
+
+  const copyDayScheduleToWhatsApp = (dayName: string, dayRequests: ExamRequest[]) => {
+    if (dayRequests.length === 0) return;
+
+    const firstReq = dayRequests[0];
+    const date = new Date(firstReq.scheduledDate + 'T00:00:00');
+    const dayOfMonth = date.getDate().toString().padStart(2, '0');
+    const month = (date.getMonth() + 1).toString().padStart(2, '0');
+
+    const lines: string[] = [];
+    lines.push(`*EXAMES PRÁTICOS PARA ${dayName.toUpperCase()} (${dayOfMonth}/${month})*`);
+
+    // Agrupa por examinador
+    const byExaminer: Record<string, ExamRequest[]> = {};
+    dayRequests.forEach(req => {
+      const exName = getExaminerName(req.examinerId);
+      if (!byExaminer[exName]) byExaminer[exName] = [];
+      byExaminer[exName].push(req);
+    });
+
+    const sortedExaminerNames = Object.keys(byExaminer).sort();
+
+    sortedExaminerNames.forEach(exName => {
+      lines.push('');
+      lines.push(`_${exName}_`);
+      byExaminer[exName].forEach(req => {
+        const schoolName = getSchoolName(req.schoolId);
+        const time = req.scheduledTime || '08:00';
+        const cats = req.intendedCategory?.split(',') || [];
+        const hasAB = cats.some(c => ['A', 'B'].includes(c));
+        const hasCDE = cats.some(c => ['C', 'D', 'E'].includes(c));
+        const isMisto = hasAB && hasCDE;
+        const isMudCat = !isMisto && hasCDE;
+        const tipo = isMisto ? ` _(1º Hab. e Mud. Cat.)_` : isMudCat ? ` _(Mud. Cat.)_` : '';
+        lines.push(`> *${schoolName} - ${time}*${tipo}`);
+      });
+    });
+
+    const text = lines.join('\n');
+    navigator.clipboard.writeText(text).then(() => {
+      alert('Escala copiada para o WhatsApp!');
+    }).catch(() => {
+      alert('Não foi possível copiar. Verifique as permissões do navegador.');
+    });
+  };
+
+  // Helper: roteia update para a tabela correta (slot ou candidato real)
+  const updateItem = (item: any, data: any) =>
+    (item as any)._isSlot
+      ? api.updateScheduleSlot(item.id, data)
+      : api.updateRequest(item.id, data);
+
+  // Helper: roteia delete para a tabela correta
+  const deleteItem = (item: any) =>
+    (item as any)._isSlot
+      ? api.deleteScheduleSlot(item.id)
+      : api.deleteRequest(item.id);
+
+  const handleConfirmAction = (req: ExamRequest) => {
+    setConfirmConfig({
+      title: 'Confirmar Agendamento',
+      message: `Tem certeza que deseja confirmar o agendamento da autoescola ${getSchoolName(req.schoolId)} para o dia ${formatDate(req.scheduledDate)} às ${req.scheduledTime || '08:00'}?`,
+      type: 'blue',
+      onConfirm: async () => {
+        await updateItem(req, { attendanceConfirmed: true });
+        setIsConfirmModalOpen(false);
+        fetchData(true);
+      }
+    });
+    setIsConfirmModalOpen(true);
+  };
+
+  const handleCancelAction = (req: ExamRequest) => {
+    setCancelRequest(req);
+    setCancelReason('');
+    setCreateReposition(false);
+    setCreateExtra(false);
+    setIsCancelModalOpen(true);
+  };
+
+  // Botão "Cancelar" do card Aguardando Confirmação: pergunta se é para
+  // cancelar só o pedido (volta pra fila, sem motivo) ou cancelar a prova de fato.
+  const handleCancelChoiceAction = (req: ExamRequest) => {
+    setCancelRequest(req);
+    setIsCancelChoiceModalOpen(true);
+  };
+
+  // "Cancelar o Pedido": volta para Pedidos Provas Extras, limpando examinador, data e horário.
+  const submitSoftCancelPedido = async () => {
+    if (!cancelRequest) return;
+    try {
+      await updateItem(cancelRequest, {
+        status: ExamStatus.WAITING_SCHEDULING,
+        examinerId: null,
+        scheduledDate: null,
+        scheduledTime: null,
+        attendanceConfirmed: false,
+      });
+      setIsCancelChoiceModalOpen(false);
+      setCancelRequest(null);
+      fetchData(true);
+    } catch (error) {
+      console.error('Error reverting request to queue:', error);
+      alert('Erro ao cancelar o pedido.');
+    }
+  };
+
+  // "Cancelar a Prova": segue o fluxo normal de cancelamento (com motivo), indo para Provas Canceladas.
+  const proceedToFullCancel = () => {
+    if (!cancelRequest) return;
+    setIsCancelChoiceModalOpen(false);
+    setCancelReason('');
+    setCreateReposition(false);
+    setCreateExtra(false);
+    setIsCancelModalOpen(true);
+  };
+
+  const submitCancel = async () => {
+    if (!cancelRequest) return;
+    
+    try {
+      // Update original request to CANCELLED with reason (roteia pela tabela correta)
+      await updateItem(cancelRequest, { 
+        status: ExamStatus.CANCELLED,
+        cancellationReason: cancelReason,
+        observation: cancelReason || ''
+      });
+
+      // Criar vaga de reposição na tabela separada exam_schedule_slots (sem dados de candidato)
+      if (createReposition) {
+        await api.createScheduleSlot({
+          schoolId: cancelRequest.schoolId,
+          examType: cancelRequest.examType,
+          requestType: RequestType.REPOSICAO,
+          intendedCategory: cancelRequest.intendedCategory,
+          status: 'SCHEDULED',
+          observation: `Reposição por cancelamento`
+        });
+      }
+
+      // Criar vaga extra na tabela separada exam_schedule_slots (sem dados de candidato)
+      if (createExtra) {
+        await api.createScheduleSlot({
+          schoolId: cancelRequest.schoolId,
+          examType: cancelRequest.examType,
+          requestType: RequestType.EXTRA,
+          intendedCategory: cancelRequest.intendedCategory,
+          status: 'SCHEDULED',
+          observation: `Vaga extra gerada`
+        });
+      }
+
+      setIsCancelModalOpen(false);
+      setCancelRequest(null);
+      fetchData(true);
+    } catch (error) {
+      console.error('Error cancelling request:', error);
+      alert('Erro ao cancelar agendamento.');
+    }
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setSchoolsForAutoGenerate([]);
+    setSchoolsWith15Days([]);
+    setSelectedSchoolsForAutoGenerate([]);
+    setAutoGenerateSnapshot(null);
+    setAutoGenerateLookupError('');
+    if (!autoGenerateDate || !isAutoGenerateModalOpen) {
+      setAutoGenerateLookupLoading(false);
+      return;
+    }
+
+    // Atualizar cadastros ao escolher a data, sem resetar a seleção no polling normal.
+    setAutoGenerateLookupLoading(true);
+    Promise.all([api.getSchoolsAsync(), api.getExaminersAsync(), api.getCities(),
+      api.getRequests(), api.getScheduleSlots()])
+      .then(([currentSchools, currentExaminers, currentCities, currentRequests, currentSlots]) => {
+        if (cancelled) return;
+        const day = fixedScaleDay(autoGenerateDate);
+        const normal: DrivingSchool[] = [];
+        const fifteenDays: DrivingSchool[] = [];
+        currentSchools.forEach(school => {
+          if (school.id === 'PCD' || school.id === 'CNH_BRASIL') return;
+
+          // Escala provisória ativa: verifica se há specificDate para a data exata
+          if (school.provisionalSchedule?.active) {
+            const hasDate = (school.provisionalSchedule.specificDates ?? [])
+              .some(d => d.date === autoGenerateDate && d.examiner && d.time);
+            if (hasDate) normal.push(school);
+            return; // provisória ativa → não cai na lógica da principal
+          }
+
+          // Escala principal: lógica original (days[] + frequência)
+          if (mainSchedulePaused(school, autoGenerateDate)) return;
+          const schedule = activeSchoolSchedule(school);
+          if (!schedule?.days?.includes(day)) return;
+          (schedule.frequency === '15_DAYS' ? fifteenDays : normal).push(school);
+        });
+
+        // Escolas quinzenais continuam pré-selecionadas conforme a última escala fixa.
+        const targetDate = new Date(`${autoGenerateDate}T00:00:00`);
+        const preSelected15Days = fifteenDays.filter(school => {
+          const lastDate = [...currentRequests, ...currentSlots].filter(r =>
+            r.schoolId === school.id && r.requestType === RequestType.FIXA &&
+            r.status !== ExamStatus.CANCELLED && r.scheduledDate && r.scheduledDate < autoGenerateDate)
+            .map(r => r.scheduledDate!).sort().at(-1);
+          return !lastDate ||
+            (targetDate.getTime() - new Date(`${lastDate}T00:00:00`).getTime()) / 86400000 >= 14;
+        });
+
+        setSchools(currentSchools);
+        setExaminers(currentExaminers);
+        setSchoolsForAutoGenerate(normal);
+        setSchoolsWith15Days(fifteenDays);
+        setAutoGenerateSnapshot({
+          schools: currentSchools, examiners: currentExaminers, cities: currentCities,
+          commitments: [...currentRequests, ...currentSlots],
+        });
+        setSelectedSchoolsForAutoGenerate([...normal.map(s => s.id), ...preSelected15Days.map(s => s.id)]);
+      })
+      .catch(error => {
+        if (!cancelled) setAutoGenerateLookupError(`Não foi possível consultar cadastros e agendamentos: ${error.message}`);
+      })
+      .finally(() => { if (!cancelled) setAutoGenerateLookupLoading(false); });
+    return () => { cancelled = true; };
+  }, [autoGenerateDate, isAutoGenerateModalOpen]);
+
+  const closeAutoGenerateModal = () => {
+    setIsAutoGenerateModalOpen(false);
+    setAutoGenerateDate('');
+    setSelectedSchoolsForAutoGenerate([]);
+    setSchoolsForAutoGenerate([]);
+    setSchoolsWith15Days([]);
+  };
+
+  const handleAutoGenerate = async () => {
+    if (autoGenerateRunningRef.current || autoGenerateLookupLoading || autoGenerateLookupError) return;
+    if (!autoGenerateDate) {
+      alert('Por favor, selecione uma data.');
+      return;
+    }
+
+    if (isDateInPast(autoGenerateDate)) {
+      alert('Não é permitido gerar agendamentos em uma data passada.');
+      return;
+    }
+
+    if (systemSettings) {
+      const check = isDateBlocked(autoGenerateDate, blockedDates, systemSettings);
+      if (check.blocked) {
+        alert(`Esta data está bloqueada: ${check.reason}`);
+        return;
+      }
+    }
+
+    if (selectedSchoolsForAutoGenerate.length === 0) {
+      alert('Por favor, selecione pelo menos uma autoescola.');
+      return;
+    }
+
+    autoGenerateRunningRef.current = true;
+    setLoading(true);
+    let count = 0;
+    try {
+      // Revalidar cadastros e compromissos atuais antes de gerar.
+      const [currentSchools, currentExaminers, currentCities, currentRequests, currentSlots] =
+        await Promise.all([api.getSchoolsAsync(), api.getExaminersAsync(), api.getCities(),
+          api.getRequests(), api.getScheduleSlots()]);
+      const { plans, issues } = planFixedScales({
+        date: autoGenerateDate,
+        selectedSchoolIds: selectedSchoolsForAutoGenerate,
+        schools: currentSchools,
+        examiners: currentExaminers,
+        cities: currentCities,
+        commitments: [...currentRequests, ...currentSlots],
+      });
+
+      for (const { school, slots } of plans) {
+        const created = await api.createAutomaticFixedScale({
+          schoolId: school.id, date: autoGenerateDate, slots,
+        });
+        count += created.length;
+      }
+
+      const details = issues.map(({ school, reason }) => `${school.name}: ${reason}`).join('\n');
+      alert(`${count} agendamentos gerados para ${formatDate(autoGenerateDate)}.` +
+        (details ? `\n\nAutoescolas não geradas:\n${details}` : ''));
+      if (count) {
+        closeAutoGenerateModal();
+        fetchData(true);
+      }
+    } catch (error: any) {
+      console.error('Error generating scales:', error);
+      const errorMsg = error.message || 'Erro desconhecido';
+      alert(`Erro ao gerar escalas automáticas: ${errorMsg}` +
+        (count ? `\n${count} provas já foram criadas. Confira os agendamentos antes de tentar novamente.` : ''));
+      if (count) fetchData(true);
+    } finally {
+      autoGenerateRunningRef.current = false;
+      setLoading(false);
+    }
+  };
+
+  const handleSubmitNew = async () => {
+    const isFixa = newRequest.requestType === RequestType.FIXA;
+    const isPcd = newRequest.schoolId === 'PCD';
+    const isCnhBrasil = newRequest.schoolId === 'CNH_BRASIL';
+    const needsExamType = !isPcd && !isCnhBrasil && newRequest.schoolId !== '';
+    const examTypeOk = !needsExamType || !!newRequest.examType;
+    const basicFieldsOk = newRequest.schoolId && examTypeOk && (isPcd || newRequest.categories.length > 0);
+    const fixaFieldsOk = !isFixa || (newRequest.date && newRequest.time && newRequest.examinerId);
+
+    if (!basicFieldsOk || !fixaFieldsOk) {
+      alert('Por favor, preencha todos os campos obrigatórios.');
+      return;
+    }
+
+    if (isFixa && newRequest.examinerId && newRequest.date) {
+      const ex = examiners.find(e => e.id === newRequest.examinerId);
+      const isBlocked = ex ? isExaminerBlocked(ex.blockedPeriods || [], newRequest.date, newRequest.time || undefined) : false;
+      if (isBlocked) {
+        const reason = ex ? getBlockReason(ex.blockedPeriods || [], newRequest.date, newRequest.time || undefined) : '';
+        alert(`O examinador selecionado está bloqueado na data ${newRequest.date}${reason ? `: ${reason}` : ''}. Por favor, escolha outro examinador ou outra data.`);
+        return;
+      }
+    }
+
+    if (newRequest.date && isDateInPast(newRequest.date)) {
+      alert('Não é permitido criar um agendamento em uma data passada.');
+      return;
+    }
+
+    // Para pedidos EXTRA e REPOSIÇÃO: todas as categorias selecionadas devem ter Qtd preenchida
+    if ((newRequest.requestType === RequestType.EXTRA || newRequest.requestType === RequestType.REPOSICAO) && !isPcd) {
+      const missingQty = newRequest.categories.filter(c => !newRequest.categoryQuantities[c] || newRequest.categoryQuantities[c] <= 0);
+      if (missingQty.length > 0) {
+        alert(`Informe a quantidade para as categorias: ${missingQty.join(', ')}`);
+        return;
+      }
+    }
+
+    if (user.role === UserRole.SCHOOL) {
+      if (newRequest.requestType === RequestType.EXTRA) {
+        const now = new Date();
+        const currentMonth = now.getMonth();
+        const currentYear = now.getFullYear();
+
+        // Determina o tipo do novo pedido: Mudança de Categoria (C/D/E) ou 1ª Habilitação (A/B)
+        const isMudancaNew = newRequest.categories.some(c => ['C', 'D', 'E'].includes(c));
+
+        const monthlyExtrasMudanca = requests.filter(r => {
+          const d = new Date(r.createdAt);
+          const isMudanca = r.intendedCategory?.split(',').some(c => ['C', 'D', 'E'].includes(c));
+          return r.schoolId === user.schoolId &&
+                 r.requestType === RequestType.EXTRA &&
+                 isMudanca &&
+                 d.getMonth() === currentMonth &&
+                 d.getFullYear() === currentYear;
+        });
+
+        const monthlyExtrasHabilitacao = requests.filter(r => {
+          const d = new Date(r.createdAt);
+          const isMudanca = r.intendedCategory?.split(',').some(c => ['C', 'D', 'E'].includes(c));
+          return r.schoolId === user.schoolId &&
+                 r.requestType === RequestType.EXTRA &&
+                 !isMudanca &&
+                 d.getMonth() === currentMonth &&
+                 d.getFullYear() === currentYear;
+        });
+
+        if (isMudancaNew && monthlyExtrasMudanca.length >= 2) {
+          setExtraLimitReachedType('Mudança de Categoria');
+          setIsExtraLimitReachedModalOpen(true);
+          return;
+        }
+
+        if (!isMudancaNew && monthlyExtrasHabilitacao.length >= 2) {
+          setExtraLimitReachedType('1ª Habilitação');
+          setIsExtraLimitReachedModalOpen(true);
+          return;
+        }
+      }
+
+      if (!awareOfLimits) {
+        setIsLimitWarningModalOpen(true);
+        return;
+      }
+    }
+
+    await executeSubmitNew();
+  };
+
+  const executeSubmitNew = async () => {
+    const isPcd = newRequest.schoolId === 'PCD';
+    if (newRequest.date && systemSettings) {
+      const check = isDateBlocked(newRequest.date, blockedDates, systemSettings);
+      if (check.blocked) {
+        alert(`Esta data está bloqueada: ${check.reason}`);
+        return;
+      }
+    }
+
+    try {
+      const categoryQuantities = (newRequest.requestType === RequestType.EXTRA || newRequest.requestType === RequestType.REPOSICAO)
+        ? Object.fromEntries(
+            newRequest.categories
+              .filter(c => newRequest.categoryQuantities[c])
+              .map(c => [c, newRequest.categoryQuantities[c]])
+          )
+        : undefined;
+
+      await api.createRequest({
+        schoolId: newRequest.schoolId,
+        source: 'SCHOOL' as any,
+        examType: isPcd ? ExamType.PCD : ExamType.COMMON,
+        modulo: isPcd ? 'PCD' : 'CFC',
+        requestType: newRequest.requestType,
+        intendedCategory: isPcd ? 'PCD' : newRequest.categories.join(','),
+        status: newRequest.date ? ExamStatus.SCHEDULED : ExamStatus.WAITING_SCHEDULING,
+        attendanceConfirmed: false,
+        scheduledDate: newRequest.date,
+        scheduledTime: newRequest.time,
+        examinerId: newRequest.examinerId,
+        observation: newRequest.observation,
+        categoryQuantities: Object.keys(categoryQuantities ?? {}).length > 0 ? categoryQuantities : undefined,
+      });
+
+      setIsNewModalOpen(false);
+      setIsLimitWarningModalOpen(false);
+      setAwareOfLimits(false);
+      setNewRequest({
+        schoolId: user.role === UserRole.SCHOOL ? user.schoolId || '' : '',
+        categories: [],
+        categoryQuantities: {},
+        examType: '',
+        examinerId: '',
+        date: '',
+        time: '',
+        observation: '',
+        requestType: RequestType.EXTRA
+      });
+      fetchData(true);
+    } catch (error) {
+      console.error('Error creating request:', error);
+      alert('Erro ao criar agendamento.');
+    }
+  };
+
+  const handleCloseNewModal = () => {
+    setIsNewModalOpen(false);
+    setAwareOfLimits(false);
+    setNewRequest({
+      schoolId: user.role === UserRole.SCHOOL ? user.schoolId || '' : '',
+      categories: [],
+      categoryQuantities: {},
+      examType: '',
+      examinerId: '',
+      date: '',
+      time: '',
+      observation: '',
+      requestType: RequestType.EXTRA
+    });
+  };
+
+  const handleUpdateEdit = async () => {
+    if (!selectedRequest) return;
+
+    if (!isFromDoneCard) {
+      if (!selectedRequest.scheduledDate || !selectedRequest.scheduledTime || !selectedRequest.examinerId) {
+        alert('Por favor, preencha a Data, Horário e Examinador.');
+        return;
+      }
+      if (isDateInPast(selectedRequest.scheduledDate)) {
+        alert('Não é permitido reagendar para uma data passada.');
+        return;
+      }
+    }
+
+    if (selectedRequest.scheduledDate && systemSettings) {
+      const check = isDateBlocked(selectedRequest.scheduledDate, blockedDates, systemSettings);
+      if (check.blocked) {
+        alert(`Esta data está bloqueada: ${check.reason}`);
+        return;
+      }
+    }
+
+    let newStatus = selectedRequest.status;
+    // Se for uma solicitação extra pendente e preencher os dados de agendamento, muda para SCHEDULED (Aguardando Confirmação)
+    if (selectedRequest.status === ExamStatus.WAITING_SCHEDULING && 
+        selectedRequest.scheduledDate && 
+        selectedRequest.scheduledTime && 
+        selectedRequest.examinerId) {
+      newStatus = ExamStatus.SCHEDULED;
+    }
+
+    try {
+      await updateItem(selectedRequest, {
+        schoolId: selectedRequest.schoolId,
+        intendedCategory: selectedRequest.intendedCategory,
+        scheduledDate: selectedRequest.scheduledDate,
+        scheduledTime: selectedRequest.scheduledTime,
+        examinerId: selectedRequest.examinerId,
+        observation: selectedRequest.observation,
+        categoryQuantities: selectedRequest.categoryQuantities,
+        status: newStatus,
+        attendanceConfirmed: selectedRequest.attendanceConfirmed
+      });
+
+      // Save banca results if editing from done card
+      if (isFromDoneCard && bancaResults.length > 0) {
+        for (const result of bancaResults) {
+          await api.saveBancaResult(result);
+        }
+      }
+
+      setIsEditModalOpen(false);
+      setIsFromDoneCard(false);
+      setActiveEditTab('dados');
+      setSelectedRequest(null);
+      setBancaResults([]);
+      fetchData(true);
+    } catch (error) {
+      console.error('Error updating request:', error);
+      alert('Erro ao atualizar agendamento.');
+    }
+  };
+
+  const handleDeleteAction = (req: ExamRequest) => {
+    setConfirmConfig({
+      title: user.role === UserRole.SCHOOL ? 'Excluir Pedido' : 'Excluir Agendamento',
+      message: user.role === UserRole.SCHOOL ? 'Tem certeza que deseja excluir permanentemente este pedido?' : 'Tem certeza que deseja excluir permanentemente este agendamento?',
+      type: 'red',
+      onConfirm: async () => {
+        await api.deleteRequest(req.id);
+        setIsConfirmModalOpen(false);
+        fetchData(true);
+      }
+    });
+    setIsConfirmModalOpen(true);
+  };
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center h-64">
+        <RefreshCw className="h-8 w-8 animate-spin text-blue-600" />
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-6 pb-10">
+      {extraToEdit && canEditExtraRequest && (
+        <ExtraRequestModal key={extraToEdit.id} item={extraToEdit} role={user.role}
+          schoolName={getSchoolName(extraToEdit.schoolId)}
+          schoolServices={schools.find(s => s.id === extraToEdit.schoolId)?.services}
+          onClose={() => setExtraToEdit(null)}
+          onSuccess={updated => {
+            setRequests(prev => prev.map(item => item.id === updated.id ? { ...item, ...updated } : item));
+            setExtraToEdit(null);
+            fetchData(true);
+          }}
+        />
+      )}
+      {confirmedAction && canManageConfirmed && (
+        <ConfirmedAppointmentModal
+          key={`${confirmedAction.item.id}:${confirmedAction.mode}`}
+          item={confirmedAction.item} mode={confirmedAction.mode} role={user.role}
+          schoolName={getSchoolName(confirmedAction.item.schoolId)}
+          examiners={examiners} settings={systemSettings} blockedDates={blockedDates}
+          onClose={() => setConfirmedAction(null)}
+          onSuccess={updated => {
+            const id = confirmedAction.item.id;
+            setRequests(prev => updated ? prev.map(item => item.id === id ? updated : item) : prev.filter(item => item.id !== id));
+            setConfirmedAction(null);
+            fetchData(true);
+          }}
+        />
+      )}
+      <div className="flex justify-between items-start">
+        <div>
+          <h1 className="text-2xl font-bold text-slate-900">{user.role === UserRole.SCHOOL ? 'Pedidos' : 'Agendamentos'}</h1>
+          <p className="text-slate-500 text-sm">{user.role === UserRole.SCHOOL ? 'Gerencie os pedidos de provas práticas' : 'Gerencie os agendamentos de provas práticas'}</p>
+        </div>
+        <div className="flex items-center gap-3">
+          {[UserRole.ADMIN, UserRole.SUPERVISOR, UserRole.OPERATOR].includes(user.role) && (
+            <button 
+              onClick={() => setIsAutoGenerateModalOpen(true)}
+              className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-md flex items-center gap-2 font-bold text-sm shadow-sm transition-colors"
+            >
+              <RefreshCw className="h-4 w-4" /> Gerar Escalas Fixas Automaticamente
+            </button>
+          )}
+          {user.role !== UserRole.EXAMINER && !isConsultant && (
+            <button 
+              onClick={() => setIsTypeSelectionModalOpen(true)}
+              className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md flex items-center gap-2 font-bold text-sm shadow-sm transition-colors"
+            >
+              <Plus className="h-4 w-4" /> {user.role === UserRole.SCHOOL ? 'Novo Pedido' : 'Novo Agendamento'}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {/* FILTROS */}
+      {user.role !== UserRole.EXAMINER && (
+        <div className="bg-white rounded-lg border border-slate-200 shadow-sm overflow-visible mb-6">
+          <div className="p-4 border-b border-slate-100 bg-slate-50/50 flex items-center gap-2">
+            <Filter className="h-4 w-4 text-slate-400" />
+            <h2 className="font-bold text-slate-700 text-sm">Filtros</h2>
+          </div>
+          <div className="p-5 grid grid-cols-1 md:grid-cols-5 gap-4">
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Status</label>
+              <select 
+                className="w-full border border-slate-200 rounded-md p-2 text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                value={filters.status}
+                onChange={e => setFilters({...filters, status: e.target.value})}
+              >
+                <option value="ALL">Todos</option>
+                <option value="WAITING_SCHEDULING">Pedidos Provas Extras</option>
+                <option value="WAITING_CONFIRMATION">Aguardando Confirmação</option>
+                <option value="CONFIRMED">Provas Confirmadas</option>
+                <option value="DONE">Provas Realizadas</option>
+                <option value="CANCELLED">Provas Canceladas</option>
+              </select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Autoescola</label>
+              <select 
+                className="w-full border border-slate-200 rounded-md p-2 text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                disabled={user.role === UserRole.SCHOOL}
+                value={filters.schoolId}
+                onChange={e => setFilters({...filters, schoolId: e.target.value})}
+              >
+                <option value="ALL">Todas</option>
+                {schools.filter(s => s.mainSchedule?.active || s.provisionalSchedule?.active).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                {user.role !== UserRole.SCHOOL && (
+                  <>
+                    <option value="PCD">{systemSettings?.pcdExamName || 'PROVA DIRECAO PCD'}</option>
+                    <option value="CNH_BRASIL">CNH DO BRASIL</option>
+                  </>
+                )}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Examinador</label>
+              <select 
+                className="w-full border border-slate-200 rounded-md p-2 text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                value={filters.examinerId}
+                onChange={e => setFilters({...filters, examinerId: e.target.value})}
+              >
+                <option value="ALL">Todos</option>
+                {examiners.map(e => <option key={e.id} value={e.id}>{e.name}</option>)}
+              </select>
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Data Início</label>
+              <input 
+                type="date"
+                className="w-full border border-slate-200 rounded-md p-2 text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                value={filters.startDate}
+                onChange={e => setFilters({...filters, startDate: e.target.value})}
+              />
+            </div>
+            <div className="space-y-1">
+              <label className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Data Fim</label>
+              <input 
+                type="date"
+                className="w-full border border-slate-200 rounded-md p-2 text-sm bg-white focus:ring-2 focus:ring-blue-500 outline-none"
+                value={filters.endDate}
+                onChange={e => setFilters({...filters, endDate: e.target.value})}
+              />
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ACCORDIONS */}
+      <div className="space-y-4">
+        {/* AFASTAMENTO/FÉRIAS CARD — oculto para o perfil Examinador */}
+        {user.role !== UserRole.EXAMINER && (() => {
+          const today = new Date().toISOString().split('T')[0];
+
+          // Janela de exibição: hoje até hoje + 30 dias
+          const oneMonthAhead = new Date();
+          oneMonthAhead.setDate(oneMonthAhead.getDate() + 30);
+          const oneMonthStr = oneMonthAhead.toISOString().split('T')[0];
+
+          const activePeriods: { examiner: Examiner; period: NonNullable<Examiner['blockedPeriods']>[number] }[] = [];
+          examiners.forEach(ex => {
+            const periods = Array.isArray(ex.blockedPeriods) ? ex.blockedPeriods : [];
+            periods.forEach(p => {
+              // Incluir: período ainda não acabou E começa até 1 mês à frente (ou já iniciou)
+              if (p.endDate >= today && p.startDate <= oneMonthStr) {
+                activePeriods.push({ examiner: ex, period: p });
+              }
+            });
+          });
+          activePeriods.sort((a, b) => a.period.startDate.localeCompare(b.period.startDate));
+
+          // Dias da semana (índice JS → código da escala)
+          const WEEKDAY_CODE = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SAB'];
+
+          /**
+           * Gera todas as datas (YYYY-MM-DD) entre startDate e endDate (inclusivo).
+           */
+          const datesInRange = (startDate: string, endDate: string): string[] => {
+            const dates: string[] = [];
+            const cur = new Date(`${startDate}T00:00:00`);
+            const end = new Date(`${endDate}T00:00:00`);
+            while (cur <= end) {
+              dates.push(cur.toISOString().split('T')[0]);
+              cur.setDate(cur.getDate() + 1);
+            }
+            return dates;
+          };
+
+          /**
+           * Para uma escola com frequência 15_DAYS, verifica se uma data específica
+           * seria a semana "ativa" baseada no último agendamento FIXA real.
+           * Usa o mesmo critério da auto-geração: última FIXA >= 14 dias antes.
+           */
+          const is15DaysActive = (schoolId: string, targetDate: string): boolean => {
+            const lastDate = requests
+              .filter(r =>
+                r.schoolId === schoolId &&
+                r.requestType === RequestType.FIXA &&
+                r.status !== ExamStatus.CANCELLED &&
+                r.scheduledDate &&
+                r.scheduledDate < targetDate
+              )
+              .map(r => r.scheduledDate!)
+              .sort()
+              .at(-1);
+
+            if (!lastDate) return true; // sem histórico → considera ativa
+            const diffDays =
+              (new Date(`${targetDate}T00:00:00`).getTime() -
+                new Date(`${lastDate}T00:00:00`).getTime()) /
+              86400000;
+            return diffDays >= 14;
+          };
+
+          /**
+           * Verifica se uma escola tem escala (principal OU provisória) vinculada
+           * ao examinador em pelo menos UMA das datas do período de afastamento.
+           * Ambas as escalas são avaliadas independentemente.
+           * Ignora escolas com rodízio na escala principal (examinador é dinâmico).
+           */
+          const getAffectedSchools = (ex: Examiner, period: NonNullable<Examiner['blockedPeriods']>[number]): string => {
+            const affected: string[] = [];
+            const periodDates = datesInRange(
+              period.startDate > today ? period.startDate : today,
+              period.endDate
+            );
+
+            schools.forEach(s => {
+              if (s.id === 'PCD' || s.id === 'CNH_BRASIL') return;
+
+              let isAffected = false;
+
+              // ── Escala Provisória: specificDates[] com examiner === ex.id na janela ──
+              // Verificada sempre, independente de estar ativa ou não,
+              // pois pode estar configurada para datas dentro do afastamento.
+              const provDates = s.provisionalSchedule?.specificDates ?? [];
+              if (provDates.some(
+                d => d.examiner === ex.id && d.date >= period.startDate && d.date <= period.endDate
+              )) {
+                isAffected = true;
+              }
+
+              // ── Escala Principal: só escalas fixas ativas (não rodízio) ──
+              if (!isAffected) {
+                const main = s.mainSchedule;
+                if (main?.active && !s.examRotation) {
+                  const examinerSlots = (main.slots ?? []).filter(slot => slot.examiner === ex.id);
+                  if (examinerSlots.length > 0) {
+                    isAffected = periodDates.some(date => {
+                      const dayCode = WEEKDAY_CODE[new Date(`${date}T00:00:00`).getDay()];
+                      if (!main.days?.includes(dayCode)) return false;
+                      const slotMatchesDay = examinerSlots.some(
+                        slot => !slot.day || slot.day === dayCode
+                      );
+                      if (!slotMatchesDay) return false;
+                      if (main.frequency === '15_DAYS') return is15DaysActive(s.id, date);
+                      return true;
+                    });
+                  }
+                }
+              }
+
+              if (isAffected) affected.push(s.name);
+            });
+
+            return affected.length > 0 ? affected.join(', ') : 'Nenhuma';
+          };
+
+          const formatDateBR = (d: string) => {
+            const [y, m, day] = d.split('-');
+            return `${day}/${m}/${y}`;
+          };
+
+          // Só exibe o card quando há períodos no horizonte de 1 mês
+          if (activePeriods.length === 0) return null;
+
+          return (
+            <div className="border border-red-200 rounded-lg overflow-hidden shadow-sm">
+              <button
+                onClick={() => toggleSection('afastamento')}
+                className="w-full flex items-center justify-between p-4 bg-red-50/60 hover:bg-red-50 transition-colors"
+              >
+                <div className="flex items-center gap-3 text-red-700">
+                  <UserX className="h-5 w-5" />
+                  <span className="font-bold">Afastamento / Férias ({activePeriods.length})</span>
+                </div>
+                {expandedSections.afastamento
+                  ? <ChevronUp className="h-5 w-5 text-red-400" />
+                  : <ChevronDown className="h-5 w-5 text-red-400" />}
+              </button>
+
+              {expandedSections.afastamento && (
+                <div className="p-4 bg-white space-y-3">
+                  {activePeriods.map(({ examiner, period }) => {
+                    const isActive = period.startDate <= today && period.endDate >= today;
+                    const affectedSchools = getAffectedSchools(examiner, period);
+                    return (
+                      <div
+                        key={`${examiner.id}-${period.id}`}
+                        className="flex flex-col sm:flex-row sm:items-start gap-3 p-4 rounded-xl border border-red-100 bg-red-50/40 shadow-sm"
+                      >
+                        <div className="flex-shrink-0 mt-0.5">
+                          <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-black uppercase tracking-wider ${
+                            isActive ? 'bg-red-600 text-white' : 'bg-amber-400 text-white'
+                          }`}>
+                            {isActive ? '● Ativo' : '○ Agendado'}
+                          </span>
+                        </div>
+                        <div className="flex-1 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-x-6 gap-y-1 text-sm">
+                          <div>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Examinador</span>
+                            <span className="font-bold text-slate-800">{examiner.name}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Período</span>
+                            <span className="text-slate-700">{formatDateBR(period.startDate)} → {formatDateBR(period.endDate)}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Motivo</span>
+                            <span className="text-slate-700">{period.description || '—'}</span>
+                          </div>
+                          <div>
+                            <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Autoescolas Afetadas</span>
+                            <span className="text-slate-700">{affectedSchools}</span>
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+          );
+        })()}
+
+        {user.role === UserRole.EXAMINER ? (
+          <>
+            <div className="border border-orange-200 rounded-lg overflow-hidden shadow-sm">
+              <button 
+                onClick={() => toggleSection('extras')}
+                className="w-full flex items-center justify-between p-4 bg-orange-50/50 hover:bg-orange-50 transition-colors"
+              >
+                <div className="flex items-center gap-3 text-orange-700">
+                  <AlertTriangle className="h-5 w-5" />
+                  <span className="font-bold">Pedidos Provas Extras ({extras.length})</span>
+                </div>
+                {expandedSections.extras ? <ChevronUp className="h-5 w-5 text-orange-400" /> : <ChevronDown className="h-5 w-5 text-orange-400" />}
+              </button>
+              
+              {expandedSections.extras && (
+                <div className="p-4 bg-white space-y-3">
+                  {extras.length > 0 ? (
+                    extras.map(req => {
+                      const dt = new Date(req.createdAt);
+                      const formattedDate = `${String(dt.getDate()).padStart(2, '0')}/${String(dt.getMonth() + 1).padStart(2, '0')}/${dt.getFullYear()} ${String(dt.getHours()).padStart(2, '0')}:${String(dt.getMinutes()).padStart(2, '0')}`;
+                      const reqSchool = schools.find(s => s.id === req.schoolId);
+                      const alreadyInterested = !!currentExaminer &&
+                        (req.interestedExaminers ?? []).some(i => i.examinerId === currentExaminer.id);
+                      return (
+                        <div key={req.id} className="p-4 border border-slate-200 rounded-xl bg-slate-50 space-y-2 shadow-sm">
+                          <div className="font-black text-black uppercase">{getSchoolName(req.schoolId)}</div>
+                          <div className="text-sm text-slate-700">
+                            <span className="font-bold">Tipo:</span> {renderRequestTypeText(req)}
+                          </div>
+                          <div className="text-sm text-slate-700">
+                            <span className="font-bold">Exame:</span> {getExamTypeLabel(req)}
+                          </div>
+                          {req.observation && (
+                            <div className="text-sm text-red-600">
+                              <span className="font-bold">Obs.:</span> {cleanObsFromQty(req.observation)}
+                            </div>
+                          )}
+                          <div className="text-sm text-slate-700">
+                            <span className="font-bold">Cidade da Autoescola:</span>{' '}
+                            {reqSchool?.city ? <span className="uppercase">{reqSchool.city}</span> : <span className="text-slate-400 italic">Não informada</span>}
+                          </div>
+                          <div className="text-[10px] text-slate-400">
+                            Cadastrado em: {formattedDate}
+                          </div>
+                          <div className="flex items-center justify-end gap-2 pt-2 border-t border-slate-200 mt-2">
+                            {alreadyInterested ? (
+                              <div className="flex items-center justify-end gap-2">
+                                <span className="inline-flex items-center gap-1.5 text-[11px] font-bold text-green-700 bg-green-50 border border-green-200 px-2.5 py-1.5 rounded-md whitespace-nowrap">
+                                  <CheckCircle className="h-3.5 w-3.5" /> Interesse registrado
+                                </span>
+                                <button type="button" onClick={() => { setInterestError(''); setRemovingInterest(true); setInterestTarget(req); }}
+                                  className="p-2 rounded-md text-red-600 hover:bg-red-50 border border-red-200"
+                                  title="Excluir meu interesse" aria-label="Excluir meu interesse">
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => { setInterestError(''); setRemovingInterest(false); setInterestTarget(req); }}
+                                className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded-md flex items-center gap-1.5 font-bold text-xs shadow-sm transition-colors whitespace-nowrap"
+                                title="Registrar interesse nesta prova extra"
+                              >
+                                <ThumbsUp className="h-3.5 w-3.5" /> Tenho interesse
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="py-8 text-center text-slate-400 italic">
+                      Nenhuma solicitação extra.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="border border-green-200 rounded-lg overflow-hidden shadow-sm">
+            <div className="p-4 bg-green-600 text-white flex justify-center">
+              <div className="flex flex-wrap justify-center bg-green-700/60 p-1.5 rounded-xl shadow-inner gap-1">
+                <button 
+                  onClick={() => setExaminerFilter('DAY')}
+                  className={`px-4 sm:px-6 py-2 rounded-lg text-xs font-black uppercase tracking-wider transition-all ${examinerFilter === 'DAY' ? 'bg-white text-green-700 shadow-md transform scale-105' : 'text-green-100 hover:bg-green-600/50'}`}
+                >
+                  Hoje
+                </button>
+                <button 
+                  onClick={() => setExaminerFilter('TOMORROW')}
+                  className={`px-4 sm:px-6 py-2 rounded-lg text-xs font-black uppercase tracking-wider transition-all ${examinerFilter === 'TOMORROW' ? 'bg-white text-green-700 shadow-md transform scale-105' : 'text-green-100 hover:bg-green-600/50'}`}
+                >
+                  Amanhã
+                </button>
+                <button 
+                  onClick={() => setExaminerFilter('WEEK')}
+                  className={`px-4 sm:px-6 py-2 rounded-lg text-xs font-black uppercase tracking-wider transition-all ${examinerFilter === 'WEEK' ? 'bg-white text-green-700 shadow-md transform scale-105' : 'text-green-100 hover:bg-green-600/50'}`}
+                >
+                  Semana
+                </button>
+              </div>
+            </div>
+            <div className="p-4 bg-white space-y-6">
+              {confirmed.length > 0 ? (
+                <div className="space-y-6">
+                  {(() => {
+                    const daysOfWeek = ['Domingo', 'Segunda-feira', 'Terça-feira', 'Quarta-feira', 'Quinta-feira', 'Sexta-feira', 'Sábado'];
+                    
+                    // Group by date
+                    const groups: Record<string, typeof confirmed> = {};
+                    confirmed.forEach(req => {
+                      const date = req.scheduledDate;
+                      if (!date) return;
+                      if (!groups[date]) groups[date] = [];
+                      groups[date].push(req);
+                    });
+                    
+                    // Sort dates
+                    const sortedDates = Object.keys(groups).sort();
+                    
+                    return sortedDates.map(date => {
+                      const dateObj = new Date(date + 'T12:00:00');
+                      const dayName = daysOfWeek[dateObj.getDay()];
+                      const reqs = groups[date];
+                      
+                      return (
+                        <div key={date} className="space-y-3">
+                          <div className="flex items-center gap-2 border-b border-slate-100 pb-2">
+                            <Calendar className="h-4 w-4 text-green-600" />
+                            <h3 className="font-bold text-slate-700 uppercase text-xs tracking-wider">
+                              {dayName} - {formatDate(date)}
+                            </h3>
+                          </div>
+                          <div className="grid grid-cols-1 gap-3">
+                            {reqs.map(req => {
+                              const vacancies = confirmedVacancies(req, examiners);
+                              return (
+                              <div key={req.id} className="p-4 border border-slate-200 rounded-xl bg-slate-50 space-y-3 shadow-sm">
+                                <div className="flex justify-between items-center border-b border-slate-200 pb-2">
+                                  <div className="flex flex-col">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Autoescola</span>
+                                    <div className="flex items-center gap-2">
+                                      <span className="font-black text-slate-800 uppercase text-sm">{getSchoolName(req.schoolId)}</span>
+                                      {req.schoolId && !['PCD', 'CNH_BRASIL'].includes(req.schoolId) && (
+                                        <button 
+                                          onClick={() => {
+                                            const school = schools.find(s => s.id === req.schoolId);
+                                            if (school) setSelectedSchoolForAddress(school);
+                                          }}
+                                          className="p-1 text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
+                                          title="Consultar Endereços"
+                                        >
+                                          <MapPin className="h-3.5 w-3.5" />
+                                        </button>
+                                      )}
+                                    </div>
+                                  </div>
+                                  <div className="bg-green-100 text-green-700 px-2 py-1 rounded text-[10px] font-bold uppercase">
+                                    Confirmada
+                                  </div>
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                  <div className="flex flex-col">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Tipo</span>
+                                    <span className="text-sm">{renderRequestTypeText(req)}</span>
+                                  </div>
+                                  <div className="flex flex-col text-right">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Horário</span>
+                                    <span className="text-slate-700 font-bold text-sm">{req.scheduledTime || '08:00'}</span>
+                                  </div>
+                                  <div className="flex flex-col">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Exame</span>
+                                    <span className="text-slate-700 font-bold text-sm">{getExamTypeLabel(req)}</span>
+                                  </div>
+                                  <div className="flex flex-col items-end">
+                                    <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Vagas liberadas</span>
+                                    {vacancies.length > 0 ? (
+                                      <div className="flex flex-wrap justify-end gap-1 mt-0.5">
+                                        {vacancies.map(([cat, qty]) => (
+                                          <span key={cat} className="inline-flex items-center gap-0.5 bg-orange-100 text-orange-800 text-xs font-bold px-1.5 py-0.5 rounded">
+                                            {qty}{cat}
+                                          </span>
+                                        ))}
+                                      </div>
+                                    ) : (
+                                      <span className="text-slate-400 text-sm">—</span>
+                                    )}
+                                  </div>
+                                </div>
+                                {(() => {
+                                  const reqSchool = schools.find(s => s.id === req.schoolId);
+                                  const digits = (reqSchool?.phone ?? '').replace(/\D/g, '');
+                                  if (!reqSchool || ['PCD', 'CNH_BRASIL'].includes(reqSchool.id) || !digits) return null;
+                                  const waPhone = digits.startsWith('55') ? digits : `55${digits}`;
+                                  return (
+                                    <div className="flex items-center justify-between gap-3 pt-2 border-t border-slate-200">
+                                      <div className="flex flex-col">
+                                        <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Telefone</span>
+                                        <span className="text-slate-700 text-sm font-medium">{reqSchool.phone}</span>
+                                      </div>
+                                      <a
+                                        href={`https://wa.me/${waPhone}`}
+                                        target="_blank"
+                                        rel="noopener noreferrer"
+                                        className="inline-flex items-center gap-1.5 bg-emerald-500 hover:bg-emerald-600 text-white px-3 py-1.5 rounded-md text-xs font-bold shadow-sm transition-colors"
+                                        title={`Abrir WhatsApp da autoescola (${reqSchool.phone})`}
+                                        aria-label="Abrir WhatsApp da autoescola"
+                                      >
+                                        <MessageCircle className="h-4 w-4" /> WhatsApp
+                                      </a>
+                                    </div>
+                                  );
+                                })()}
+                              </div>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    });
+                  })()}
+                </div>
+              ) : (
+                <div className="py-12 text-center">
+                  <CheckCircle className="h-12 w-12 text-slate-200 mx-auto mb-3" />
+                  <p className="text-slate-400 italic">Nenhuma prova confirmada para você no momento.</p>
+                </div>
+              )}
+            </div>
+          </div>
+          </>
+        ) : (
+          <>
+            {/* SECTION: EXTRAS */}
+            <div className="border border-orange-200 rounded-lg overflow-hidden shadow-sm">
+          <button 
+            onClick={() => toggleSection('extras')}
+            className="w-full flex items-center justify-between p-4 bg-orange-50/50 hover:bg-orange-50 transition-colors"
+          >
+            <div className="flex items-center gap-3 text-orange-700">
+              <AlertTriangle className="h-5 w-5" />
+              <span className="font-bold">Pedidos Provas Extras ({extras.length})</span>
+            </div>
+            {expandedSections.extras ? <ChevronUp className="h-5 w-5 text-orange-400" /> : <ChevronDown className="h-5 w-5 text-orange-400" />}
+          </button>
+          
+          {expandedSections.extras && (
+            <div className="p-4 bg-white">
+              {extras.length > 0 ? (
+                <div className="overflow-x-auto border border-slate-200 rounded-lg">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-slate-50/50 text-slate-400 uppercase font-bold border-b border-slate-100">
+                        <th className="px-4 py-3 text-center">Cadastrado em</th>
+                        <th className="px-4 py-3">Tipo</th>
+                        <th className="px-4 py-3">Autoescola</th>
+                        <th className="px-4 py-3">Exame</th>
+                        <th className="px-4 py-3">Qtd. por Cat.</th>
+                        <th className="px-4 py-3">Observações</th>
+                        <th className="px-4 py-3 text-right">Ações</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-50">
+                      {extras.map(req => {
+                        const qtys = (req.categoryQuantities && Object.keys(req.categoryQuantities).length > 0)
+                          ? req.categoryQuantities
+                          : parseQtyFromObs(req.observation);
+                        const cleanObs = cleanObsFromQty(req.observation);
+                        return (
+                        <tr key={req.id} className={getRowClass(req)}>
+                          <td className="px-4 py-3 text-slate-500 text-center">{new Date(req.createdAt).toLocaleString()}</td>
+                          <td className="px-4 py-3">{renderRequestTypeText(req)}</td>
+                          <td className="px-4 py-3 font-black text-slate-800 uppercase">
+                            <div className="flex flex-col">
+                              {getSchoolName(req.schoolId)}
+                            </div>
+                          </td>
+                          <td className="px-4 py-3 text-slate-600">
+                            {getExamTypeLabel(req)}
+                          </td>
+                          <td className="px-4 py-3">
+                            {qtys ? (
+                              <div className="flex flex-wrap gap-1">
+                                {Object.entries(qtys).map(([cat, qty]) => (
+                                  <span key={cat} className="inline-flex items-center gap-0.5 bg-orange-100 text-orange-800 text-xs font-bold px-1.5 py-0.5 rounded border border-orange-200">
+                                    {qty}{cat}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-slate-300 italic text-xs">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3 text-slate-500 max-w-[200px] truncate" title={cleanObs || undefined}>{cleanObs || '-'}</td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center justify-end gap-2">
+                              {user.role !== UserRole.SCHOOL && !isConsultant && (
+                                <button 
+                                  onClick={() => {
+                                    setSelectedRequest(req);
+                                    setIsFromDoneCard(false);
+                                    setIsEditModalOpen(true);
+                                    setActiveEditTab('dados');
+                                  }}
+                                  className="bg-orange-600 hover:bg-orange-700 text-white px-3 py-1.5 rounded-md flex items-center gap-1.5 font-bold text-[10px] shadow-sm transition-colors"
+                                  title="Inserir Dados"
+                                >
+                                  <FileText className="h-3 w-3" /> Inserir Dados
+                                </button>
+                              )}
+                              {canEditExtraRequest && (() => {
+                                const interestedCount = (req.interestedExaminers ?? []).length;
+                                return (
+                                  <button type="button"
+                                    onClick={() => setInterestedModalRequest(req)}
+                                    className={`relative border p-2 rounded-md flex items-center justify-center transition-colors ${
+                                      interestedCount > 0
+                                        ? 'border-green-300 text-green-700 bg-green-50 hover:bg-green-100'
+                                        : 'border-slate-200 text-slate-400 hover:bg-slate-50'
+                                    }`}
+                                    title={interestedCount > 0 ? `${interestedCount} examinador(es) interessado(s)` : 'Nenhum examinador interessado'}
+                                    aria-label="Ver examinadores interessados">
+                                    <Users className="h-4 w-4" />
+                                    {interestedCount > 0 && (
+                                      <span className="absolute -top-1.5 -right-1.5 min-w-[16px] h-4 px-1 rounded-full bg-green-600 text-white text-[9px] font-black flex items-center justify-center">
+                                        {interestedCount}
+                                      </span>
+                                    )}
+                                  </button>
+                                );
+                              })()}
+                              {canEditExtraRequest && (
+                                <button type="button"
+                                  onClick={() => setExtraToEdit({ ...req, categoryQuantities: qtys, observation: cleanObs })}
+                                  className="border border-orange-200 text-orange-600 hover:bg-orange-50 p-2 rounded-md flex items-center justify-center transition-colors"
+                                  title="Editar pedido de prova extra" aria-label="Editar pedido de prova extra">
+                                  <Pencil className="h-4 w-4" />
+                                </button>
+                              )}
+                              {user.role === UserRole.SCHOOL && (
+                                <span className="text-xs font-bold text-orange-600 bg-orange-50 px-2.5 py-1.5 rounded-md border border-orange-100 whitespace-nowrap">
+                                  Situação: Aguardando na fila
+                                </span>
+                              )}
+                              {!isConsultant && (
+                                <button 
+                                  onClick={() => handleDeleteAction(req)}
+                                  className="border border-red-100 text-red-400 hover:text-red-600 hover:bg-red-50 p-2 rounded-md flex items-center justify-center transition-colors"
+                                  title="Excluir"
+                                >
+                                  <Trash2 className="h-4 w-4" />
+                                </button>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <p className="text-center py-4 text-slate-400 text-sm italic">Nenhuma solicitação extra pendente.</p>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* SECTION: WAITING CONFIRMATION */}
+        <div className="border border-violet-200 rounded-lg overflow-hidden shadow-sm">
+          <button 
+            onClick={() => toggleSection('waiting')}
+            className="w-full flex items-center justify-between p-4 bg-violet-50/60 hover:bg-violet-50 transition-colors"
+          >
+            <div className="flex items-center gap-3 text-violet-700">
+              <Clock className="h-5 w-5" />
+              <span className="font-bold">Aguardando Confirmação ({waitingConfirmation.length})</span>
+            </div>
+            {expandedSections.waiting ? <ChevronUp className="h-5 w-5 text-violet-400" /> : <ChevronDown className="h-5 w-5 text-violet-400" />}
+          </button>
+          
+          {expandedSections.waiting && (
+            <div className="p-0 bg-white">
+              {waitingConfirmation.length > 0 ? (
+                <div className="overflow-x-auto">
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-500 uppercase tracking-wider font-bold">
+                        <th className="px-4 py-3">Tipo</th>
+                        <th className="px-4 py-3">Autoescola</th>
+                        <th className="px-4 py-3">Data</th>
+                        <th className="px-4 py-3">Horário</th>
+                        <th className="px-4 py-3">Examinador</th>
+                        <th className="px-4 py-3">Exame</th>
+                        <th className="px-4 py-3">Vagas Liberadas</th>
+                        <th className="px-4 py-3 text-right">Ações</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {waitingConfirmation.map(req => (
+                        <tr key={req.id} className={getRowClass(req)}>
+                          <td className="px-4 py-3">{renderRequestTypeText(req)}</td>
+                          <td className="px-4 py-3 font-black text-slate-800 uppercase">{getSchoolName(req.schoolId)}</td>
+                          <td className="px-4 py-3 text-red-600 font-bold">{formatDate(req.scheduledDate)}</td>
+                          <td className="px-4 py-3 text-red-600 font-bold">{req.scheduledTime || '08:00'}</td>
+                          <td className="px-4 py-3 text-red-600 font-bold uppercase">
+                            {(user.role === UserRole.SCHOOL && req.requestType === RequestType.EXTRA)
+                              ? 'Sem Identificação'
+                              : getExaminerName(req.examinerId)}
+                          </td>
+                          <td className="px-4 py-3 text-slate-600">
+                            {getExamTypeLabel(req)}
+                          </td>
+                          <td className="px-4 py-3 text-slate-700">
+                            {req.categoryQuantities && Object.keys(req.categoryQuantities).length > 0 ? (
+                              <div className="flex flex-wrap gap-1">
+                                {Object.entries(req.categoryQuantities).map(([cat, qty]) => (
+                                  <span key={cat} className="inline-flex items-center gap-0.5 bg-orange-100 text-orange-800 text-xs font-bold px-1.5 py-0.5 rounded">
+                                    {qty}{cat}
+                                  </span>
+                                ))}
+                              </div>
+                            ) : (
+                              <span className="text-slate-400">—</span>
+                            )}
+                          </td>
+                          <td className="px-4 py-3">
+                            <div className="flex items-center justify-end gap-2">
+                              {user.role !== UserRole.SCHOOL && !isConsultant && (
+                                <>
+                                  <button
+                                    onClick={() => {
+                                      setSelectedRequest(req);
+                                      setIsFromDoneCard(false);
+                                      setIsEditModalOpen(true);
+                                      setActiveEditTab('dados');
+                                    }}
+                                    className="bg-orange-500 hover:bg-orange-600 text-white p-2 rounded-md flex items-center justify-center shadow-sm transition-colors"
+                                    title="Editar Vagas Liberadas"
+                                  >
+                                    <Pencil className="h-4 w-4" />
+                                  </button>
+                                  <button
+                                    onClick={() => handleCopyConfirmationMessage(req)}
+                                    className={`text-white p-2 rounded-md flex items-center justify-center shadow-sm transition-colors ${copiedRequestId === req.id ? 'bg-green-600' : 'bg-blue-500 hover:bg-blue-600'}`}
+                                    title="Copiar Mensagem de Confirmação"
+                                  >
+                                    {copiedRequestId === req.id ? <CheckCircle className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
+                                  </button>
+                                </>
+                              )}
+                              {!isConsultant && (
+                                <>
+                                  <button 
+                                    onClick={() => handleConfirmAction(req)}
+                                    className="bg-green-600 hover:bg-green-700 text-white px-3 py-1.5 rounded-md flex items-center justify-center gap-1.5 shadow-sm transition-colors text-xs font-bold"
+                                    title="Confirmar"
+                                  >
+                                    <CheckCircle className="h-4 w-4" /> Confirmar
+                                  </button>
+                                  <button 
+                                    onClick={() => handleCancelChoiceAction(req)}
+                                    className="border border-red-200 text-red-600 hover:bg-red-50 px-3 py-1.5 rounded-md flex items-center justify-center gap-1.5 transition-colors text-xs font-bold"
+                                    title="Cancelar"
+                                  >
+                                    <XCircle className="h-4 w-4" /> Cancelar
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              ) : (
+                <div className="p-8 text-center text-slate-400 italic">
+                  Nenhum agendamento aguardando confirmação.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* SECTION: CONFIRMED */}
+        <div className="border border-green-200 rounded-lg overflow-hidden shadow-sm">
+          <button 
+            onClick={() => toggleSection('confirmed')}
+            className="w-full flex items-center justify-between p-4 bg-green-50/50 hover:bg-green-50 transition-colors"
+          >
+            <div className="flex items-center gap-3 text-green-700">
+              <CheckCircle2 className="h-5 w-5" />
+              <span className="font-bold">Provas Confirmadas ({confirmed.length})</span>
+            </div>
+            {expandedSections.confirmed ? <ChevronUp className="h-5 w-5 text-green-400" /> : <ChevronDown className="h-5 w-5 text-green-400" />}
+          </button>
+          
+          {expandedSections.confirmed && (
+            <div className="p-4 bg-white space-y-4">
+              {daysOfWeek.filter(d => d !== 'Outros/Sem Data').map((dayName) => (
+                <div key={dayName} className="border border-slate-200 rounded-lg overflow-hidden">
+                  <div className="w-full flex items-center justify-between p-3 bg-slate-50 border-b border-slate-200">
+                    <button 
+                      onClick={() => toggleDay(dayName)}
+                      className="flex-1 flex items-center justify-between hover:bg-slate-100 transition-colors p-1 rounded"
+                    >
+                      <span className="font-bold text-slate-700 text-sm uppercase tracking-tight">{dayName} ({groupedByDayOfWeek[dayName].length})</span>
+                      {expandedDays[dayName] ? <ChevronUp className="h-4 w-4 text-slate-400" /> : <ChevronDown className="h-4 w-4 text-slate-400" />}
+                    </button>
+                    {user.role !== UserRole.SCHOOL && !isConsultant && groupedByDayOfWeek[dayName].length > 0 && (
+                      <button 
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          copyDayScheduleToWhatsApp(dayName, groupedByDayOfWeek[dayName]);
+                        }}
+                        className="ml-2 p-1.5 text-emerald-600 hover:bg-emerald-50 rounded-md transition-colors"
+                        title="Copiar Escala para WhatsApp"
+                      >
+                        <Copy className="h-4 w-4" />
+                      </button>
+                    )}
+                  </div>
+                  
+                  {expandedDays[dayName] && (
+                    <div className="overflow-x-auto">
+                      <table className="w-full text-left text-xs">
+                        <thead>
+                          <tr className="bg-slate-50/50 text-slate-400 uppercase font-bold border-b border-slate-100">
+                            <th className="px-4 py-3">Tipo</th>
+                            <th className="px-4 py-3">Autoescola</th>
+                            <th className="px-4 py-3">Data</th>
+                            <th className="px-4 py-3">Horário</th>
+                            <th className="px-4 py-3">Examinador</th>
+                            <th className="px-4 py-3">Exame</th>
+                            <th className="px-4 py-3">Vagas liberadas</th>
+                            {user.role !== UserRole.SCHOOL && <th className="px-4 py-3">Ações</th>}
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-50">
+                          {groupedByDayOfWeek[dayName].map(req => {
+                            const vacancies = confirmedVacancies(req, examiners);
+                            return (
+                            <tr key={req.id} className={getRowClass(req)}>
+                              <td className="px-4 py-3">{renderRequestTypeText(req)}</td>
+                              <td className="px-4 py-3 font-black text-slate-800 uppercase">{getSchoolName(req.schoolId)}</td>
+                              <td className="px-4 py-3 text-slate-600">{formatDate(req.scheduledDate)}</td>
+                              <td className="px-4 py-3 text-slate-600">{req.scheduledTime || '08:00'}</td>
+                              <td className="px-4 py-3 text-slate-600 uppercase">{getExaminerName(req.examinerId)}</td>
+                              <td className="px-4 py-3 text-slate-600">
+                                {getExamTypeLabel(req)}
+                              </td>
+                              <td className="px-4 py-3 text-slate-700">
+                                {vacancies.length > 0 ? (
+                                  <div className="flex flex-wrap gap-1">
+                                    {vacancies.map(([cat, qty]) => (
+                                      <span key={cat} className="inline-flex items-center gap-0.5 bg-orange-100 text-orange-800 text-xs font-bold px-1.5 py-0.5 rounded">
+                                        {qty}{cat}
+                                      </span>
+                                    ))}
+                                  </div>
+                                ) : (
+                                  <span className="text-slate-400">—</span>
+                                )}
+                              </td>
+                              {user.role !== UserRole.SCHOOL && !isConsultant && (
+                                <td className="px-4 py-3">
+                                  <div className="flex items-center gap-2">
+                                    {canManageConfirmed && <>
+                                      <button onClick={() => setConfirmedAction({ item: { ...req }, mode: 'edit' })}
+                                        className="border border-blue-200 text-blue-600 hover:bg-blue-50 p-2 rounded-md"
+                                        title="Editar prova confirmada" aria-label="Editar prova confirmada">
+                                        <Pencil className="h-4 w-4" />
+                                      </button>
+                                      <button onClick={() => setConfirmedAction({ item: { ...req }, mode: 'delete' })}
+                                        className="border border-red-200 text-red-600 hover:bg-red-50 p-2 rounded-md"
+                                        title="Excluir agendamento" aria-label="Excluir agendamento">
+                                        <Trash2 className="h-4 w-4" />
+                                      </button>
+                                    </>}
+                                    <button 
+                                      onClick={() => handleCancelAction(req)}
+                                      className="border border-red-200 text-red-600 hover:bg-red-50 p-2 rounded-md flex items-center justify-center transition-colors"
+                                      title="Cancelar"
+                                    >
+                                      <XCircle className="h-4 w-4" />
+                                    </button>
+                                  </div>
+                                </td>
+                              )}
+                            </tr>
+                            );
+                          })}
+                          {groupedByDayOfWeek[dayName].length === 0 && (
+                            <tr>
+                               <td colSpan={user.role === UserRole.SCHOOL ? 7 : 8} className="px-4 py-8 text-center text-slate-400 italic">Nenhum agendamento para este dia.</td>
+                            </tr>
+                          )}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              ))}
+              {confirmed.length === 0 && <p className="text-center py-4 text-slate-400 text-sm italic">Nenhum agendamento confirmado.</p>}
+            </div>
+          )}
+        </div>
+
+        {/* SECTION: DONE */}
+        <div className="border border-sky-200 rounded-lg overflow-hidden shadow-sm">
+          <button 
+            onClick={() => toggleSection('done')}
+            className="w-full flex items-center justify-between p-4 bg-sky-50/60 hover:bg-sky-50 transition-colors"
+          >
+            <div className="flex items-center gap-3 text-sky-700">
+              <CheckCircle2 className="h-5 w-5" />
+              <span className="font-bold">Provas Realizadas ({done.length})</span>
+            </div>
+            {expandedSections.done ? <ChevronUp className="h-5 w-5 text-sky-400" /> : <ChevronDown className="h-5 w-5 text-sky-400" />}
+          </button>
+          {expandedSections.done && (
+            <div className="p-4 bg-white">
+               {done.length > 0 ? (
+                 <div className="border border-slate-200 rounded-lg overflow-hidden">
+                   <div className="overflow-x-auto">
+                     <table className="w-full text-left text-xs">
+                       <thead>
+                         <tr className="bg-slate-50/50 text-slate-400 uppercase font-bold border-b border-slate-100">
+                           <th className="px-4 py-3">Tipo</th>
+                           <th className="px-4 py-3">Autoescola</th>
+                           <th className="px-4 py-3">Data</th>
+                           <th className="px-4 py-3">Horário</th>
+                           <th className="px-4 py-3">Examinador</th>
+                           <th className="px-4 py-3">Exame</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-50">
+                         {done.map(req => (
+                           <tr key={req.id} className={getRowClass(req)}>
+                             <td className="px-4 py-3">{renderRequestTypeText(req)}</td>
+                             <td className="px-4 py-3 font-black text-slate-800 uppercase">{getSchoolName(req.schoolId)}</td>
+                             <td className="px-4 py-3 text-slate-600">{formatDate(req.scheduledDate)}</td>
+                             <td className="px-4 py-3 text-slate-600">{req.scheduledTime || '08:00'}</td>
+                             <td className="px-4 py-3 text-slate-600 uppercase">{getExaminerName(req.examinerId)}</td>
+                             <td className="px-4 py-3 text-slate-600">{getExamTypeLabel(req)}</td>
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 </div>
+               ) : (
+                 <p className="text-center py-4 text-slate-400 text-sm italic">Nenhuma prova realizada encontrada.</p>
+               )}
+            </div>
+          )}
+        </div>
+
+        {/* SECTION: CANCELLED */}
+        <div className="border border-slate-300 rounded-lg overflow-hidden shadow-sm">
+          <button 
+            onClick={() => toggleSection('cancelled')}
+            className="w-full flex items-center justify-between p-4 bg-slate-100/80 hover:bg-slate-100 transition-colors"
+          >
+            <div className="flex items-center gap-3 text-slate-600">
+              <XCircle className="h-5 w-5" />
+              <span className="font-bold">Provas Canceladas ({cancelled.length})</span>
+            </div>
+            {expandedSections.cancelled ? <ChevronUp className="h-5 w-5 text-slate-400" /> : <ChevronDown className="h-5 w-5 text-slate-400" />}
+          </button>
+          {expandedSections.cancelled && (
+            <div className="p-4 bg-white">
+               {cancelled.length > 0 ? (
+                 <div className="border border-slate-200 rounded-lg overflow-hidden">
+                   <div className="overflow-x-auto">
+                     <table className="w-full text-left text-xs">
+                       <thead>
+                         <tr className="bg-slate-50/50 text-slate-400 uppercase font-bold border-b border-slate-100">
+                           <th className="px-4 py-3">Tipo</th>
+                           <th className="px-4 py-3">Autoescola</th>
+                           <th className="px-4 py-3">Data</th>
+                           <th className="px-4 py-3">Horário</th>
+                           <th className="px-4 py-3">Examinador</th>
+                           <th className="px-4 py-3">Exame</th>
+                           <th className="px-4 py-3">Motivo</th>
+                         </tr>
+                       </thead>
+                       <tbody className="divide-y divide-slate-50">
+                         {cancelled.map(req => (
+                           <tr key={req.id} className={getRowClass(req)}>
+                             <td className="px-4 py-3">{renderRequestTypeText(req)}</td>
+                             <td className="px-4 py-3 font-black text-slate-800 uppercase">{getSchoolName(req.schoolId)}</td>
+                             <td className="px-4 py-3 text-slate-600">{formatDate(req.scheduledDate)}</td>
+                             <td className="px-4 py-3 text-slate-600">{req.scheduledTime || '08:00'}</td>
+                             <td className="px-4 py-3 text-slate-600 uppercase">{getExaminerName(req.examinerId)}</td>
+                             <td className="px-4 py-3 text-slate-600">{getExamTypeLabel(req)}</td>
+                             <td className="px-4 py-3 text-slate-600">{req.cancellationReason || '-'}</td>
+                           </tr>
+                         ))}
+                       </tbody>
+                     </table>
+                   </div>
+                 </div>
+               ) : (
+                 <p className="text-center py-4 text-slate-400 text-sm italic">Nenhuma prova cancelada encontrada.</p>
+               )}
+            </div>
+          )}
+        </div>
+      </>
+    )}
+  </div>
+
+      {/* MODAL: GERAR ESCALAS AUTOMATICAMENTE */}
+      {isAutoGenerateModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-lg overflow-visible animate-in fade-in zoom-in duration-200">
+            <div className="flex justify-between items-center p-6 border-b border-slate-100">
+              <h2 className="text-xl font-bold text-slate-800">Gerar Escalas Automáticas</h2>
+              <button onClick={closeAutoGenerateModal} className="text-slate-400 hover:text-slate-600 transition-colors">
+                <X className="h-6 w-6" />
+              </button>
+            </div>
+            
+            <div className="p-6 space-y-4 border-b border-slate-100">
+              <p className="text-sm text-slate-600">
+                Selecione a data para a qual deseja gerar as escalas fixas. O sistema irá buscar a configuração ativa (Principal ou Provisória) de cada autoescola para este dia da semana.
+              </p>
+              
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Data Selecionada <span className="text-red-500">*</span></label>
+                <DatePicker 
+                  value={autoGenerateDate} 
+                  onChange={setAutoGenerateDate} 
+                  blockedDates={blockedDates}
+                  settings={systemSettings}
+                  placeholder="Selecione a data"
+                  className="w-full"
+                />
+              </div>
+            </div>
+
+            <div className="p-6 space-y-4 max-h-[50vh] overflow-y-auto">
+              {autoGenerateLookupLoading && <p role="status" className="text-sm text-slate-600">Consultando autoescolas e disponibilidade dos examinadores...</p>}
+              {autoGenerateLookupError && <p role="alert" className="text-sm text-red-600">{autoGenerateLookupError}</p>}
+              {autoGenerateDate && (
+                <div className="space-y-6 pt-2">
+                  {/* List 1: Normal Schedules */}
+                  <div className="space-y-3">
+                    <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest border-b border-slate-100 pb-1">Autoescolas do Dia (Escala Normal)</h3>
+                    
+                    {schoolsForAutoGenerate.length > 0 ? (
+                      <div className="grid grid-cols-1 gap-2">
+                        {schoolsForAutoGenerate.map(school => (
+                          <label key={school.id} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-md cursor-pointer transition-colors border border-transparent hover:border-slate-100">
+                            <input 
+                              type="checkbox" 
+                              data-testid={`checkbox-escala-autoescola-${school.id}`}
+                              className="h-4 w-4 rounded border-slate-300 text-emerald-600 focus:ring-emerald-500"
+                              checked={selectedSchoolsForAutoGenerate.includes(school.id)}
+                              onChange={e => {
+                                if (e.target.checked) {
+                                  setSelectedSchoolsForAutoGenerate([...selectedSchoolsForAutoGenerate, school.id]);
+                                } else {
+                                  setSelectedSchoolsForAutoGenerate(selectedSchoolsForAutoGenerate.filter(id => id !== school.id));
+                                }
+                              }}
+                            />
+                            <span className="flex flex-col">
+                              <span className="text-sm font-bold text-slate-700">{school.name}</span>
+                              {rotationSummaries[school.id] && <span data-testid={`status-rodizio-${school.id}`}
+                                className={`text-xs ${rotationSummaries[school.id].startsWith('Rodízio pronto:') ? 'text-emerald-700' : rotationSummaries[school.id].startsWith('Rodízio configurado:') ? 'text-amber-700' : 'text-red-600'}`}>
+                                {rotationSummaries[school.id]}
+                              </span>}
+                            </span>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-400 italic">Nenhuma autoescola configurada para este dia.</p>
+                    )}
+                  </div>
+
+                  {/* List 2: 15-Day Schedules */}
+                  <div className="space-y-3">
+                    <h3 className="text-xs font-black text-slate-400 uppercase tracking-widest border-b border-slate-100 pb-1">Autoescolas a cada 15 dias</h3>
+                    {schoolsWith15Days.length > 0 ? (
+                      <div className="grid grid-cols-1 gap-2">
+                        {schoolsWith15Days.map(school => (
+                          <label key={school.id} className="flex items-center gap-3 p-2 hover:bg-slate-50 rounded-md cursor-pointer transition-colors border border-transparent hover:border-slate-100">
+                            <input 
+                              type="checkbox" 
+                              data-testid={`checkbox-escala-autoescola-${school.id}`}
+                              className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                              checked={selectedSchoolsForAutoGenerate.includes(school.id)}
+                              onChange={e => {
+                                if (e.target.checked) {
+                                  setSelectedSchoolsForAutoGenerate([...selectedSchoolsForAutoGenerate, school.id]);
+                                } else {
+                                  setSelectedSchoolsForAutoGenerate(selectedSchoolsForAutoGenerate.filter(id => id !== school.id));
+                                }
+                              }}
+                            />
+                            <div className="flex flex-col">
+                              <span className="text-sm font-bold text-slate-700">{school.name}</span>
+                              <span className="text-[10px] text-blue-600 font-bold uppercase">Escala Quinzenal — pré-seleção automática pelo histórico</span>
+                              {rotationSummaries[school.id] && <span data-testid={`status-rodizio-${school.id}`}
+                                className={`text-xs ${rotationSummaries[school.id].startsWith('Rodízio pronto:') ? 'text-emerald-700' : rotationSummaries[school.id].startsWith('Rodízio configurado:') ? 'text-amber-700' : 'text-red-600'}`}>
+                                {rotationSummaries[school.id]}
+                              </span>}
+                            </div>
+                          </label>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-slate-400 italic">Nenhuma autoescola com escala de 15 dias para este dia.</p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-6 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
+              <button 
+                onClick={closeAutoGenerateModal}
+                className="px-6 py-2 rounded-lg border border-slate-200 text-slate-600 font-bold text-sm hover:bg-white transition-all"
+              >
+                Cancelar
+              </button>
+              <button 
+                onClick={handleAutoGenerate}
+                data-testid="button-gerar-escalas-fixas"
+                disabled={loading || autoGenerateLookupLoading || !!autoGenerateLookupError}
+                className="px-8 py-2 rounded-lg bg-emerald-600 text-white font-bold text-sm hover:bg-emerald-700 disabled:opacity-50 shadow-md shadow-emerald-200 transition-all flex items-center gap-2"
+              >
+                <RefreshCw className="h-4 w-4" /> Gerar Escalas
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: SELEÇÃO DE TIPO DE AGENDAMENTO */}
+      {isTypeSelectionModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-sm overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-6 border-b border-slate-100">
+              <h2 className="text-lg font-bold text-slate-800">{user.role === UserRole.SCHOOL ? 'Tipo de Pedido' : 'Tipo de Agendamento'}</h2>
+            </div>
+            <div className={`p-6 grid ${showReposition ? 'grid-cols-2' : 'grid-cols-1'} gap-4`}>
+              <button 
+                onClick={() => {
+                  setNewRequest({...newRequest, requestType: RequestType.EXTRA, observation: ''});
+                  setIsTypeSelectionModalOpen(false);
+                  setIsNewModalOpen(true);
+                }}
+                className="bg-orange-100 hover:bg-orange-200 text-orange-800 font-bold py-4 rounded-lg transition-all"
+              >
+                Extra
+              </button>
+              {showReposition && (
+                <button 
+                  onClick={() => {
+                    setNewRequest({...newRequest, requestType: RequestType.REPOSICAO, observation: ''});
+                    setIsTypeSelectionModalOpen(false);
+                    setIsNewModalOpen(true);
+                  }}
+                  className="bg-emerald-100 hover:bg-emerald-200 text-emerald-800 font-bold py-4 rounded-lg transition-all"
+                >
+                  Reposição
+                </button>
+              )}
+            </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-end">
+              <button 
+                onClick={() => {
+                  setIsTypeSelectionModalOpen(false);
+                  setNewRequest({
+                    schoolId: user.role === UserRole.SCHOOL ? user.schoolId || '' : '',
+                    categories: [],
+                    categoryQuantities: {},
+                    examType: '',
+                    examinerId: '',
+                    date: '',
+                    time: '',
+                    observation: '',
+                    requestType: RequestType.EXTRA
+                  });
+                }}
+                className="px-4 py-2 rounded-lg text-sm font-bold text-slate-600 hover:bg-slate-200 transition-all"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: NOVO AGENDAMENTO */}
+      {/* NOTIFICATION MODAL */}
+      {isNotificationModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[70] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-300 border-4 border-red-500">
+            <div className="p-8 text-center space-y-6">
+              <div className="mx-auto h-24 w-24 rounded-full bg-red-50 flex items-center justify-center text-red-600 animate-bounce">
+                <Bell className="h-12 w-12" />
+              </div>
+              <div className="space-y-3">
+                <h3 className="text-2xl font-black text-slate-800 uppercase tracking-tight">{user.role === UserRole.SCHOOL ? 'Novo Pedido!' : 'Novo Agendamento!'}</h3>
+                <p className="text-slate-600 font-medium text-lg">
+                  Existe um novo agendamento aguardando a sua confirmação no sistema.
+                </p>
+              </div>
+              <button 
+                onClick={() => {
+                  const currentIds = waitingConfirmation.map(r => r.id);
+                  localStorage.setItem(`cfc_notified_requests_${user.id}`, JSON.stringify(currentIds));
+                  setIsNotificationModalOpen(false);
+                }}
+                className="w-full py-4 bg-red-600 hover:bg-red-700 text-white rounded-xl font-bold text-lg shadow-lg shadow-red-200 transition-all transform hover:scale-[1.02] active:scale-[0.98] uppercase tracking-wider"
+              >
+                Entendido
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: LIMITE DE EXTRAS ATINGIDO */}
+      {isExtraLimitReachedModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[80] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-300 border-t-8 border-red-600">
+            <div className="p-8 space-y-6">
+              <div className="mx-auto h-20 w-20 rounded-full bg-red-50 flex items-center justify-center text-red-600">
+                <AlertTriangle className="h-10 w-10" />
+              </div>
+              <div className="space-y-3 text-center">
+                <h3 className="text-2xl font-black text-slate-800 uppercase tracking-tight">Limite de Pedidos Atingido</h3>
+                <p className="text-slate-600 font-medium leading-relaxed">
+                  O limite de <span className="font-black text-red-600">2 pedidos de provas Extras</span> do tipo <span className="font-black text-slate-800">"{extraLimitReachedType}"</span> para este mês já foi atingido.
+                </p>
+                <p className="text-slate-500 text-sm">
+                  Não é possível adicionar mais pedidos de prova Extra deste tipo no mês corrente. Aguarde o próximo mês ou entre em contato com o DETRAN.
+                </p>
+              </div>
+              <button
+                onClick={() => setIsExtraLimitReachedModalOpen(false)}
+                className="w-full py-4 bg-red-600 hover:bg-red-700 text-white rounded-xl font-bold text-lg shadow-lg shadow-red-200 transition-all transform hover:scale-[1.02] active:scale-[0.98]"
+              >
+                Entendido
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: AVISO DE LIMITE DE VAGAS */}
+      {isLimitWarningModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[80] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-300 border-t-8 border-blue-600">
+            <div className="p-8 space-y-6">
+              <div className="mx-auto h-20 w-20 rounded-full bg-blue-50 flex items-center justify-center text-blue-600">
+                <AlertTriangle className="h-10 w-10" />
+              </div>
+              
+              <div className="space-y-4 text-center">
+                <h3 className="text-2xl font-black text-slate-800 uppercase tracking-tight">Aviso de Limite de Vagas</h3>
+                <div className="bg-slate-50 p-6 rounded-xl border border-slate-100 text-left space-y-4">
+                  {user.role === UserRole.SCHOOL ? (
+                    <p className="text-slate-600 font-medium leading-relaxed">
+                      O pedido de prova extra pode ter vagas liberadas com quantidades <strong>acima ou abaixo</strong> das vagas solicitadas, conforme a disponibilidade do Examinador.
+                    </p>
+                  ) : (
+                    <>
+                      <p className="text-slate-600 font-medium leading-relaxed">
+                        A autoescola está ciente de que serão oferecidas no máximo as seguintes quantidades de vagas por categoria:
+                      </p>
+                      <ul className="space-y-2">
+                        <li className="flex items-center gap-3 text-slate-700 font-bold">
+                          <div className="h-2 w-2 rounded-full bg-blue-500"></div>
+                          Categoria A: {systemSettings?.defaultMaxSlotsA || 10} vagas
+                        </li>
+                        <li className="flex items-center gap-3 text-slate-700 font-bold">
+                          <div className="h-2 w-2 rounded-full bg-blue-500"></div>
+                          Categoria B: {systemSettings?.defaultMaxSlotsB || 10} vagas
+                        </li>
+                        <li className="flex items-center gap-3 text-slate-700 font-bold">
+                          <div className="h-2 w-2 rounded-full bg-blue-500"></div>
+                          Categorias C, D e E (juntas): {systemSettings?.defaultMaxSlotsMudanca || 10} vagas
+                        </li>
+                      </ul>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="flex flex-col gap-3">
+                <button 
+                  onClick={() => {
+                    setAwareOfLimits(true);
+                    executeSubmitNew();
+                  }}
+                  className="w-full py-4 bg-blue-600 hover:bg-blue-700 text-white rounded-xl font-bold text-lg shadow-lg shadow-blue-200 transition-all transform hover:scale-[1.02] active:scale-[0.98] uppercase tracking-wider"
+                >
+                  Estou Ciente e Salvar
+                </button>
+                <button 
+                  onClick={() => setIsLimitWarningModalOpen(false)}
+                  className="w-full py-3 text-slate-500 font-bold hover:text-slate-700 transition-colors"
+                >
+                  Voltar e Revisar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isNewModalOpen && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className={`bg-white rounded-xl shadow-2xl w-full ${newRequest.requestType === RequestType.FIXA ? 'max-w-2xl' : 'max-w-lg'} overflow-hidden animate-in fade-in zoom-in duration-200`}>
+            <div className="flex justify-between items-center p-6 border-b border-slate-100">
+              <h2 className="text-xl font-bold text-slate-800">{user.role === UserRole.SCHOOL ? 'Novo Pedido' : 'Novo Agendamento'}</h2>
+              <button onClick={handleCloseNewModal} className="text-slate-400 hover:text-slate-600 transition-colors">
+                <X className="h-6 w-6" />
+              </button>
+            </div>
+            
+            <div className="p-6 space-y-6">
+              <div className={`grid grid-cols-1 ${newRequest.requestType === RequestType.FIXA ? 'md:grid-cols-2' : ''} gap-6`}>
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Autoescola <span className="text-red-500">*</span></label>
+                  <select 
+                    className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                    value={newRequest.schoolId}
+                    onChange={e => {
+                      const newSchoolId = e.target.value;
+                      setNewRequest({
+                        ...newRequest, 
+                        schoolId: newSchoolId,
+                        examType: '',
+                        categories: newSchoolId === 'CNH_BRASIL' ? ['A', 'B'] : [],
+                        categoryQuantities: {}
+                      });
+                    }}
+                    disabled={user.role === UserRole.SCHOOL}
+                  >
+                    <option value="">Selecione a autoescola</option>
+                    {schools
+                      .filter(s => user.role === UserRole.SCHOOL 
+                        ? s.id === user.schoolId 
+                        : (newRequest.requestType !== RequestType.FIXA || s.mainSchedule?.active || s.provisionalSchedule?.active)
+                      )
+                      .map(s => <option key={s.id} value={s.id}>{s.name}</option>)
+                    }
+                    {newRequest.requestType === RequestType.FIXA && user.role !== UserRole.SCHOOL && (
+                      <>
+                        <option value="PCD">{systemSettings?.pcdExamName || 'PROVA DIRECAO PCD'}</option>
+                        <option value="CNH_BRASIL">CNH DO BRASIL</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+
+                {/* Exame — acima de Categoria; select para escolas normais */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Exame <span className="text-red-500">*</span></label>
+                  {newRequest.schoolId === 'PCD' ? (
+                    <input type="text" value="PCD" readOnly className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-100 text-slate-500 outline-none" />
+                  ) : newRequest.schoolId === 'CNH_BRASIL' ? (
+                    <input type="text" value="1º Habilitação" readOnly className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-100 text-slate-500 outline-none" />
+                  ) : (() => {
+                    const selectedSchool = newRequest.schoolId ? schools.find(s => s.id === newRequest.schoolId) : null;
+                    const hasCDE = !selectedSchool || (selectedSchool.services || []).some((s: string) => ['C', 'D', 'E'].includes(s));
+                    return (
+                      <select
+                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        value={newRequest.examType}
+                        onChange={e => setNewRequest({...newRequest, examType: e.target.value, categories: [], categoryQuantities: {}})}
+                      >
+                        <option value="">Selecione o tipo de exame</option>
+                        <option value="1HAB">1º Habilitação</option>
+                        {hasCDE && <option value="MUD_CAT">Mudança Categoria</option>}
+                        {hasCDE && <option value="MISTO">Misto (1º Hab. e Mud. Cat.)</option>}
+                      </select>
+                    );
+                  })()}
+                </div>
+
+                {/* Categoria — filtrada pelo tipo de exame selecionado */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Categoria <span className="text-red-500">*</span></label>
+                  <div className="flex flex-wrap items-center gap-4 pt-2">
+                    {newRequest.schoolId === 'PCD' ? (
+                      <label className="flex items-center gap-2 cursor-pointer group">
+                        <input type="checkbox" className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" checked={true} readOnly />
+                        <span className="text-sm font-bold text-slate-700">PCD</span>
+                      </label>
+                    ) : newRequest.schoolId === 'CNH_BRASIL' ? (
+                      <>
+                        <label className="flex items-center gap-2 cursor-pointer group">
+                          <input type="checkbox" className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" checked={true} readOnly />
+                          <span className="text-sm font-bold text-slate-700">A</span>
+                        </label>
+                        <label className="flex items-center gap-2 cursor-pointer group">
+                          <input type="checkbox" className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" checked={true} readOnly />
+                          <span className="text-sm font-bold text-slate-700">B</span>
+                        </label>
+                      </>
+                    ) : !newRequest.examType ? (
+                      <span className="text-xs text-slate-400 italic">Selecione o tipo de exame primeiro</span>
+                    ) : (
+                      (() => {
+                        const selectedSchool = newRequest.schoolId ? schools.find(s => s.id === newRequest.schoolId) : null;
+                        const schoolCde = (selectedSchool?.services || ['C', 'D', 'E']).filter((s: string) => ['C', 'D', 'E'].includes(s));
+                        let availableCats: string[] = [];
+                        if (newRequest.examType === '1HAB') availableCats = ['A', 'B'];
+                        else if (newRequest.examType === 'MUD_CAT') availableCats = schoolCde;
+                        else if (newRequest.examType === 'MISTO') availableCats = ['A', 'B', ...schoolCde];
+                        return availableCats.map(cat => (
+                          <label key={cat} className="flex items-center gap-2 cursor-pointer group">
+                            <input
+                              type="checkbox"
+                              className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+                              checked={newRequest.categories.includes(cat)}
+                              onChange={e => {
+                                const categoryOrder = ['A', 'B', 'C', 'D', 'E'];
+                                let newCats = e.target.checked
+                                  ? [...newRequest.categories, cat]
+                                  : newRequest.categories.filter(c => c !== cat);
+                                newCats.sort((a, b) => categoryOrder.indexOf(a) - categoryOrder.indexOf(b));
+                                const newQtys = { ...newRequest.categoryQuantities };
+                                if (!e.target.checked) delete newQtys[cat];
+                                setNewRequest({...newRequest, categories: newCats, categoryQuantities: newQtys});
+                              }}
+                            />
+                            <span className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors">{cat}</span>
+                            {(newRequest.requestType === RequestType.EXTRA || newRequest.requestType === RequestType.REPOSICAO) && newRequest.categories.includes(cat) && (
+                              <input
+                                type="number"
+                                min={1}
+                                value={newRequest.categoryQuantities[cat] ?? ''}
+                                onChange={e => {
+                                  const val = parseInt(e.target.value);
+                                  setNewRequest({
+                                    ...newRequest,
+                                    categoryQuantities: { ...newRequest.categoryQuantities, [cat]: isNaN(val) ? 0 : val }
+                                  });
+                                }}
+                                className="w-14 border border-orange-300 bg-orange-50 rounded p-1 text-sm text-center font-bold focus:ring-2 focus:ring-orange-400 outline-none"
+                                placeholder="Qtd"
+                              />
+                            )}
+                          </label>
+                        ));
+                      })()
+                    )}
+                  </div>
+                </div>
+
+                {newRequest.requestType === RequestType.FIXA && (
+                  <>
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Examinador <span className="text-red-500">*</span></label>
+                      <select 
+                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        value={newRequest.examinerId}
+                        onChange={e => setNewRequest({...newRequest, examinerId: e.target.value})}
+                      >
+                        <option value="">Selecione o examinador</option>
+                        {examiners.map(e => {
+                          const examDate = newRequest.date;
+                          const examTime = newRequest.time || undefined;
+                          const isBlocked = examDate
+                            ? isExaminerBlocked(e.blockedPeriods || [], examDate, examTime)
+                            : false;
+                          const reason = isBlocked
+                            ? getBlockReason(e.blockedPeriods || [], examDate!, examTime)
+                            : '';
+                          return (
+                            <option key={e.id} value={e.id} disabled={isBlocked}>
+                              {isBlocked ? `🔒 ${e.name}${reason ? ` — ${reason}` : ' — BLOQUEADO'}` : e.name}
+                            </option>
+                          );
+                        })}
+                      </select>
+                      {newRequest.examinerId && newRequest.date && (() => {
+                        const ex = examiners.find(e => e.id === newRequest.examinerId);
+                        const examTime = newRequest.time || undefined;
+                        const isBlocked = ex ? isExaminerBlocked(ex.blockedPeriods || [], newRequest.date, examTime) : false;
+                        const reason = isBlocked && ex ? getBlockReason(ex.blockedPeriods || [], newRequest.date, examTime) : '';
+                        return isBlocked ? (
+                          <p className="text-xs text-red-600 font-semibold mt-1">⚠️ Este examinador está bloqueado na data selecionada{reason ? `: ${reason}` : ''}.</p>
+                        ) : null;
+                      })()}
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Data <span className="text-red-500">*</span></label>
+                      <DatePicker 
+                        value={newRequest.date} 
+                        onChange={date => setNewRequest({...newRequest, date})} 
+                        blockedDates={blockedDates}
+                        settings={systemSettings}
+                        placeholder="Selecione a data"
+                        className="w-full"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Horário <span className="text-red-500">*</span></label>
+                      <input 
+                        type="time" 
+                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        value={newRequest.time}
+                        onChange={e => setNewRequest({...newRequest, time: e.target.value})}
+                      />
+                    </div>
+                  </>
+                )}
+              </div>
+
+              <div className="space-y-1.5">
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Observações</label>
+                <textarea 
+                  rows={3}
+                  placeholder="Observações adicionais..."
+                  className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all resize-none"
+                  value={newRequest.observation}
+                  onChange={e => setNewRequest({...newRequest, observation: e.target.value})}
+                ></textarea>
+              </div>
+            </div>
+
+            <div className="p-6 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
+              <button 
+                onClick={handleCloseNewModal}
+                className="px-6 py-2 rounded-lg border border-slate-200 text-slate-600 font-bold text-sm hover:bg-white transition-all"
+              >
+                Cancelar
+              </button>
+              <button 
+                onClick={handleSubmitNew}
+                className="px-8 py-2 rounded-lg bg-blue-600 text-white font-bold text-sm hover:bg-blue-700 shadow-md shadow-blue-200 transition-all flex items-center gap-2"
+              >
+                <Save className="h-4 w-4" /> Salvar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: EDITAR AGENDAMENTO */}
+      {isEditModalOpen && selectedRequest && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className={`bg-white rounded-xl shadow-2xl w-full ${isFromDoneCard ? 'max-w-2xl' : 'max-w-md'} overflow-hidden animate-in fade-in zoom-in duration-200`}>
+            <div className="flex justify-between items-center p-6 border-b border-slate-100">
+              <h2 className="text-xl font-bold text-slate-800">
+                {isFromDoneCard ? `Inserir Resultados da Autoescola ${schools.find(s => s.id === selectedRequest?.schoolId)?.name || ''}` : 'Inserir Dados Agendamento'}
+              </h2>
+              <button onClick={() => {
+                setIsEditModalOpen(false);
+                setIsFromDoneCard(false);
+                setActiveEditTab('dados');
+              }} className="text-slate-400 hover:text-slate-600 transition-colors">
+                <X className="h-6 w-6" />
+              </button>
+            </div>
+
+            {isFromDoneCard && (
+              <div className="flex border-b border-slate-100 px-6 bg-white sticky top-0 z-10">
+                {[
+                  { id: 'dados', label: 'Dados Principais' },
+                  { id: 'catA', label: 'Categoria A' },
+                  { id: 'catB', label: 'Categoria B' },
+                  { id: 'mudanca', label: 'Mudança Categoria' }
+                ].filter(tab => {
+                  if (tab.id === 'dados') return !isFromDoneCard;
+                  const cats = selectedRequest.intendedCategory?.split(',') || [];
+                  if (tab.id === 'catA') return cats.includes('A') || cats.length === 0 || (cats.length === 1 && cats[0] === '');
+                  if (tab.id === 'catB') return cats.includes('B');
+                  if (tab.id === 'mudanca') return cats.some(c => ['C', 'D', 'E'].includes(c));
+                  return false;
+                }).map(tab => (
+                  <button
+                    key={tab.id}
+                    onClick={() => setActiveEditTab(tab.id)}
+                    className={`px-4 py-3 text-xs font-bold uppercase tracking-wider transition-all border-b-2 ${
+                      activeEditTab === tab.id 
+                        ? 'border-blue-600 text-blue-600' 
+                        : 'border-transparent text-slate-400 hover:text-slate-600'
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            )}
+            
+            <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+              {activeEditTab === 'dados' && (
+                <div className="space-y-6">
+                  {!isFromDoneCard ? (
+                    <div className="space-y-4">
+                      <div className="bg-yellow-50 border border-yellow-200 rounded-lg p-4 space-y-2">
+                        <div className="flex flex-wrap gap-x-4 gap-y-1 text-sm">
+                          <span className="text-red-600 font-black uppercase">Autoescola: <span className="text-slate-900">{getSchoolName(selectedRequest.schoolId)}</span></span>
+                          <span className="text-red-600 font-black uppercase">Exame: <span className="text-slate-900">{getExamTypeLabel(selectedRequest)}</span></span>
+                        </div>
+                      </div>
+                      {(selectedRequest.intendedCategory || '').split(',').filter(Boolean).filter(c => c !== 'PCD').length > 0 && (
+                        <div className="space-y-2">
+                          <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Vagas Liberadas por Categoria</label>
+                          <div className="flex flex-wrap items-center gap-4 p-3 bg-orange-50 rounded-lg border border-orange-200">
+                            {(selectedRequest.intendedCategory || '').split(',').filter(Boolean).filter(c => c !== 'PCD').map(cat => (
+                              <div key={cat} className="flex items-center gap-2">
+                                <span className="text-sm font-bold text-slate-700 min-w-[18px]">{cat}</span>
+                                <input
+                                  type="number"
+                                  min={0}
+                                  value={selectedRequest.categoryQuantities?.[cat] ?? ''}
+                                  onChange={e => {
+                                    const val = parseInt(e.target.value);
+                                    setSelectedRequest({
+                                      ...selectedRequest,
+                                      categoryQuantities: {
+                                        ...(selectedRequest.categoryQuantities || {}),
+                                        [cat]: isNaN(val) ? 0 : val
+                                      }
+                                    });
+                                  }}
+                                  className="w-16 border border-orange-300 bg-white rounded p-1 text-sm text-center font-bold focus:ring-2 focus:ring-orange-400 outline-none"
+                                  placeholder="0"
+                                />
+                              </div>
+                            ))}
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                      <div className="md:col-span-2 space-y-1.5">
+                        <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Autoescola</label>
+                        <select 
+                          className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-100 focus:ring-2 focus:ring-blue-500 outline-none transition-all cursor-not-allowed"
+                          value={selectedRequest.schoolId}
+                          onChange={e => {
+                            const newSchoolId = e.target.value;
+                            setSelectedRequest({
+                              ...selectedRequest, 
+                              schoolId: newSchoolId,
+                              intendedCategory: newSchoolId === 'CNH_BRASIL' ? 'A,B' : ''
+                            });
+                          }}
+                          disabled={true}
+                        >
+                          {schools.filter(s => s.mainSchedule?.active || s.provisionalSchedule?.active).map(s => <option key={s.id} value={s.id}>{s.name}</option>)}
+                          {user.role !== UserRole.SCHOOL && (
+                            <>
+                              <option value="PCD">{systemSettings?.pcdExamName || 'PROVA DIRECAO PCD'}</option>
+                              <option value="CNH_BRASIL">CNH DO BRASIL</option>
+                            </>
+                          )}
+                        </select>
+                      </div>
+
+                      <div className="md:col-span-2 space-y-1.5">
+                        <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Categoria <span className="text-red-500">*</span></label>
+                        <div className="flex flex-wrap items-center gap-6 p-3 bg-slate-50 rounded-lg border border-slate-100">
+                          {selectedRequest.schoolId === 'PCD' ? (
+                            <label className="flex items-center gap-2 cursor-pointer group">
+                              <input 
+                                type="checkbox" 
+                                className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" 
+                                checked={true}
+                                readOnly
+                              />
+                              <span className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors">
+                                PCD
+                              </span>
+                            </label>
+                          ) : selectedRequest.schoolId === 'CNH_BRASIL' ? (
+                            <>
+                              <label className="flex items-center gap-2 cursor-pointer group">
+                                <input 
+                                  type="checkbox" 
+                                  className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" 
+                                  checked={true}
+                                  readOnly
+                                />
+                                <span className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors">
+                                  A
+                                </span>
+                              </label>
+                              <label className="flex items-center gap-2 cursor-pointer group">
+                                <input 
+                                  type="checkbox" 
+                                  className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" 
+                                  checked={true}
+                                  readOnly
+                                />
+                                <span className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors">
+                                  B
+                                </span>
+                              </label>
+                            </>
+                          ) : (
+                            (selectedRequest.schoolId 
+                              ? schools.find(s => s.id === selectedRequest.schoolId)?.services || [] 
+                              : ['A', 'B', 'C', 'D', 'E', 'PCD']
+                            ).filter(cat => {
+                              if (selectedRequest.requestType === RequestType.FIXA || selectedRequest.requestType === RequestType.REPOSICAO) {
+                                return ['A', 'B'].includes(cat);
+                              }
+                              return true;
+                            }).map(cat => (
+                              <label key={cat} className={`flex items-center gap-2 group ${!isFromDoneCard ? 'cursor-not-allowed opacity-70' : 'cursor-pointer'}`}>
+                                <input 
+                                  type="checkbox" 
+                                  className="h-4 w-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500" 
+                                  checked={selectedRequest.intendedCategory?.split(',').includes(cat)}
+                                  disabled={!isFromDoneCard}
+                                  onChange={e => {
+                                    const currentCats = selectedRequest.intendedCategory ? selectedRequest.intendedCategory.split(',').filter(Boolean) : [];
+                                    let newCats = e.target.checked 
+                                      ? [...currentCats, cat]
+                                      : currentCats.filter(c => c !== cat);
+                                    
+                                    // Ordenar categorias: A, B, C, D, E, PCD
+                                    const categoryOrder = ['A', 'B', 'C', 'D', 'E', 'PCD'];
+                                    newCats.sort((a, b) => categoryOrder.indexOf(a) - categoryOrder.indexOf(b));
+
+                                    // Regra: Não permitir A/B junto com C/D/E
+                                    const hasAB = newCats.some(c => ['A', 'B'].includes(c));
+                                    const hasCDE = newCats.some(c => ['C', 'D', 'E'].includes(c));
+                                    if (hasAB && hasCDE) {
+                                      alert('Não é permitido selecionar categorias A/B junto com C/D/E.');
+                                      return;
+                                    }
+                                    
+                                    setSelectedRequest({...selectedRequest, intendedCategory: newCats.join(',')});
+                                  }}
+                                />
+                                <span className="text-sm font-bold text-slate-700 group-hover:text-blue-600 transition-colors">{cat}</span>
+                              </label>
+                            ))
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="space-y-1.5">
+                        <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Exame</label>
+                        <div className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-100 text-slate-600 font-bold">
+                          {getExamTypeLabel(selectedRequest)}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Data <span className="text-red-500">*</span></label>
+                      <DatePicker 
+                        value={selectedRequest.scheduledDate || ''} 
+                        onChange={date => {
+                          // Se o examinador actualmente seleccionado ficar bloqueado na nova data, limpa-o
+                          const currentEx = examiners.find(e => e.id === selectedRequest.examinerId);
+                          const periods = Array.isArray(currentEx?.blockedPeriods) ? currentEx!.blockedPeriods : [];
+                          const willBeBlocked = date ? isExaminerBlocked(periods, date, selectedRequest.scheduledTime || undefined) : false;
+                          setSelectedRequest({
+                            ...selectedRequest,
+                            scheduledDate: date,
+                            examinerId: willBeBlocked ? '' : (selectedRequest.examinerId || ''),
+                          });
+                        }} 
+                        blockedDates={blockedDates}
+                        settings={systemSettings}
+                        placeholder="Selecione a data"
+                        className="w-full"
+                      />
+                    </div>
+
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Horário <span className="text-red-500">*</span></label>
+                      <input 
+                        type="time" 
+                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        value={selectedRequest.scheduledTime || ''}
+                        onChange={e => setSelectedRequest({...selectedRequest, scheduledTime: e.target.value})}
+                      />
+                    </div>
+
+                    <div className="md:col-span-2 space-y-1.5">
+                      <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Examinador <span className="text-red-500">*</span></label>
+                      <select 
+                        className="w-full border border-slate-200 rounded-lg p-2.5 text-sm bg-slate-50 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                        value={selectedRequest.examinerId || ''}
+                        onChange={e => setSelectedRequest({...selectedRequest, examinerId: e.target.value})}
+                      >
+                        <option value="">Selecione o examinador</option>
+                        {examiners
+                          .filter(e => {
+                            if (!selectedRequest.intendedCategory) return true;
+                            const reqCats = selectedRequest.intendedCategory.split(',').filter(Boolean);
+                            if (reqCats.length === 0) return true;
+                            return e.categories?.some(cat => reqCats.includes(cat));
+                          })
+                          .map(e => {
+                            const examDate = selectedRequest.scheduledDate || '';
+                            const examTime = selectedRequest.scheduledTime || undefined;
+                            const isBlocked = examDate
+                              ? isExaminerBlocked(Array.isArray(e.blockedPeriods) ? e.blockedPeriods : [], examDate, examTime)
+                              : false;
+                            const reason = isBlocked
+                              ? getBlockReason(Array.isArray(e.blockedPeriods) ? e.blockedPeriods : [], examDate, examTime)
+                              : '';
+                            return (
+                              <option key={e.id} value={e.id} disabled={isBlocked}>
+                                {isBlocked ? `🔒 ${e.name}${reason ? ` — ${reason}` : ' — BLOQUEADO'}` : e.name}
+                              </option>
+                            );
+                          })
+                        }
+                      </select>
+                      {selectedRequest.examinerId && selectedRequest.scheduledDate && (() => {
+                        const ex = examiners.find(e => e.id === selectedRequest.examinerId);
+                        const periods = Array.isArray(ex?.blockedPeriods) ? ex!.blockedPeriods : [];
+                        const examDate = selectedRequest.scheduledDate || '';
+                        const examTime = selectedRequest.scheduledTime || undefined;
+                        const blocked = examDate ? isExaminerBlocked(periods, examDate, examTime) : false;
+                        const blockReason = blocked ? getBlockReason(periods, examDate, examTime) : '';
+                        return blocked ? (
+                          <p className="text-xs text-red-600 font-semibold mt-1 flex items-center gap-1">
+                            <span>⚠️</span>
+                            <span>Este examinador está bloqueado na data/horário selecionado{blockReason ? `: ${blockReason}` : ''}.</span>
+                          </p>
+                        ) : null;
+                      })()}
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Observações</label>
+                    <textarea 
+                      rows={3}
+                      className={`w-full border border-slate-200 rounded-lg p-2.5 text-sm focus:ring-2 focus:ring-blue-500 outline-none transition-all resize-none ${!isFromDoneCard ? 'bg-slate-100 cursor-not-allowed' : 'bg-slate-50'}`}
+                      placeholder="Observações adicionais..."
+                      value={selectedRequest.observation || ''}
+                      onChange={e => setSelectedRequest({...selectedRequest, observation: e.target.value})}
+                      disabled={!isFromDoneCard}
+                    ></textarea>
+                  </div>
+                </div>
+              )}
+
+              {activeEditTab === 'catA' && (
+                <div className="p-6 space-y-6">
+                  <div className="grid grid-cols-3 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Total Vagas</label>
+                      <input 
+                        type="number"
+                        value={bancaResults.find(r => r.category === 'A')?.totalSlots || 0}
+                        disabled
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 bg-slate-100 text-slate-500 outline-none transition-all cursor-not-allowed"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Vagas Usadas</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'A')?.usedSlots || 0}
+                        onChange={(e) => updateBancaResult('A', 'usedSlots', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Apto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'A')?.approved || 0}
+                        onChange={(e) => updateBancaResult('A', 'approved', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Inapto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'A')?.failed || 0}
+                        onChange={(e) => updateBancaResult('A', 'failed', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Cancelado</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'A')?.cancelled || 0}
+                        onChange={(e) => updateBancaResult('A', 'cancelled', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Falta</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'A')?.absent || 0}
+                        onChange={(e) => updateBancaResult('A', 'absent', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeEditTab === 'catB' && (
+                <div className="p-6 space-y-6">
+                  <div className="grid grid-cols-3 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Total Vagas</label>
+                      <input 
+                        type="number"
+                        value={bancaResults.find(r => r.category === 'B')?.totalSlots || 0}
+                        disabled
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 bg-slate-100 text-slate-500 outline-none transition-all cursor-not-allowed"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Vagas Usadas</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'B')?.usedSlots || 0}
+                        onChange={(e) => updateBancaResult('B', 'usedSlots', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Apto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'B')?.approved || 0}
+                        onChange={(e) => updateBancaResult('B', 'approved', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Inapto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'B')?.failed || 0}
+                        onChange={(e) => updateBancaResult('B', 'failed', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Cancelado</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'B')?.cancelled || 0}
+                        onChange={(e) => updateBancaResult('B', 'cancelled', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Falta</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'B')?.absent || 0}
+                        onChange={(e) => updateBancaResult('B', 'absent', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {activeEditTab === 'mudanca' && (
+                <div className="p-6 space-y-6">
+                  <div className="grid grid-cols-3 gap-6">
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Total Vagas</label>
+                      <input 
+                        type="number"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.totalSlots || 0}
+                        disabled
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 bg-slate-100 text-slate-500 outline-none transition-all cursor-not-allowed"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Vagas Usadas</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.usedSlots || 0}
+                        onChange={(e) => updateBancaResult('MUDANCA', 'usedSlots', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Apto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.approved || 0}
+                        onChange={(e) => updateBancaResult('MUDANCA', 'approved', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Inapto</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.failed || 0}
+                        onChange={(e) => updateBancaResult('MUDANCA', 'failed', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Cancelado</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.cancelled || 0}
+                        onChange={(e) => updateBancaResult('MUDANCA', 'cancelled', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-sm font-bold text-slate-700">Falta</label>
+                      <input 
+                        type="number"
+                        min="0"
+                        value={bancaResults.find(r => r.category === 'MUDANCA')?.absent || 0}
+                        onChange={(e) => updateBancaResult('MUDANCA', 'absent', parseInt(e.target.value) || 0)}
+                        className="w-full px-4 py-2.5 rounded-lg border border-slate-200 focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                      />
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <div className="p-6 border-t border-slate-100 bg-slate-50 flex justify-end items-center">
+              <div className="flex gap-3">
+                <button 
+                  onClick={() => {
+                    setIsEditModalOpen(false);
+                    setIsFromDoneCard(false);
+                    setActiveEditTab('dados');
+                    setBancaResults([]);
+                  }}
+                  className="px-6 py-2.5 rounded-lg text-sm font-bold text-slate-600 hover:bg-slate-200 transition-colors"
+                >
+                  Cancelar
+                </button>
+                <button 
+                  onClick={handleUpdateEdit}
+                  className="px-6 py-2.5 rounded-lg text-sm font-bold text-white bg-blue-600 hover:bg-blue-700 shadow-lg shadow-blue-200 transition-all flex items-center gap-2"
+                >
+                  <Save className="h-4 w-4" /> Salvar
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CONFIRMATION MODAL */}
+      {isConfirmModalOpen && confirmConfig && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-8 text-center space-y-4">
+              <div className={`mx-auto h-16 w-16 rounded-full flex items-center justify-center ${
+                confirmConfig.type === 'blue' ? 'bg-blue-50 text-blue-600' : 
+                confirmConfig.type === 'red' ? 'bg-red-50 text-red-600' : 
+                'bg-green-50 text-green-600'
+              }`}>
+                {confirmConfig.type === 'blue' ? <CheckCircle2 className="h-10 w-10" /> : 
+                 confirmConfig.type === 'red' ? <XCircle className="h-10 w-10" /> : 
+                 <CheckCircle className="h-10 w-10" />}
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-xl font-bold text-slate-800">{confirmConfig.title}</h3>
+                <p className="text-slate-500 text-sm">{confirmConfig.message}</p>
+              </div>
+            </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-center gap-3">
+              <button 
+                onClick={() => setIsConfirmModalOpen(false)}
+                className="px-6 py-2 rounded-lg border border-slate-200 text-slate-600 font-bold text-sm hover:bg-white transition-all flex items-center gap-2"
+              >
+                <X className="h-4 w-4" /> Cancelar
+              </button>
+              <button 
+                onClick={confirmConfig.onConfirm}
+                className={`px-8 py-2 rounded-lg text-white font-bold text-sm shadow-md transition-all flex items-center gap-2 ${
+                  confirmConfig.type === 'blue' ? 'bg-blue-600 hover:bg-blue-700 shadow-blue-200' : 
+                  confirmConfig.type === 'red' ? 'bg-red-600 hover:bg-red-700 shadow-red-200' : 
+                  'bg-green-600 hover:bg-green-700 shadow-green-200'
+                }`}
+              >
+                <CheckCircle className="h-4 w-4" /> Confirmar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CANCEL CHOICE MODAL: Cancelar o Pedido (volta pra fila) vs Cancelar a Prova (vai pra Canceladas) */}
+      {isCancelChoiceModalOpen && cancelRequest && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-6 border-b bg-red-50 border-red-100 text-red-700">
+              <h3 className="text-lg font-bold flex items-center gap-2">
+                <XCircle className="h-5 w-5" />
+                Cancelar
+              </h3>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-slate-600">
+                O que você deseja fazer com o agendamento da autoescola <strong>{getSchoolName(cancelRequest.schoolId)}</strong> para o dia {formatDate(cancelRequest.scheduledDate)}?
+              </p>
+
+              <button
+                onClick={submitSoftCancelPedido}
+                className="w-full text-left p-4 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors group"
+              >
+                <span className="block text-sm font-bold text-slate-700 group-hover:text-blue-700 transition-colors">
+                  Cancelar o Pedido
+                </span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Volta para "Pedidos Provas Extras". Examinador, data e horário são apagados automaticamente. Não precisa informar motivo.
+                </span>
+              </button>
+
+              <button
+                onClick={proceedToFullCancel}
+                className="w-full text-left p-4 border border-slate-200 rounded-lg hover:bg-red-50 transition-colors group"
+              >
+                <span className="block text-sm font-bold text-slate-700 group-hover:text-red-700 transition-colors">
+                  Cancelar a Prova
+                </span>
+                <span className="block text-xs text-slate-500 mt-0.5">
+                  Cancela definitivamente e move para "Provas Canceladas". Será pedido o motivo do cancelamento.
+                </span>
+              </button>
+            </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-end">
+              <button 
+                onClick={() => {
+                  setIsCancelChoiceModalOpen(false);
+                  setCancelRequest(null);
+                }}
+                className="px-4 py-2 text-slate-600 hover:bg-slate-200 rounded-lg font-medium transition-colors"
+              >
+                Voltar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* CANCEL MODAL */}
+      {isCancelModalOpen && cancelRequest && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-6 border-b bg-red-50 border-red-100 text-red-700">
+              <h3 className="text-lg font-bold flex items-center gap-2">
+                <XCircle className="h-5 w-5" />
+                {user.role === UserRole.SCHOOL ? 'Cancelar Pedido' : 'Cancelar Agendamento'}
+              </h3>
+            </div>
+            <div className="p-6 space-y-4">
+              <p className="text-sm text-slate-600">
+                Você está cancelando o agendamento da autoescola <strong>{getSchoolName(cancelRequest.schoolId)}</strong> para o dia {formatDate(cancelRequest.scheduledDate)}.
+              </p>
+              
+              <div className="space-y-2">
+                <label className="text-xs font-bold text-slate-500 uppercase tracking-wider">Motivo do Cancelamento</label>
+                <textarea
+                  className="w-full border border-slate-200 rounded-lg p-3 text-sm bg-slate-50 focus:ring-2 focus:ring-red-500 outline-none transition-all resize-none h-24"
+                  placeholder="Descreva o motivo do cancelamento..."
+                  value={cancelReason}
+                  onChange={(e) => setCancelReason(e.target.value)}
+                />
+              </div>
+
+              {cancelRequest.requestType === RequestType.FIXA && (
+                <div className="pt-2">
+                  <label className="flex items-start gap-3 cursor-pointer group p-3 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors">
+                    <div className="flex items-center h-5">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300 text-red-600 focus:ring-red-500"
+                        checked={createReposition}
+                        onChange={(e) => setCreateReposition(e.target.checked)}
+                      />
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-sm font-bold text-slate-700 group-hover:text-red-700 transition-colors">
+                        Criar prova de reposição
+                      </span>
+                      <span className="text-xs text-slate-500 mt-0.5">
+                        Uma nova solicitação extra do tipo "Reposição" será criada automaticamente.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+              )}
+
+              {cancelRequest.requestType === RequestType.EXTRA && (
+                <div className="pt-2">
+                  <label className="flex items-start gap-3 cursor-pointer group p-3 border border-slate-200 rounded-lg hover:bg-slate-50 transition-colors">
+                    <div className="flex items-center h-5">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 rounded border-slate-300 text-red-600 focus:ring-red-500"
+                        checked={createExtra}
+                        onChange={(e) => setCreateExtra(e.target.checked)}
+                      />
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-sm font-bold text-slate-700 group-hover:text-red-700 transition-colors">
+                        Criar prova do tipo Extra
+                      </span>
+                      <span className="text-xs text-slate-500 mt-0.5">
+                        Uma nova solicitação extra será criada automaticamente.
+                      </span>
+                    </div>
+                  </label>
+                </div>
+              )}
+            </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-end gap-3">
+              <button 
+                onClick={() => {
+                  setIsCancelModalOpen(false);
+                  setCancelRequest(null);
+                }}
+                className="px-4 py-2 text-slate-600 hover:bg-slate-200 rounded-lg font-medium transition-colors"
+              >
+                Voltar
+              </button>
+              <button 
+                onClick={submitCancel}
+                className="px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg font-bold shadow-sm transition-colors"
+              >
+                Confirmar Cancelamento
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CONSULTAR ENDEREÇOS DA AUTOESCOLA (sede + pátios cadastrados) */}
+      {selectedSchoolForAddress && (() => {
+        const yards = effectiveYards(selectedSchoolForAddress);
+        const yardStyle: Record<string, { text: string; bg: string }> = {
+          MOTO: { text: 'text-orange-700', bg: 'bg-orange-100' },
+          CARRO: { text: 'text-green-700', bg: 'bg-green-100' },
+          MUDANCA: { text: 'text-purple-700', bg: 'bg-purple-100' },
+        };
+        const mapsLink = (q: string) => `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(q)}`;
+        return (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-4 bg-blue-600 text-white flex justify-between items-center">
+              <div className="flex items-center gap-2">
+                <MapPin className="h-5 w-5" />
+                <h2 className="font-bold uppercase tracking-tight">Endereços: {selectedSchoolForAddress.name}</h2>
+              </div>
+              <button 
+                onClick={() => setSelectedSchoolForAddress(null)}
+                className="p-1 hover:bg-white/20 rounded-full transition-colors"
+              >
+                <X className="h-5 w-5" />
+              </button>
+            </div>
+            
+            <div className="p-6 space-y-6 max-h-[70vh] overflow-y-auto">
+              {/* Endereço Principal */}
+              {selectedSchoolForAddress.address && (
+                <div className="space-y-2">
+                  <div className="flex items-center gap-2 text-blue-700">
+                    <div className="p-1.5 bg-blue-100 rounded-lg">
+                      <FileText className="h-4 w-4" />
+                    </div>
+                    <span className="font-bold text-xs uppercase tracking-wider">Dados Principais (Sede)</span>
+                  </div>
+                  <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                    <p className="text-sm text-slate-700 font-medium leading-relaxed">
+                      {selectedSchoolForAddress.address}
+                    </p>
+                    <a 
+                      href={mapsLink(selectedSchoolForAddress.address)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mt-2 flex items-center gap-1.5 text-xs text-blue-600 font-bold hover:underline"
+                    >
+                      <ExternalLink className="h-3 w-3" />
+                      Ver no Google Maps
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {/* Pátios cadastrados (tipo + endereço + referência) */}
+              {yards.map(yard => {
+                const style = yardStyle[yard.type] ?? { text: 'text-slate-700', bg: 'bg-slate-100' };
+                return (
+                  <div key={yard.id} className="space-y-2">
+                    <div className={`flex items-center gap-2 ${style.text}`}>
+                      <div className={`p-1.5 ${style.bg} rounded-lg`}>
+                        <MapPin className="h-4 w-4" />
+                      </div>
+                      <span className="font-bold text-xs uppercase tracking-wider">Pátio {YARD_TYPE_LABEL[yard.type]}</span>
+                    </div>
+                    <div className="p-3 bg-slate-50 rounded-xl border border-slate-200">
+                      <p className="text-sm text-slate-700 font-medium leading-relaxed">
+                        {yard.address}
+                      </p>
+                      {yard.reference && (
+                        <p className="text-xs text-slate-500 mt-1">
+                          <span className="font-bold">Referência:</span> {yard.reference}
+                        </p>
+                      )}
+                      <a 
+                        href={mapsLink(yard.address)}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-2 flex items-center gap-1.5 text-xs text-blue-600 font-bold hover:underline"
+                      >
+                        <ExternalLink className="h-3 w-3" />
+                        Ver no Google Maps
+                      </a>
+                    </div>
+                  </div>
+                );
+              })}
+
+              {!selectedSchoolForAddress.address && yards.length === 0 && (
+                <div className="py-12 text-center">
+                  <MapPin className="h-12 w-12 text-slate-200 mx-auto mb-3" />
+                  <p className="text-slate-400 italic">Nenhum endereço cadastrado para esta autoescola.</p>
+                </div>
+              )}
+            </div>
+            
+            <div className="p-4 bg-slate-50 border-t border-slate-100">
+              <button 
+                onClick={() => setSelectedSchoolForAddress(null)}
+                className="w-full py-3 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl font-bold transition-colors"
+              >
+                Fechar
+              </button>
+            </div>
+          </div>
+        </div>
+        );
+      })()}
+
+      {/* MODAL: CONFIRMAR "TENHO INTERESSE" (Examinador) */}
+      {interestTarget && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+          <div className="bg-white rounded-xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+            <div className="p-8 text-center space-y-4">
+              <div className="mx-auto h-16 w-16 rounded-full flex items-center justify-center bg-green-50 text-green-600">
+                <ThumbsUp className="h-10 w-10" />
+              </div>
+              <div className="space-y-2">
+                <h3 className="text-xl font-bold text-slate-800">{removingInterest ? 'Excluir meu interesse?' : 'Registrar interesse?'}</h3>
+                <p className="text-slate-500 text-sm">
+                  {removingInterest ? 'Deseja retirar seu interesse na prova extra da autoescola ' : 'Deseja registrar interesse na prova extra da autoescola '}
+                  <span className="font-bold uppercase">{getSchoolName(interestTarget.schoolId)}</span>?
+                </p>
+                <div className="text-xs text-slate-500 bg-slate-50 border border-slate-200 rounded-lg p-3 text-left space-y-1">
+                  <div><span className="font-bold">Tipo:</span> {renderRequestTypeText(interestTarget)}</div>
+                  <div><span className="font-bold">Exame:</span> {getExamTypeLabel(interestTarget)}</div>
+                </div>
+                {interestError && (
+                  <p className="text-xs text-red-600 font-bold bg-red-50 border border-red-100 rounded-lg p-2">{interestError}</p>
+                )}
+              </div>
+            </div>
+            <div className="p-4 bg-slate-50 border-t border-slate-100 flex justify-center gap-3">
+              <button 
+                type="button"
+                disabled={interestSaving}
+                onClick={() => { setInterestTarget(null); setInterestError(''); }}
+                className="px-6 py-2 rounded-lg border border-slate-200 text-slate-600 font-bold text-sm hover:bg-white transition-all flex items-center gap-2 disabled:opacity-50"
+              >
+                <X className="h-4 w-4" /> Cancelar
+              </button>
+              <button 
+                type="button"
+                disabled={interestSaving}
+                onClick={async () => {
+                  if (!interestTarget) return;
+                  setInterestSaving(true);
+                  setInterestError('');
+                  try {
+                    const updated = removingInterest
+                      ? await api.removeInterest(interestTarget.id)
+                      : await api.registerInterest(interestTarget.id);
+                    setRequests(prev => prev.map(r => r.id === updated.id ? { ...r, ...updated } : r));
+                    setInterestTarget(null);
+                  } catch (err: any) {
+                    setInterestError(err?.message || 'Não foi possível atualizar o interesse.');
+                  } finally {
+                    setInterestSaving(false);
+                  }
+                }}
+                className="px-8 py-2 rounded-lg text-white font-bold text-sm shadow-md transition-all flex items-center gap-2 bg-green-600 hover:bg-green-700 shadow-green-200 disabled:opacity-60"
+              >
+                {interestSaving ? <RefreshCw className="h-4 w-4 animate-spin" /> : <CheckCircle className="h-4 w-4" />}
+                {interestSaving ? 'Salvando...' : removingInterest ? 'Excluir interesse' : 'Confirmar'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: EXAMINADORES INTERESSADOS (Admin / Supervisor / Operador) */}
+      {interestedModalRequest && (() => {
+        const interested = [...(interestedModalRequest.interestedExaminers ?? [])]
+          .sort((a, b) => a.registeredAt.localeCompare(b.registeredAt));
+        const fmt = (iso: string) => {
+          const d = new Date(iso);
+          if (Number.isNaN(d.getTime())) return '—';
+          return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()} ${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+        };
+        return (
+          <div className="fixed inset-0 bg-black/60 backdrop-blur-sm z-[60] flex items-center justify-center p-4">
+            <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden animate-in fade-in zoom-in duration-200">
+              <div className="p-4 bg-green-600 text-white flex justify-between items-center">
+                <div className="flex items-center gap-2">
+                  <Users className="h-5 w-5" />
+                  <h2 className="font-bold uppercase tracking-tight">Examinadores Interessados</h2>
+                </div>
+                <button 
+                  onClick={() => setInterestedModalRequest(null)}
+                  className="p-1 hover:bg-white/20 rounded-full transition-colors"
+                  aria-label="Fechar"
+                >
+                  <X className="h-5 w-5" />
+                </button>
+              </div>
+
+              {/* Resumo do pedido */}
+              <div className="p-4 bg-slate-50 border-b border-slate-200 grid grid-cols-1 sm:grid-cols-3 gap-3 text-sm">
+                <div className="sm:col-span-3">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Autoescola</span>
+                  <span className="font-black text-slate-800 uppercase">{getSchoolName(interestedModalRequest.schoolId)}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Tipo</span>
+                  {renderRequestTypeText(interestedModalRequest)}
+                </div>
+                <div className="sm:col-span-2">
+                  <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider block">Exame</span>
+                  <span className="font-bold text-slate-700">{getExamTypeLabel(interestedModalRequest)}</span>
+                </div>
+              </div>
+
+              <div className="p-4 max-h-[50vh] overflow-y-auto">
+                {interested.length === 0 ? (
+                  <div className="py-10 text-center">
+                    <Users className="h-12 w-12 text-slate-200 mx-auto mb-3" />
+                    <p className="text-slate-400 italic text-sm">Nenhum examinador registrou interesse ainda.</p>
+                  </div>
+                ) : (
+                  <ul className="divide-y divide-slate-100 border border-slate-200 rounded-lg overflow-hidden">
+                    {interested.map((i, idx) => (
+                      <li key={i.examinerId} className="flex items-center justify-between gap-3 px-4 py-3 bg-white">
+                        <div className="flex items-center gap-3">
+                          <span className="h-7 w-7 rounded-full bg-green-100 text-green-700 text-xs font-black flex items-center justify-center">{idx + 1}</span>
+                          <span className="font-bold text-slate-800 uppercase text-sm">{examiners.find(ex => ex.id === i.examinerId)?.name || i.name}</span>
+                        </div>
+                        <span className="text-[11px] text-slate-400 whitespace-nowrap">{fmt(i.registeredAt)}</span>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+              </div>
+
+              <div className="p-4 bg-slate-50 border-t border-slate-100">
+                <button 
+                  onClick={() => setInterestedModalRequest(null)}
+                  className="w-full py-3 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-xl font-bold transition-colors"
+                >
+                  Fechar
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
+    </div>
+  );
+};
+
+export default CFCSchedulingCenter;

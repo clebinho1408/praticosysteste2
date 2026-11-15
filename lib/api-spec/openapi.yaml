@@ -1,0 +1,242 @@
+openapi: 3.1.0
+info:
+  # Do not change the title, if the title changes, the import paths will be broken
+  title: Api
+  version: 0.1.0
+  description: API specification
+servers:
+  - url: /api
+    description: Base API path
+tags:
+  - name: health
+    description: Health operations
+paths:
+  /users/change-own-password:
+    post:
+      operationId: changeOwnPassword
+      summary: Trocar a própria senha mantendo este aparelho conectado
+      description: Exige a senha atual, exceto no primeiro acesso. Encerra outros acessos e códigos OTP somente após confirmação.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/OwnPasswordInput"
+      responses:
+        "200":
+          description: Senha alterada, sessão atual preservada
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionUser"
+        "400":
+          description: Senha inválida
+        "401":
+          description: Sessão inválida
+        "403":
+          description: Senha atual inválida
+        "409":
+          description: Confirmação de encerramento de outros acessos ausente
+  /requests:
+    put:
+      operationId: updateExamRequest
+      summary: Atualizar pedido ou registrar/retirar o próprio interesse do examinador
+      description: removeInterest retira somente o examinador da sessão em pedidos CFC ainda pendentes. Outros campos seguem as permissões de atualização existentes.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ExamRequestUpdate"
+      responses:
+        "200":
+          description: Pedido atualizado
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          description: Dados inválidos
+        "401":
+          description: Sessão inválida
+        "403":
+          description: Perfil sem permissão ou sem examinador vinculado
+        "409":
+          description: Pedido não está mais pendente ou interesse já registrado
+  /session:
+    get:
+      operationId: getSession
+      summary: Restaurar a sessão atual sem renovar sua validade
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Dados atuais do usuário autenticado, sem senha nem token
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionUser"
+        "401":
+          description: Sessão ausente, inválida, revogada ou expirada
+        "503":
+          description: Não foi possível verificar a sessão; tente novamente
+    delete:
+      operationId: deleteSession
+      summary: Encerrar a sessão atual
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Sessão encerrada
+        "503":
+          description: Não foi possível encerrar a sessão no servidor
+  /cpf-lookup:
+    post:
+      operationId: lookupCandidateCpf
+      summary: Consultar somente o nome do candidato CNH pelo CPF
+      description: Requer sessão, módulo CNH autorizado e serviço ativo. Nunca retorna credenciais ou outros dados pessoais.
+      security:
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CandidateCpfInput"
+      responses:
+        "200":
+          description: Nome encontrado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CandidateCpfName"
+        "400":
+          description: CPF inválido
+        "401":
+          description: Sessão ausente ou expirada
+        "403":
+          description: Perfil ou módulo sem permissão
+        "404":
+          description: CPF não encontrado
+        "409":
+          description: Serviço desativado
+        "429":
+          description: Limite de consultas
+        "503":
+          description: Provedor indisponível ou não configurado
+  /healthz:
+    get:
+      operationId: healthCheck
+      tags: [health]
+      summary: Health check
+      description: Returns server health status
+      responses:
+        "200":
+          description: Healthy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthStatus"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+  schemas:
+    OwnPasswordInput:
+      type: object
+      additionalProperties: false
+      required: [password, confirmSessionRevocation]
+      properties:
+        password:
+          type: string
+          minLength: 6
+          maxLength: 72
+        currentPassword:
+          type: string
+        confirmSessionRevocation:
+          type: boolean
+          enum: [true]
+    ExamRequestUpdate:
+      type: object
+      required: [id]
+      additionalProperties: true
+      properties:
+        id:
+          type: string
+          minLength: 1
+        registerInterest:
+          type: boolean
+        removeInterest:
+          type: boolean
+    SessionUser:
+      type: object
+      required: [id, name, login, role]
+      properties:
+        id:
+          type: string
+          minLength: 1
+        name:
+          type: string
+        login:
+          type: string
+        role:
+          type: string
+          enum: [ADMIN, SUPERVISOR, OPERATOR, CONSULTANT, SCHOOL, EXAMINER, INSTRUCTOR]
+        schoolId:
+          type: string
+        examinerId:
+          type: string
+        instructorId:
+          type: string
+        forcePasswordChange:
+          type: boolean
+        twoFactorEnabled:
+          type: boolean
+        email:
+          type: string
+        phone:
+          type: string
+        allowedModules:
+          type: array
+          items:
+            type: string
+            enum: [cnh, cfc, pcd, cadastro]
+        allowedLocationIds:
+          type: array
+          items:
+            type: string
+        allowedCadastroTabs:
+          type: array
+          items:
+            type: string
+    CandidateCpfInput:
+      type: object
+      required: [cpf, module]
+      properties:
+        cpf:
+          type: string
+          minLength: 11
+          maxLength: 14
+        module:
+          type: string
+          enum: [CNH_BRASIL]
+    CandidateCpfName:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+    HealthStatus:
+      type: object
+      properties:
+        status:
+          type: string
+      required:
+        - status
+

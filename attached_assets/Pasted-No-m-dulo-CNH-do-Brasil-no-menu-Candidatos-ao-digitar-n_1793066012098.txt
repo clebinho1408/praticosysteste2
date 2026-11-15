@@ -1,0 +1,52 @@
+No módulo CNH do Brasil, no menu Candidatos, ao digitar no campo CPF ou colar, preenche automaticamente o campo Nome Completo através da api token "0f1457cb4677a14a7c6737dd7f6bf1023b3f550061cf57574a0b2ffd9adf1770", com as seguintes informações:
+
+curl -X GET "https://apicpf.com/api/consulta?cpf=12345678900" \ -H "X-API-KEY: sua_chave_api_aqui"
+Resposta de Sucesso
+200 OK
+
+{ "code": 200, "data": { "cpf": "12345678900", "nome": "João da Silva", "genero": "M", "data_nascimento": "1985-07-15" } }
+Campo	Descrição
+code	Código de status HTTP da resposta
+data.cpf	CPF completo com 11 dígitos (preenchido com zeros à esquerda se necessário)
+data.nome	Nome completo da pessoa
+data.genero	Gênero - "M" (Masculino), "F" (Feminino) ou "I" (Indefinido/Outro)
+data.data_nascimento	Data de nascimento no formato YYYY-MM-DD
+Respostas de Erro
+400 Bad Request - CPF não informado
+
+{ "code": 400, "message": "O parâmetro CPF é obrigatório" }
+400 Bad Request - CPF com formato inválido
+
+{ "code": 400, "message": "O CPF deve conter exatamente 11 dígitos" }
+400 Bad Request - CPF reprovado na validação do dígito verificador
+
+{ "code": 400, "message": "CPF inválido" }
+404 Not Found - CPF não encontrado
+
+{ "code": 404, "message": "Pessoa não encontrada com o CPF informado" }
+402 Payment Required - Sem créditos para consultar a base externa
+
+{ "code": 402, "message": "Sem créditos disponíveis para consulta externa. Adquira créditos ou renove seu plano em www.apicpf.com" }
+O 402 não interrompe sua integração. Ele acontece apenas quando o CPF consultado não está na nossa base e não há saldo para buscá-lo na base externa. Consultas de CPFs já presentes na nossa base continuam sendo atendidas normalmente, com 200, e seus limites diário e por minuto seguem inalterados. Para voltar a alcançar a base externa, adquira um pacote de créditos ou renove seu plano.
+401 Unauthorized - API Key não fornecida
+
+{ "code": 401, "message": "API key não fornecida" }
+401 Unauthorized - API Key inválida
+
+{ "code": 401, "message": "API key inválida" }
+403 Forbidden - API Key expirada
+
+{ "code": 403, "message": "API key expirada" }
+429 Too Many Requests - Limite diário excedido
+
+{ "code": 429, "message": "Limite diário excedido" }
+429 Too Many Requests - Limite por minuto excedido
+
+{ "code": 429, "message": "Limite por minuto excedido. Diminua a frequência de requisições ou contrate um plano PRO em www.apicpf.com" }
+429 Too Many Requests - Limite de consultas repetidas com o mesmo CPF excedido
+
+{ "code": 429, "message": "Limite de consultas repetidas excedido" }
+
+Caso altere o cpf altere o nome completo novamente, e caso não funcione api, permita editar e apagar e inserir manualmente.
+
+Coloque no menu Configurações, na aba CNH do Brasil, em uma aba especifica se o serviço de autopreenchimento através de API estará ativo ou não no campo Nome Completo.

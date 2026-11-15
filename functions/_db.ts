@@ -1,0 +1,199 @@
+// Shared DB helper for Cloudflare Pages Functions
+// Uses env.DATABASE_URL injected by the Workers runtime (no dotenv needed)
+import { neon } from '@neondatabase/serverless';
+import { drizzle } from 'drizzle-orm/neon-http';
+import { sql } from 'drizzle-orm';
+import * as schema from '../db/schema.js';
+import { createD1Db, isD1, verifyD1Schema } from './_d1.js';
+import { CNH_MODALITY_NEON_SQL } from '../db/cnh-exam-modality-migration.js';
+import { YARDS_INTEREST_NEON_SQL } from '../db/school-yards-interest-migration.js';
+import { readJsonBody } from './_request-body.js';
+
+// ─── Migração de renomeação: inglês → português ────────────────────────────────
+// O SQL vive em ./_migration-sql.mjs (fonte única, também usada por scripts psql).
+// Um único bloco DO $$ = uma requisição HTTP ao Neon, atômico e idempotente.
+// Cache de módulo: só roda uma vez por instância de Worker (cold start).
+import { PT_SCHEMA_DO_BLOCK, PT_SCHEMA_VERIFY_SQL, PT_SCHEMA_MARKER_SQL } from './_migration-sql.mjs';
+
+let _schemaMigrated = false;
+let _cnhBrasilSdcStorageReady = false;
+let _columnMigrationsReady = false;
+let _slotQuantitiesReady = false;
+
+export async function ensureSlotQuantities(db: any): Promise<void> {
+  if (isD1(db)) return verifyD1Schema(db);
+  if (_slotQuantitiesReady) return;
+  await db.execute(sql`DO $$ BEGIN
+    ALTER TABLE vagas_cfc ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb;
+    ALTER TABLE vagas_pcd ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb;
+  END $$`);
+  _slotQuantitiesReady = true;
+}
+
+async function verifyPtSchema(db: any): Promise<boolean> {
+  try {
+    const v = await db.execute(sql.raw(PT_SCHEMA_VERIFY_SQL));
+    const row = (((v as any).rows ?? v) as any[])[0] ?? {};
+    return !!(row.c1 && row.c2 && row.c3 && row.c4 && row.c5 && row.c6);
+  } catch { return false; }
+}
+
+export async function ensurePortugueseSchema(db: any): Promise<void> {
+  if (isD1(db)) return verifyD1Schema(db);
+  if (_schemaMigrated) return;
+
+  // Verificação rápida do marcador
+  try {
+    const r = await db.execute(sql`SELECT 1 FROM migracoes_schema WHERE versao = 'pt_schema_v1' LIMIT 1`);
+    if ((((r as any).rows ?? r) as any[]).length > 0) { _schemaMigrated = true; return; }
+  } catch {}
+
+  try {
+    await db.execute(sql.raw(PT_SCHEMA_DO_BLOCK));
+  } catch (e) {
+    console.error('[schema-migrate] DO block failed:', e);
+  }
+
+  // Marcador e flag SOMENTE após verificação dos objetos-chave em PT.
+  // Se algo falhou (lock, permissão, schema misto), a próxima requisição retenta.
+  if (await verifyPtSchema(db)) {
+    try { await db.execute(sql.raw(PT_SCHEMA_MARKER_SQL)); } catch {}
+    _schemaMigrated = true;
+  }
+}
+
+/**
+ * Garante o armazenamento do SDC no módulo CNH do Brasil após a separação
+ * das tabelas por módulo. É executado uma vez por instância do Worker.
+ */
+export async function ensureCnhBrasilSdcStorage(db: any): Promise<void> {
+  if (isD1(db)) return verifyD1Schema(db);
+  if (_cnhBrasilSdcStorageReady) return;
+  await db.execute(sql`
+    ALTER TABLE solicitacoes_cnhbrasil
+    ADD COLUMN IF NOT EXISTS sem_duplo_comando boolean DEFAULT false
+  `);
+  _cnhBrasilSdcStorageReady = true;
+}
+
+/**
+ * Garante que todas as colunas adicionadas após a migration inicial existam.
+ * Usa ADD COLUMN IF NOT EXISTS — 100% idempotente e seguro.
+ * Roda uma vez por instância de Worker (cold start).
+ */
+export async function ensureColumnMigrations(db: any): Promise<void> {
+  if (isD1(db)) return verifyD1Schema(db);
+  if (_columnMigrationsReady) return;
+  try {
+    // veiculos — colunas adicionadas após schema inicial
+    await db.execute(sql`ALTER TABLE veiculos ADD COLUMN IF NOT EXISTS duplo_comando boolean DEFAULT false`);
+    await db.execute(sql`ALTER TABLE veiculos ADD COLUMN IF NOT EXISTS procuracao boolean DEFAULT false`);
+    await db.execute(sql`ALTER TABLE veiculos ADD COLUMN IF NOT EXISTS ano_fabricacao text`);
+    // configuracoes — colunas adicionadas após schema inicial
+    await db.execute(sql`ALTER TABLE configuracoes ADD COLUMN IF NOT EXISTS banca_principal_cnh_brasil JSONB`);
+    await db.execute(sql`ALTER TABLE configuracoes ADD COLUMN IF NOT EXISTS max_vagas_mudanca_padrao INTEGER DEFAULT 10`);
+    await db.execute(sql`ALTER TABLE configuracoes ADD COLUMN IF NOT EXISTS chave_area_risco text`);
+    await db.execute(sql`ALTER TABLE configuracoes ADD COLUMN IF NOT EXISTS ano_fabricacao_maximo JSONB`);
+    // solicitacoes — sem_duplo_comando
+    await db.execute(sql`ALTER TABLE solicitacoes ADD COLUMN IF NOT EXISTS sem_duplo_comando boolean DEFAULT false`);
+    // examinadores — períodos de bloqueio
+    await db.execute(sql`ALTER TABLE examinadores ADD COLUMN IF NOT EXISTS periodos_bloqueio JSONB DEFAULT '[]'::jsonb`);
+  } catch {}
+  await db.execute(sql`ALTER TABLE configuracoes ADD COLUMN IF NOT EXISTS preencher_nome_cpf_cnh boolean NOT NULL DEFAULT false`);
+  await db.execute(sql`CREATE TABLE IF NOT EXISTS cotas_consulta_cpf (id text PRIMARY KEY, janela_minuto integer NOT NULL, consultas integer NOT NULL DEFAULT 0)`);
+  await db.execute(sql.raw(CNH_MODALITY_NEON_SQL));
+  await db.execute(sql.raw(YARDS_INTEREST_NEON_SQL));
+  _columnMigrationsReady = true;
+}
+
+export function getDb(env: Record<string, any>) {
+  if (env.DB_PROVIDER === 'd1') {
+    if (!env.DB?.prepare) throw new Error('D1 selecionado sem binding DB. Conexão Neon não será usada como fallback.');
+    return createD1Db(env.DB);
+  }
+  if (env.DB_PROVIDER && env.DB_PROVIDER !== 'neon') throw new Error('DB_PROVIDER inválido.');
+  const url = env.DATABASE_URL;
+  if (!url) throw new Error('DATABASE_URL not set in environment');
+  const sqlClient = neon(url);
+  return drizzle(sqlClient, { schema });
+}
+
+export function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json' },
+  });
+}
+
+export function error(message: string, status = 500): Response {
+  return json({ error: message }, status);
+}
+
+export async function parseBody<T = any>(req: Request): Promise<T> {
+  const maximum = new URL(req.url).pathname === '/api/backups' ? 8_500_000 : 131_072;
+  return readJsonBody<T>(req, maximum);
+}
+
+export function getQuery(url: string): Record<string, string> {
+  const { searchParams } = new URL(url);
+  const result: Record<string, string> = {};
+  searchParams.forEach((v, k) => { result[k] = v; });
+  return result;
+}
+
+// ─── Audit helpers ───────────────────────────────────────────────────────────
+
+export function extractActor(_req: Request, data: any) {
+  // Pages clones Request between middleware and handler. Only context.data
+  // transports trusted identity across that boundary, never request headers.
+  const user = data?.sessionUser;
+  return { userId: user?.id ?? null, userName: user?.name ?? null, userRole: user?.role ?? null };
+}
+
+let _auditTableReady = false;
+
+export async function writeAuditLog(
+  db: any,
+  actor: { userId: string | null; userName: string | null; userRole: string | null },
+  action: string,
+  entity: string,
+  entityId: string | null,
+  details?: Record<string, any>
+) {
+  try {
+    if (!_auditTableReady) {
+      await db.execute(sql`
+        CREATE TABLE IF NOT EXISTS logs_auditoria (
+          id text PRIMARY KEY,
+          usuario_id text,
+          nome_usuario text,
+          perfil_usuario text,
+          acao text NOT NULL,
+          entidade text NOT NULL,
+          entidade_id text,
+          detalhes jsonb,
+          criado_em timestamp DEFAULT (now())
+        )
+      `);
+      _auditTableReady = true;
+    }
+    const id = crypto.randomUUID();
+    const det = details ? JSON.stringify(details) : null;
+    await db.execute(sql`
+      INSERT INTO logs_auditoria (id, usuario_id, nome_usuario, perfil_usuario, acao, entidade, entidade_id, detalhes, criado_em)
+      VALUES (
+        ${id},
+        ${actor.userId},
+        ${actor.userName},
+        ${actor.userRole},
+        ${action},
+        ${entity},
+        ${entityId},
+        ${det}::jsonb,
+        now()
+      )
+    `);
+  } catch (e) {
+    console.error('[audit] write failed:', e);
+  }
+}
