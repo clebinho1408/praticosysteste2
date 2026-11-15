@@ -107,11 +107,12 @@ export async function ensureColumnMigrations(db: any): Promise<void> {
 }
 
 export function getDb(env: Record<string, any>) {
-  if (env.DB_PROVIDER === 'd1') {
+  const provider = String(env.DB_PROVIDER ?? '').trim().toLowerCase();
+  if (provider === 'd1') {
     if (!env.DB?.prepare) throw new Error('D1 selecionado sem binding DB. Conexão Neon não será usada como fallback.');
     return createD1Db(env.DB);
   }
-  if (env.DB_PROVIDER && env.DB_PROVIDER !== 'neon') throw new Error('DB_PROVIDER inválido.');
+  if (provider && provider !== 'neon') throw new Error('DB_PROVIDER inválido.');
   const url = env.DATABASE_URL;
   if (!url) throw new Error('DATABASE_URL not set in environment');
   const sqlClient = neon(url);
