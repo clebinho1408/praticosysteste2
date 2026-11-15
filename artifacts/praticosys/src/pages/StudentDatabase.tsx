@@ -143,8 +143,8 @@ const StudentDatabase: React.FC = () => {
                     <p className="text-[10px] text-gray-400 font-black mb-1 uppercase tracking-tighter">Categoria Pretendida</p>
                     <p className="text-3xl font-black text-blue-600">{selectedStudent.intendedCategory || 'B'}</p>
                     <div className="mt-4 flex items-center gap-2">
-                        <div className={`h-2.5 w-2.5 rounded-full ${selectedStudent.paidFee ? 'bg-green-500' : 'bg-gray-300'}`}></div>
-                        <span className="text-[10px] font-black uppercase text-gray-500 tracking-widest">Taxa Detran: {selectedStudent.paidFee ? 'PAGA' : 'PENDENTE'}</span>
+                        <div className={`h-2.5 w-2.5 rounded-full ${(selectedStudent.taxaPaga ?? selectedStudent.paidFee) ? 'bg-green-500' : 'bg-gray-300'}`}></div>
+                        <span className="text-[10px] font-black uppercase text-gray-500 tracking-widest">Taxa Detran: {(selectedStudent.taxaPaga ?? selectedStudent.paidFee) ? 'PAGA' : 'PENDENTE'}</span>
                     </div>
                   </div>
                 </div>

@@ -34,6 +34,7 @@ import { CADASTRO_TABS_D1_VERSION, CADASTRO_TABS_D1_STATEMENTS, cadastroTabsD1Ch
 import { CNH_MODALITY_VERSION, CNH_MODALITY_STATEMENTS, cnhModalityChecksum } from '../db/cnh-exam-modality-migration.js';
 import { YARDS_INTEREST_VERSION, YARDS_INTEREST_STATEMENTS, yardsInterestChecksum } from '../db/school-yards-interest-migration.js';
 import { AUTH_SECURITY_VERSION, AUTH_SECURITY_DDL, authSecurityChecksum } from '../db/auth-security-migration.js';
+import { CLEANUP_V2_VERSION, CLEANUP_V2_STATEMENTS, cleanupV2Checksum } from '../db/cleanup-v2-migration.js';
 
 const BACKUP_PART_BYTES = 40_000; // Seguro abaixo do limite de 100 KB por statement do D1
 
@@ -110,6 +111,7 @@ async function buildSchemaStatements(): Promise<string[]> {
     modalityChecksum,
     yardsChecksum,
     authChecksum,
+    cleanupChecksum,
   ] = await Promise.all([
     d1Checksum(),
     cpfD1Checksum(),
@@ -117,6 +119,7 @@ async function buildSchemaStatements(): Promise<string[]> {
     cnhModalityChecksum(),
     yardsInterestChecksum(),
     authSecurityChecksum(),
+    cleanupV2Checksum(),
   ]);
 
   return [
@@ -148,6 +151,10 @@ async function buildSchemaStatements(): Promise<string[]> {
     '-- 6) Migração segurança / rate limit de autenticação',
     `${AUTH_SECURITY_DDL.trim()};`,
     `INSERT OR IGNORE INTO "migracoes_d1" ("versao", "checksum", "aplicado_em") VALUES (${sqlString(AUTH_SECURITY_VERSION)}, ${sqlString(authChecksum)}, ${sqlString(nowIso)});`,
+    '',
+    '-- 7) Reorganização e limpeza de schema D1 (v2)',
+    ...CLEANUP_V2_STATEMENTS.map(s => `${s.trim()};`),
+    `INSERT OR IGNORE INTO "migracoes_d1" ("versao", "checksum", "aplicado_em") VALUES (${sqlString(CLEANUP_V2_VERSION)}, ${sqlString(cleanupChecksum)}, ${sqlString(nowIso)});`,
     '',
   ];
 }
@@ -211,14 +218,17 @@ async function main() {
 
       if (targetCols.length === 0) continue;
 
-      const selectCols = targetCols
-        .filter(c => pgCols.has(c.name))
-        .map(c => quote(c.name))
-        .join(', ');
+      const extraTaxaBool = (tableName === 'solicitacoes_cnhbrasil' || tableName === 'solicitacoes_pcd')
+        && pgCols.has('taxa_paga_bool');
+      const selectColList = [
+        ...targetCols.filter(c => pgCols.has(c.name)).map(c => quote(c.name)),
+        ...(extraTaxaBool ? [quote('taxa_paga_bool')] : []),
+      ];
+      const selectCols = selectColList.join(', ');
       if (!selectCols) continue;
 
       const dataRes = await pool.query(`SELECT ${selectCols} FROM ${quote(tableName)}`);
-      const rows = dataRes.rows;
+      const rows = dataRes.rows.map(r => extraTaxaBool ? { ...r, taxa_paga: Boolean(r.taxa_paga || r.taxa_paga_bool) } : r);
 
       lines.push(`-- Tabela ${tableName}: ${rows.length} registro(s)`);
       if (rows.length === 0) {

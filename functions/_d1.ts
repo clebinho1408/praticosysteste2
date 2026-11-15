@@ -7,6 +7,7 @@ import { CNH_MODALITY_VERSION, cnhModalityChecksum } from '../db/cnh-exam-modali
 import { YARDS_INTEREST_VERSION, yardsInterestChecksum } from '../db/school-yards-interest-migration.js';
 import { translateD1Sql, decodeD1Row } from './_d1-sql.js';
 import { AUTH_SECURITY_VERSION, authSecurityChecksum } from '../db/auth-security-migration.js';
+import { CLEANUP_V2_VERSION, cleanupV2Checksum } from '../db/cleanup-v2-migration.js';
 import type { D1Database, D1Result } from '../db/d1-types.js';
 
 export const isD1 = (db: any): boolean => !!db.$d1;
@@ -28,13 +29,14 @@ export async function verifyD1Schema(db: any) {
   const rows = await binding.prepare('SELECT versao, checksum FROM migracoes_d1')
     .all<{ versao: string; checksum: string }>();
   const map = new Map((rows.results ?? []).map(r => [r.versao, r.checksum]));
-  const [cBase, cCpf, cTabs, cModality, cYards, cAuth] = await Promise.all([
+  const [cBase, cCpf, cTabs, cModality, cYards, cAuth, cCleanup] = await Promise.all([
     d1Checksum(),
     cpfD1Checksum(),
     cadastroTabsD1Checksum(),
     cnhModalityChecksum(),
     yardsInterestChecksum(),
     authSecurityChecksum(),
+    cleanupV2Checksum(),
   ]);
   if (map.get(D1_VERSION) !== cBase) throw new Error('Migrações D1 ausentes ou incompatíveis. Execute a manutenção de schema antes de usar o ambiente.');
   if (map.get(CPF_D1_VERSION) !== cCpf) throw new Error('Migração D1 de autopreenchimento ausente ou incompatível. Execute a manutenção de schema.');
@@ -42,6 +44,9 @@ export async function verifyD1Schema(db: any) {
   if (map.get(CNH_MODALITY_VERSION) !== cModality) throw new Error('Migração D1 de modalidades CNH ausente ou incompatível. Execute a manutenção de schema.');
   if (map.get(YARDS_INTEREST_VERSION) !== cYards) throw new Error('Migração D1 de pátios/interesse ausente ou incompatível. Execute a manutenção de schema.');
   if (map.get(AUTH_SECURITY_VERSION) !== cAuth) throw new Error('Migração D1 de segurança ausente. Execute a manutenção local de schema.');
+  if (map.has(CLEANUP_V2_VERSION) && map.get(CLEANUP_V2_VERSION) !== cCleanup) {
+    throw new Error('Migração D1 de reorganização (v2) incompatível. Execute a manutenção de schema.');
+  }
   verifiedBindings.add(binding as unknown as object);
   db.$d1Verified = true;
 }

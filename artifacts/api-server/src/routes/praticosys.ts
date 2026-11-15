@@ -7,8 +7,8 @@ import { cnhBancaConflict, cnhSchoolScaleConflict } from "../../../../functions/
 import { db } from "@workspace/db";
 import {
   users, drivingSchools, examiners, instructors, vehicles,
-  examSchedules, examRequests, systemSettings, blockedDates,
-  cities, examScheduleSlots, bancaResults, examLocations, otpCodes, auditLogs,
+  examSchedules, systemSettings, blockedDates,
+  cities, bancaResults, examLocations, otpCodes, auditLogs,
   cnhbrasilRequests, cfcRequests, pcdRequests,
   cfcScheduleSlots, pcdScheduleSlots,
 } from "@workspace/db";
@@ -47,12 +47,9 @@ const OTP_MAX_ATTEMPTS = 5;
 // ─── BACKUP ───────────────────────────────────────────────────────────────────
 const BACKUP_TABLES = [
   "autoescolas", "examinadores", "instrutores", "veiculos", "cidades",
-  // Tabelas separadas por módulo
-  "solicitacoes_cnhbrasil", "solicitacoes_cfc", "solicitacoes_pcd",
-  "vagas_cfc", "vagas_pcd",
-  "resultados_banca", "locais_exame", "datas_bloqueadas", "configuracoes",
-  // Tabelas legadas mantidas para segurança/rollback
-  "solicitacoes", "bancas", "vagas_banca",
+  "bancas", "solicitacoes_cnhbrasil", "solicitacoes_cfc", "solicitacoes_pcd",
+  "vagas_cfc", "vagas_pcd", "resultados_banca", "locais_exame",
+  "datas_bloqueadas", "configuracoes",
 ];
 const MAX_BACKUPS = 15;
 
@@ -563,8 +560,7 @@ router.get("/schedules", async (_req, res) => {
       const calc = calcStatus(s.date, s.time, s.status);
       if (calc !== s.status) {
         if (calc === "CONCLUDED" && s.status !== "CONCLUDED") {
-          // Atualiza status nas 3 tabelas de módulo (e na legada por segurança)
-          for (const t of [cnhbrasilRequests, cfcRequests, pcdRequests, examRequests] as any[]) {
+          for (const t of [cnhbrasilRequests, cfcRequests, pcdRequests] as any[]) {
             await db.update(t)
               .set({ status: "WAITING_RESULT", updatedAt: new Date() })
               .where(and(eq(t.scheduleId, s.id), eq(t.status, "SCHEDULED")));
@@ -667,9 +663,14 @@ const ALLOWED_REQ_FIELDS = [
 
 /** Campos removidos de cada tabela de módulo — não podem ser gravados nelas */
 const MODULE_DROPPED_FIELDS: Record<string, string[]> = {
-  CNH_BRASIL: ['disabilityType', 'specialNeeds', 'categoryQuantities', 'interestedExaminers'],
-  CFC:        ['disabilityType', 'specialNeeds', 'examModalityA', 'examModalityB'],
-  PCD:        ['semDuploComando', 'categoryQuantities', 'examModalityA', 'examModalityB', 'interestedExaminers'],
+  CNH_BRASIL: ['schoolId', 'paidFee', 'disabilityType', 'specialNeeds', 'categoryQuantities', 'interestedExaminers'],
+  CFC: [
+    'studentName', 'socialName', 'cpf', 'phone', 'email', 'address', 'city',
+    'paidFee', 'taxaPaga', 'completedPracticalCourse', 'practicalHours', 'hasVehicle',
+    'cnhRestriction', 'instructor', 'vehiclePlate', 'semDuploComando', 'checklistVehicle',
+    'practicalCourseInserted', 'disabilityType', 'specialNeeds', 'examModalityA', 'examModalityB', 'examHistory',
+  ],
+  PCD: ['paidFee', 'semDuploComando', 'categoryQuantities', 'examModalityA', 'examModalityB', 'interestedExaminers'],
 };
 
 /** Remove campos que não existem mais na tabela do módulo alvo */
@@ -729,12 +730,11 @@ router.get("/requests", async (req, res) => {
     if (cpf) {
       const clean = cpf.replace(/\D/g, "");
       const pattern = `%${clean}%`;
-      const [cnhRows, cfcRows, pcdRows] = await Promise.all([
+      const [cnhRows, pcdRows] = await Promise.all([
         db.select().from(cnhbrasilRequests).where(like(cnhbrasilRequests.cpf, pattern)),
-        db.select().from(cfcRequests).where(like(cfcRequests.cpf, pattern)),
         db.select().from(pcdRequests).where(like(pcdRequests.cpf, pattern)),
       ]);
-      return res.json([...cnhRows, ...cfcRows, ...pcdRows]);
+      return res.json([...cnhRows, ...pcdRows]);
     }
     const [cnhRows, cfcRows, pcdRows] = await Promise.all([
       db.select().from(cnhbrasilRequests),
@@ -752,6 +752,7 @@ router.post("/requests", async (req, res) => {
     const filtered: any = {};
     for (const k of ALLOWED_REQ_FIELDS) { if (body[k] !== undefined) filtered[k] = body[k]; }
     if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
+    if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
     const safeFiltered = stripDroppedFields(filtered, filtered.modulo);
     const table = getRequestTable(safeFiltered.modulo);
     const item = await db.insert(table).values({
@@ -795,6 +796,7 @@ router.put("/requests", async (req, res) => {
     const { id, createdAt, ...rawUpdates } = body;
     const updates: any = {};
     for (const k of ALLOWED_REQ_FIELDS) { if (rawUpdates[k] !== undefined) updates[k] = rawUpdates[k]; }
+    if (updates.paidFee !== undefined && updates.taxaPaga === undefined) updates.taxaPaga = updates.paidFee;
     updates.updatedAt = new Date();
 
     // Busca registro para saber qual tabela atualizar e para auditoria

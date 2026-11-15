@@ -1,0 +1,107 @@
+name: Limpar e Reorganizar Schema D1 (v2)
+
+on:
+  workflow_dispatch:
+    inputs:
+      d1_database_name:
+        description: "Nome do banco D1 criado no Cloudflare (ex: praticosys-db)"
+        required: true
+        default: "praticosys-db"
+        type: string
+      d1_database_id:
+        description: "UUID do banco D1 (opcional: se vazio, busca automaticamente pelo nome)"
+        required: false
+        type: string
+
+jobs:
+  cleanup-v2:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Baixar código do repositório
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Instalar dependências
+        run: npm install --no-audit --no-fund
+
+      - name: Verificar estado atual e aplicar limpeza no Cloudflare D1
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          D1_DB_NAME: ${{ inputs.d1_database_name }}
+          D1_DB_ID: ${{ inputs.d1_database_id }}
+        run: |
+          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
+            echo "Erro: configure CLOUDFLARE_API_TOKEN e CLOUDFLARE_ACCOUNT_ID nos Secrets do GitHub."
+            exit 1
+          fi
+
+          DB_ID="$D1_DB_ID"
+          if [ -z "$DB_ID" ]; then
+            DB_ID=$(npx --yes wrangler@4 d1 list --json | node -e '
+              const fs = require("fs");
+              const list = JSON.parse(fs.readFileSync(0, "utf8"));
+              const target = process.env.D1_DB_NAME;
+              const found = Array.isArray(list) ? list.find(d => d.name === target) : null;
+              if (!found) {
+                console.error("Banco D1 não encontrado:", target);
+                process.exit(1);
+              }
+              process.stdout.write(found.uuid);
+            ')
+          fi
+
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("/tmp/wrangler-d1.json", JSON.stringify({
+              name: "praticosys-d1-cleanup",
+              compatibility_date: "2024-09-23",
+              d1_databases: [{
+                binding: "DB",
+                database_name: process.env.D1_DB_NAME,
+                database_id: process.argv[1]
+              }]
+            }, null, 2));
+          ' "$DB_ID"
+
+          META_JSON=$(npx tsx scripts/apply-d1-cleanup-v2.ts --print-checksum)
+          EXPECTED_VER=$(node -e 'console.log(JSON.parse(process.argv[1]).version)' "$META_JSON")
+          EXPECTED_CHK=$(node -e 'console.log(JSON.parse(process.argv[1]).checksum)' "$META_JSON")
+
+          MIG_JSON=$(npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT versao, checksum FROM migracoes_d1" --json)
+          STATUS=$(node -e '
+            const payload = JSON.parse(process.argv[1]);
+            const rows = (Array.isArray(payload) ? payload[0]?.results : payload?.results) || [];
+            const map = new Map(rows.map(r => [r.versao, r.checksum]));
+            if (!map.has("d1_schema_v1")) { console.log("NO_BASE"); process.exit(0); }
+            if (!map.has(process.argv[2])) { console.log("PENDING"); process.exit(0); }
+            console.log(map.get(process.argv[2]) === process.argv[3] ? "ALREADY_APPLIED" : "MISMATCH");
+          ' "$MIG_JSON" "$EXPECTED_VER" "$EXPECTED_CHK")
+
+          if [ "$STATUS" = "NO_BASE" ]; then
+            echo "Erro: d1_schema_v1 não encontrado em migracoes_d1. Execute primeiro o workflow de migração Neon -> D1."
+            rm -f /tmp/wrangler-d1.json
+            exit 1
+          fi
+
+          if [ "$STATUS" = "MISMATCH" ]; then
+            echo "Erro: a versão $EXPECTED_VER já existe com checksum diferente em migracoes_d1."
+            rm -f /tmp/wrangler-d1.json
+            exit 1
+          fi
+
+          if [ "$STATUS" = "ALREADY_APPLIED" ]; then
+            echo "Migração $EXPECTED_VER já está aplicada com sucesso neste banco D1 ($D1_DB_NAME)."
+          else
+            npx tsx scripts/apply-d1-cleanup-v2.ts --out /tmp/d1-cleanup-v2.sql
+            npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --file=/tmp/d1-cleanup-v2.sql --yes
+          fi
+
+          echo "--- Resumo final do schema D1 ---"
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT count(*) AS total_tabelas FROM sqlite_master WHERE type = '\''table'\'' AND name NOT LIKE '\''sqlite_%'\'' AND name NOT LIKE '\''_cf_%'\''" --json
+          npx --yes wrangler@4 d1 execute DB --remote --config /tmp/wrangler-d1.json --command "SELECT name FROM pragma_table_info('\''solicitacoes_cfc'\'')" --json
+          rm -f /tmp/d1-cleanup-v2.sql /tmp/wrangler-d1.json

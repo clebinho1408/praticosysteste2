@@ -13,11 +13,9 @@ export const RESTORE_TABLES = [
   'veiculos',
   'cidades',
   'bancas',
-  'solicitacoes',
   'solicitacoes_cnhbrasil',
   'solicitacoes_cfc',
   'solicitacoes_pcd',
-  'vagas_banca',
   'vagas_cfc',
   'vagas_pcd',
   'resultados_banca',
@@ -42,8 +40,6 @@ const TABLE_ALIASES: Record<string, RestoreTable> = {
   cities: 'cidades',
   bancas: 'bancas',
   exam_schedules: 'bancas',
-  solicitacoes: 'solicitacoes',
-  exam_requests: 'solicitacoes',
   solicitacoes_cnhbrasil: 'solicitacoes_cnhbrasil',
   cnhbrasil_requests: 'solicitacoes_cnhbrasil',
   exam_requests_cnh_brasil: 'solicitacoes_cnhbrasil',
@@ -53,8 +49,6 @@ const TABLE_ALIASES: Record<string, RestoreTable> = {
   solicitacoes_pcd: 'solicitacoes_pcd',
   pcd_requests: 'solicitacoes_pcd',
   exam_requests_pcd: 'solicitacoes_pcd',
-  vagas_banca: 'vagas_banca',
-  exam_schedule_slots: 'vagas_banca',
   vagas_cfc: 'vagas_cfc',
   cfc_schedule_slots: 'vagas_cfc',
   vagas_pcd: 'vagas_pcd',
@@ -74,7 +68,7 @@ const TABLE_ALIASES: Record<string, RestoreTable> = {
 const COMMON_REQUEST_COLUMNS = [
   'id', 'nome_candidato', 'nome_social', 'cpf', 'telefone', 'email', 'endereco',
   'cidade', 'tipo_solicitacao', 'tipo_exame', 'categoria_pretendida', 'origem',
-  'autoescola_id', 'taxa_paga_bool', 'curso_pratico_concluido', 'horas_praticas',
+  'autoescola_id', 'curso_pratico_concluido', 'horas_praticas',
   'tem_veiculo', 'restricao_cnh', 'instrutor', 'placa_veiculo', 'sem_duplo_comando',
   'checklist_veiculo', 'curso_pratico_inserido', 'taxa_paga', 'tipo_deficiencia',
   'necessidades_especiais', 'status', 'resultado', 'banca_id', 'data_agendada',
@@ -115,20 +109,22 @@ const TABLE_COLUMNS: Record<RestoreTable, string[]> = {
     'id', 'codigo', 'data', 'hora', 'examinadores_ids', 'max_vagas_a', 'max_vagas_b',
     'tipo', 'status', 'motivo_cancelamento', 'local_id', 'criado_em',
   ],
-  solicitacoes: COMMON_REQUEST_COLUMNS,
-  solicitacoes_cnhbrasil: COMMON_REQUEST_COLUMNS.filter(
-    (column) => !['tipo_deficiencia', 'necessidades_especiais', 'quantidades_categoria'].includes(column),
-  ),
-  solicitacoes_cfc: [
+  solicitacoes_cnhbrasil: [
     ...COMMON_REQUEST_COLUMNS.filter(
-      (column) => !['tipo_deficiencia', 'necessidades_especiais'].includes(column),
+      (column) => !['autoescola_id', 'tipo_deficiencia', 'necessidades_especiais', 'quantidades_categoria'].includes(column),
     ),
-    'examinadores_interessados',
+    'modalidade_exame_a', 'modalidade_exame_b',
+  ],
+  solicitacoes_cfc: [
+    'id', 'tipo_solicitacao', 'tipo_exame', 'categoria_pretendida', 'origem', 'autoescola_id',
+    'status', 'resultado', 'banca_id', 'data_agendada', 'hora_agendada', 'categoria_agendada',
+    'examinador_id', 'presenca_confirmada', 'motivo_cancelamento', 'observacao',
+    'quantidades_categoria', 'examinadores_interessados', 'modulo', 'cor_linha',
+    'criado_em', 'atualizado_em', 'fila_atualizado_em', 'agendado_por',
   ],
   solicitacoes_pcd: COMMON_REQUEST_COLUMNS.filter(
     (column) => !['sem_duplo_comando', 'quantidades_categoria'].includes(column),
   ),
-  vagas_banca: COMMON_SLOT_COLUMNS,
    vagas_cfc: [...COMMON_SLOT_COLUMNS, 'quantidades_categoria'],
    vagas_pcd: [...COMMON_SLOT_COLUMNS, 'quantidades_categoria'],
   resultados_banca: [
@@ -189,11 +185,9 @@ const COLUMN_ALIASES: Record<RestoreTable, Record<string, string>> = {
     cancellation_reason: 'motivo_cancelamento', location_id: 'local_id',
     created_at: 'criado_em',
   },
-  solicitacoes: {},
   solicitacoes_cnhbrasil: {},
   solicitacoes_cfc: {},
   solicitacoes_pcd: {},
-  vagas_banca: {},
   vagas_cfc: {},
   vagas_pcd: {},
   resultados_banca: {
@@ -237,12 +231,12 @@ const COLUMN_ALIASES: Record<RestoreTable, Record<string, string>> = {
   },
 };
 
-for (const table of ['solicitacoes', 'solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd'] as RestoreTable[]) {
+for (const table of ['solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd'] as RestoreTable[]) {
   COLUMN_ALIASES[table] = {
     student_name: 'nome_candidato', social_name: 'nome_social', phone: 'telefone',
     address: 'endereco', city: 'cidade', request_type: 'tipo_solicitacao',
     exam_type: 'tipo_exame', intended_category: 'categoria_pretendida', source: 'origem',
-    school_id: 'autoescola_id', paid_fee: 'taxa_paga_bool',
+    school_id: 'autoescola_id', paid_fee: 'taxa_paga', taxa_paga_bool: 'taxa_paga',
     completed_practical_course: 'curso_pratico_concluido', practical_hours: 'horas_praticas',
     has_vehicle: 'tem_veiculo', cnh_restriction: 'restricao_cnh', vehicle_plate: 'placa_veiculo',
     sem_duplo_comando: 'sem_duplo_comando', checklist_vehicle: 'checklist_veiculo',
@@ -255,10 +249,12 @@ for (const table of ['solicitacoes', 'solicitacoes_cnhbrasil', 'solicitacoes_cfc
     category_quantities: 'quantidades_categoria', row_color: 'cor_linha',
     created_at: 'criado_em', updated_at: 'atualizado_em',
     queue_updated_at: 'fila_atualizado_em', scheduled_by: 'agendado_por',
+    exam_modality_a: 'modalidade_exame_a', exam_modality_b: 'modalidade_exame_b',
+    interested_examiners: 'examinadores_interessados',
   };
 }
 
-for (const table of ['vagas_banca', 'vagas_cfc', 'vagas_pcd'] as RestoreTable[]) {
+for (const table of ['vagas_cfc', 'vagas_pcd'] as RestoreTable[]) {
   COLUMN_ALIASES[table] = {
     school_id: 'autoescola_id', exam_type: 'tipo_exame', request_type: 'tipo_solicitacao',
     intended_category: 'categoria_pretendida', scheduled_date: 'data_agendada',

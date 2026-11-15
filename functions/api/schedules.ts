@@ -3,6 +3,7 @@ import { getDb, json, error, parseBody, getQuery } from '../_db.js';
 import { examSchedules, cnhbrasilRequests, cfcRequests, pcdRequests, drivingSchools } from '../../db/schema.js';
 import { eq, and, desc, isNotNull, sql } from 'drizzle-orm';
 import { cnhBancaConflict } from '../_cnh-time-conflicts.js';
+import { isD1 } from '../_d1.js';
 
 const calculateStatus = (dateStr: string, timeStr: string, currentStatus: string) => {
   if (currentStatus === 'CANCELLED') return 'CANCELLED';
@@ -115,24 +116,25 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           updatedAt: new Date(),
         };
         await updateAllModuleTables(db, resetFields, id);
-        // Legada por segurança
-        try {
-          await db.execute(sql`ALTER TABLE solicitacoes ADD COLUMN IF NOT EXISTS fila_atualizado_em timestamptz`);
-        } catch {}
-        await db.execute(sql`
-          UPDATE solicitacoes
-          SET
-            status              = 'WAITING_SCHEDULING',
-            banca_id            = NULL,
-            data_agendada       = NULL,
-            hora_agendada       = NULL,
-            categoria_agendada  = NULL,
-            examinador_id       = NULL,
-            presenca_confirmada = FALSE,
-            atualizado_em = COALESCE(fila_atualizado_em, atualizado_em),
-            fila_atualizado_em  = NULL
-          WHERE banca_id = ${id}
-        `);
+        if (!isD1(db)) {
+          try {
+            await db.execute(sql`ALTER TABLE solicitacoes ADD COLUMN IF NOT EXISTS fila_atualizado_em timestamptz`);
+            await db.execute(sql`
+              UPDATE solicitacoes
+              SET
+                status              = 'WAITING_SCHEDULING',
+                banca_id            = NULL,
+                data_agendada       = NULL,
+                hora_agendada       = NULL,
+                categoria_agendada  = NULL,
+                examinador_id       = NULL,
+                presenca_confirmada = FALSE,
+                atualizado_em = COALESCE(fila_atualizado_em, atualizado_em),
+                fila_atualizado_em  = NULL
+              WHERE banca_id = ${id}
+            `);
+          } catch {}
+        }
 
         return json(updated[0] ?? { id, status: 'CANCELLED' });
       }

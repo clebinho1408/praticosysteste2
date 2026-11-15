@@ -19,10 +19,10 @@ export async function credentialChange(db: any, users: any, id: string, updates:
 
 export async function operationalCleanup(db: any, action: string) {
   const resetTables = ['resultados_banca', 'solicitacoes_cnhbrasil', 'solicitacoes_cfc',
-    'solicitacoes_pcd', 'vagas_cfc', 'vagas_pcd', 'bancas', 'solicitacoes', 'vagas_banca'];
+    'solicitacoes_pcd', 'vagas_cfc', 'vagas_pcd', 'bancas'];
   const queries = action === 'RESET_DATA' ? resetTables.map(t => sql.raw(`DELETE FROM ${t}`)) :
     action === 'CLEANUP_PHANTOM_REQUESTS' ?
-      ['solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd', 'solicitacoes'].map(t =>
+      ['solicitacoes_cnhbrasil', 'solicitacoes_pcd'].map(t =>
         sql.raw(`DELETE FROM ${t} WHERE (nome_candidato IS NULL OR nome_candidato = '' OR nome_candidato = 'Vaga Disponível') AND (cpf IS NULL OR cpf = '' OR cpf = '00000000000')`)) : null;
   if (!queries) throw new Error('Ação de limpeza inválida.');
   if (typeof db.batch === 'function') await db.batch(queries.map(q => db.execute(q)));

@@ -7,9 +7,9 @@ export const D1_PAYLOAD_LIMIT = 8_000_000;
 const PART_BYTES = 900_000;
 export const BACKUP_TABLES = [
   'autoescolas', 'examinadores', 'instrutores', 'veiculos', 'cidades',
-  'solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd', 'vagas_cfc', 'vagas_pcd',
-  'resultados_banca', 'locais_exame', 'datas_bloqueadas', 'configuracoes',
-  'solicitacoes', 'bancas', 'vagas_banca',
+  'bancas', 'solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd',
+  'vagas_cfc', 'vagas_pcd', 'resultados_banca', 'locais_exame',
+  'datas_bloqueadas', 'configuracoes',
 ];
 
 export function splitD1Text(text: string): string[] {

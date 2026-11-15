@@ -22,9 +22,14 @@ const ALLOWED_FIELDS = [
 
 /** Campos removidos de cada tabela de módulo — não podem ser gravados nelas */
 const MODULE_DROPPED_FIELDS: Record<string, string[]> = {
-  CNH_BRASIL: ['disabilityType', 'specialNeeds', 'categoryQuantities', 'interestedExaminers'],
-  CFC:        ['disabilityType', 'specialNeeds', 'examModalityA', 'examModalityB'],
-  PCD:        ['semDuploComando', 'categoryQuantities', 'examModalityA', 'examModalityB', 'interestedExaminers'],
+  CNH_BRASIL: ['schoolId', 'paidFee', 'disabilityType', 'specialNeeds', 'categoryQuantities', 'interestedExaminers'],
+  CFC: [
+    'studentName', 'socialName', 'cpf', 'phone', 'email', 'address', 'city',
+    'paidFee', 'taxaPaga', 'completedPracticalCourse', 'practicalHours', 'hasVehicle',
+    'cnhRestriction', 'instructor', 'vehiclePlate', 'semDuploComando', 'checklistVehicle',
+    'practicalCourseInserted', 'disabilityType', 'specialNeeds', 'examModalityA', 'examModalityB', 'examHistory',
+  ],
+  PCD: ['paidFee', 'semDuploComando', 'categoryQuantities', 'examModalityA', 'examModalityB', 'interestedExaminers'],
 };
 
 /** Remove campos que não existem mais na tabela do módulo alvo */
@@ -77,12 +82,11 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (query.cpf) {
         const clean = query.cpf.replace(/\D/g, '');
         const pattern = `%${clean}%`;
-        const [cnhRows, cfcRows, pcdRows] = await Promise.all([
+        const [cnhRows, pcdRows] = await Promise.all([
           db.select().from(cnhbrasilRequests).where(like(cnhbrasilRequests.cpf, pattern)),
-          db.select().from(cfcRequests).where(like(cfcRequests.cpf, pattern)),
           db.select().from(pcdRequests).where(like(pcdRequests.cpf, pattern)),
         ]);
-        return json([...cnhRows, ...cfcRows, ...pcdRows]);
+        return json([...cnhRows, ...pcdRows]);
       }
       const [cnhRows, cfcRows, pcdRows] = await Promise.all([
         db.select().from(cnhbrasilRequests),
@@ -98,13 +102,16 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (modalityError) return error(modalityError, 400);
       const filtered = filterFields(body);
       if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
+      if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
+      if (filtered.modulo !== 'CFC') {
+        filtered.studentName = filtered.studentName || null;
+        filtered.phone = filtered.phone || null;
+      }
       const safeFiltered = stripDroppedFields(filtered, filtered.modulo);
       const table = getRequestTable(safeFiltered.modulo);
       const newItem = await db.insert(table).values({
         id: safeFiltered.id || crypto.randomUUID(),
         ...safeFiltered,
-        studentName: filtered.studentName || null,
-        phone: filtered.phone || null,
         createdAt: filtered.createdAt ? new Date(filtered.createdAt) : new Date(),
         updatedAt: new Date(),
       }).returning();
@@ -125,6 +132,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if (!body?.id) return error('ID obrigatório', 400);
       const { id, updatedAt, createdAt, ...rawUpdates } = body;
       const filtered = filterFields(rawUpdates);
+      if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
       if (filtered.queueUpdatedAt && typeof filtered.queueUpdatedAt === 'string') {
         filtered.queueUpdatedAt = new Date(filtered.queueUpdatedAt);
       }

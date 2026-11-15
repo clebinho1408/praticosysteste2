@@ -7,12 +7,9 @@ export { normalizeBackupPayload, restoreBackup } from './_backup-restore.js';
 // Tabelas de dados incluídas no backup (sessões, OTPs e logs de auditoria ficam fora)
 const BACKUP_TABLES = [
   'autoescolas', 'examinadores', 'instrutores', 'veiculos', 'cidades',
-  // Tabelas separadas por módulo
-  'solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd',
-  'vagas_cfc', 'vagas_pcd',
-  'resultados_banca', 'locais_exame', 'datas_bloqueadas', 'configuracoes',
-  // Tabelas legadas mantidas para segurança/rollback
-  'solicitacoes', 'bancas', 'vagas_banca',
+  'bancas', 'solicitacoes_cnhbrasil', 'solicitacoes_cfc', 'solicitacoes_pcd',
+  'vagas_cfc', 'vagas_pcd', 'resultados_banca', 'locais_exame',
+  'datas_bloqueadas', 'configuracoes',
 ];
 
 const MAX_BACKUPS = 15;
