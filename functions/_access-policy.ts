@@ -90,7 +90,6 @@ export async function accessPolicy(db: any, schema: any, user: any) {
     if (!moduleAllowed(user, module)) return false;
     const g = await graph();
     const schedule = g.schedules.find((s: any) => s.id === row.scheduleId);
-    if (module === 'CNH_BRASIL' && row.scheduleId && !locationAllowed(schedule)) return false;
     if (globalReader) return true;
     if (!await hasValidLink()) return false;
     if (user.role === 'SCHOOL') return row.schoolId === user.schoolId;
@@ -170,6 +169,16 @@ export async function accessPolicy(db: any, schema: any, user: any) {
       } else {
         let projected = row;
         if (projected && typeof projected === 'object') {
+          if (route === 'requests' && projected.scheduleId && (!projected.scheduledDate || !projected.scheduledTime)) {
+            const schedule = (await graph()).schedules.find((s: any) => s.id === projected.scheduleId);
+            if (schedule) {
+              projected = {
+                ...projected,
+                scheduledDate: projected.scheduledDate || schedule.date,
+                scheduledTime: projected.scheduledTime || schedule.time,
+              };
+            }
+          }
           const needsCpfMask = (user.role === 'CONSULTANT' || user.role === 'EXAMINER') && ['requests', 'instructors'].includes(route);
           if (Object.hasOwn(projected, 'cpfHmac') || (needsCpfMask && projected.cpf)) {
             const { cpfHmac: _hidden, ...rest } = projected;
@@ -243,7 +252,14 @@ export async function accessPolicy(db: any, schema: any, user: any) {
       if (next.schoolId && !['PCD', 'CNH_BRASIL'].includes(next.schoolId) && !g.schools.some((s: any) => s.id === next.schoolId)) throw new AccessDenied(400, 'Autoescola inválida.');
       if (next.examinerId && !g.examiners.some((e: any) => e.id === next.examinerId)) throw new AccessDenied(400, 'Examinador inválido.');
       if (!await visible(next, route)) throw new AccessDenied();
-      if (next.scheduleId) {
+      if (route === 'requests' && current?.status === 'SCHEDULED' && current?.scheduleId && recordModule(current) === 'CNH_BRASIL') {
+        const unschedulingOrMoving = next.scheduleId !== current.scheduleId || next.status === 'WAITING_SCHEDULING';
+        if (unschedulingOrMoving) {
+          const currentSchedule = g.schedules.find((s: any) => s.id === current.scheduleId);
+          if (currentSchedule && !await scheduleVisible(currentSchedule)) throw new AccessDenied();
+        }
+      }
+      if (next.scheduleId && (route !== 'requests' || next.scheduleId !== current?.scheduleId || (next.status === 'SCHEDULED' && current?.status !== 'SCHEDULED'))) {
         const schedule = g.schedules.find((s: any) => s.id === next.scheduleId);
         const parent = route === 'banca-results' ? [...g.requests, ...g.slots].find((r: any) => r.id === next.scheduleId && r.schoolId === next.schoolId) : null;
         if (parent) {

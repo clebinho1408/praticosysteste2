@@ -38,3 +38,22 @@ export function visibleProvisionalDates<T extends { date: string; id?: string }>
   // an in-progress row just because that intermediate value sorts before today.
   return dates.filter(entry => !entry.date || entry.date >= today || (!!entry.id && draftIds.has(entry.id)));
 }
+
+export type SchoolScaleFilter = '' | 'MAIN' | 'PROVISIONAL';
+
+export function activeSchoolScale(school: {
+  mainSchedule?: { active?: boolean } | null;
+  provisionalSchedule?: { active?: boolean } | null;
+}): 'MAIN' | 'PROVISIONAL' | null {
+  if (school.provisionalSchedule?.active) return 'PROVISIONAL';
+  if (school.mainSchedule?.active) return 'MAIN';
+  return null;
+}
+
+export function matchesSchoolScale(school: {
+  mainSchedule?: { active?: boolean } | null;
+  provisionalSchedule?: { active?: boolean } | null;
+}, filter: SchoolScaleFilter): boolean {
+  if (!filter) return true;
+  return activeSchoolScale(school) === filter;
+}

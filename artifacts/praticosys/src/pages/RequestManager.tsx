@@ -400,7 +400,7 @@ const RequestManager: React.FC<RequestManagerProps> = ({
           const timeStr = schedule?.time || req.scheduledTime;
 
           if (dateStr && timeStr) {
-            const examDateTime = new Date(`${dateStr}T${timeStr}`);
+            const examDateTime = new Date(`${dateStr.split('T')[0]}T${timeStr}`);
             if (!isNaN(examDateTime.getTime())) {
               const fourHoursInMs = 4 * 60 * 60 * 1000;
               if (now.getTime() >= examDateTime.getTime() + fourHoursInMs) {

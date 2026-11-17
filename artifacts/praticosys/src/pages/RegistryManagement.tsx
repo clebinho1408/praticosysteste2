@@ -4,7 +4,7 @@ import { api } from '../services/api';
 import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
-import { businessDate, visibleProvisionalDates } from '../../../../functions/_school-schedule';
+import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter } from '../../../../functions/_school-schedule';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -734,6 +734,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
   const [searchTerm, setSearchTerm] = useState('');
   const [cityFilter, setCityFilter] = useState('');
   const [examinerFilter, setExaminerFilter] = useState('');
+  const [scheduleFilter, setScheduleFilter] = useState<SchoolScaleFilter>('');
   
   const initialFormData: Partial<DrivingSchool> = {
     name: '',
@@ -938,7 +939,9 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
           (s.mainSchedule?.slots.some(slot => slot.examiner === examinerFilter)) ||
           (s.provisionalSchedule?.slots.some(slot => slot.examiner === examinerFilter));
 
-      return matchesSearch && matchesCity && matchesExaminer;
+      const matchesScale = matchesSchoolScale(s, scheduleFilter);
+
+      return matchesSearch && matchesCity && matchesExaminer && matchesScale;
   });
 
   // Group by City
@@ -1787,6 +1790,17 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
             {examiners.map(ex => (
               <option key={ex.id} value={ex.id}>{ex.name}</option>
             ))}
+          </select>
+
+          <select
+            aria-label="Filtrar por escala"
+            className="border rounded-md px-3 py-2 text-sm bg-white text-gray-900 focus:ring-2 focus:ring-blue-500 focus:outline-none"
+            value={scheduleFilter}
+            onChange={e => setScheduleFilter(e.target.value as SchoolScaleFilter)}
+          >
+            <option value="">Todas as Escalas</option>
+            <option value="MAIN">Principal</option>
+            <option value="PROVISIONAL">Provisória</option>
           </select>
         </div>
         
