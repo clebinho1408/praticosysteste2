@@ -394,3 +394,199 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     changed,
   };
 }
+
+export function filterUpcomingRotationNext7Days(
+  entries: RotationScheduleEntry[] | null | undefined,
+  today = businessDate(),
+  daysAhead = 7,
+): RotationScheduleEntry[] {
+  if (!Array.isArray(entries) || !isCalendarDate(today)) return [];
+  const maxDate = addCalendarDays(today, Math.max(0, daysAhead));
+  return entries
+    .filter(entry => !!entry && isCalendarDate(entry.date) && entry.date >= today && entry.date <= maxDate)
+    .sort((a, b) => a.date.localeCompare(b.date) || normalizeScaleTime(a.time).localeCompare(normalizeScaleTime(b.time)));
+}
+
+export interface ShuffleRotationScheduleInput extends Omit<SyncRotationScheduleInput, 'forceRebalanceAuto'> {
+  rng?: () => number;
+}
+
+function fisherYatesShuffle<T>(items: T[], rng: () => number): T[] {
+  const arr = [...items];
+  for (let i = arr.length - 1; i > 0; i--) {
+    const j = Math.floor(rng() * (i + 1));
+    [arr[i], arr[j]] = [arr[j], arr[i]];
+  }
+  return arr;
+}
+
+export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): SyncRotationScheduleResult {
+  const today = input.today ?? businessDate();
+  const horizonDays = input.horizonDays ?? 30;
+  const maxDate = addCalendarDays(today, horizonDays);
+  const blockedDates = input.blockedDates ?? [];
+  const pausedSet = new Set((input.pausedDates ?? []).filter(isCalendarDate));
+  const createId = input.createId ?? (() => crypto.randomUUID());
+  const rng = input.rng ?? Math.random;
+  const maxAttempts = input.rng ? 1 : 10;
+
+  const normalizedConfig: RotationConfig = {
+    days: Array.from(new Set(input.config.days ?? [])),
+    startTime: normalizeScaleTime(input.config.startTime),
+    endTime: normalizeScaleTime(input.config.endTime),
+  };
+
+  const rawSuppressed = Array.isArray(input.suppressedDates) ? input.suppressedDates : [];
+  const cleanedSuppressed = Array.from(
+    new Set(rawSuppressed.filter(d => isCalendarDate(d) && d >= today && d <= maxDate)),
+  ).sort();
+  const suppressedSet = new Set(cleanedSuppressed);
+
+  const cityId = resolveCityIdByName(input.schoolCity, input.cities);
+  const examinerMap = new Map(input.examiners.map(ex => [ex.id, ex]));
+
+  const rawExisting = Array.isArray(input.existingEntries) ? input.existingEntries : [];
+  const manualEntries: RotationScheduleEntry[] = [];
+  for (const item of rawExisting) {
+    if (!item || !isCalendarDate(item.date) || item.date < today) continue;
+    if (item.manual) {
+      manualEntries.push({
+        id: item.id || createId(),
+        date: item.date,
+        time: normalizeScaleTime(item.time),
+        examiner: item.examiner,
+        manual: true,
+      });
+    }
+  }
+
+  const coveredDates = new Set(manualEntries.map(e => e.date));
+  const baseEligibility = findEligibleExaminersForSchool({
+    schoolCity: input.schoolCity,
+    config: normalizedConfig,
+    examiners: input.examiners,
+    cities: input.cities,
+  });
+
+  const baseWarnings: string[] = [];
+  if (baseEligibility.issue) {
+    baseWarnings.push(baseEligibility.issue);
+  }
+
+  const dateSlots: { date: string; candidates: { examiner: RotationExaminerLike; time: string }[]; distinctExaminerCount: number }[] = [];
+  for (const date of listForwardDates(today, horizonDays)) {
+    if (coveredDates.has(date) || suppressedSet.has(date) || pausedSet.has(date)) continue;
+    const weekday = scaleWeekday(date);
+    if (!normalizedConfig.days.includes(weekday)) continue;
+    if (isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked) continue;
+    if (!cityId) continue;
+
+    const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
+    for (const ex of baseEligibility.eligible) {
+      if (!ex.rotationAvailability?.days?.includes(weekday)) continue;
+      const times = getExaminerRotationTimesInWindow(ex, normalizedConfig);
+      for (const time of times) {
+        if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
+          candidates.push({ examiner: ex, time });
+        }
+      }
+    }
+
+    if (candidates.length === 0) {
+      if (baseEligibility.eligible.length > 0) {
+        baseWarnings.push(`Sem examinador disponível em ${formatRotationDateBR(date)} (${weekday}) — verifique afastamentos/férias ou horários.`);
+      }
+      continue;
+    }
+
+    const distinctExaminerCount = new Set(candidates.map(c => c.examiner.id)).size;
+    dateSlots.push({ date, candidates, distinctExaminerCount });
+  }
+
+  const serializeEntries = (list: RotationScheduleEntry[]) =>
+    list
+      .map(e => `${e.date}|${normalizeScaleTime(e.time)}|${e.examiner}|${e.manual ? '1' : '0'}`)
+      .join(';');
+
+  const previousSignature = serializeEntries(
+    rawExisting
+      .filter(e => e && isCalendarDate(e.date) && e.date >= today)
+      .sort((a, b) => a.date.localeCompare(b.date) || normalizeScaleTime(a.time).localeCompare(normalizeScaleTime(b.time))),
+  );
+
+  let chosenEntries: RotationScheduleEntry[] = [];
+
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const counts = new Map<string, number>();
+    for (const ex of input.examiners) {
+      counts.set(ex.id, 0);
+    }
+    for (const entry of manualEntries) {
+      if (entry.date <= maxDate && entry.examiner) {
+        counts.set(entry.examiner, (counts.get(entry.examiner) ?? 0) + 1);
+      }
+    }
+
+    // Agrupa datas por nível de restrição (datas com menos examinadores primeiro) e embaralha dentro de cada grupo.
+    const byConstraint = new Map<number, typeof dateSlots>();
+    for (const slot of dateSlots) {
+      const bucket = byConstraint.get(slot.distinctExaminerCount) ?? [];
+      bucket.push(slot);
+      byConstraint.set(slot.distinctExaminerCount, bucket);
+    }
+    const orderedSlots = [...byConstraint.keys()]
+      .sort((a, b) => a - b)
+      .flatMap(level => fisherYatesShuffle(byConstraint.get(level)!, rng));
+
+    const generated: RotationScheduleEntry[] = [];
+    for (const slot of orderedSlots) {
+      let minCount = Infinity;
+      for (const candidate of slot.candidates) {
+        const count = counts.get(candidate.examiner.id) ?? 0;
+        if (count < minCount) minCount = count;
+      }
+      const tied = slot.candidates.filter(c => (counts.get(c.examiner.id) ?? 0) === minCount);
+      const chosen = tied[Math.floor(rng() * tied.length)];
+      generated.push({
+        id: createId(),
+        date: slot.date,
+        time: chosen.time,
+        examiner: chosen.examiner.id,
+        manual: false,
+      });
+      counts.set(chosen.examiner.id, (counts.get(chosen.examiner.id) ?? 0) + 1);
+    }
+
+    const candidateFinal = [...manualEntries, ...generated].sort(
+      (a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time),
+    );
+    chosenEntries = candidateFinal;
+    if (serializeEntries(candidateFinal) !== previousSignature) {
+      break;
+    }
+  }
+
+  const summaryIds = new Set<string>([
+    ...baseEligibility.eligible.map(e => e.id),
+    ...chosenEntries.map(e => e.examiner).filter(Boolean),
+  ]);
+  const distribution = [...summaryIds]
+    .map(examinerId => ({
+      examinerId,
+      examinerName: examinerMap.get(examinerId)?.name ?? examinerId,
+      count: chosenEntries.filter(e => e.examiner === examinerId).length,
+    }))
+    .sort((a, b) => a.examinerName.localeCompare(b.examinerName));
+
+  const changed =
+    serializeEntries(rawExisting) !== serializeEntries(chosenEntries) ||
+    rawSuppressed.join(',') !== cleanedSuppressed.join(',');
+
+  return {
+    entries: chosenEntries,
+    suppressedDates: cleanedSuppressed,
+    warnings: baseWarnings,
+    distribution,
+    changed,
+  };
+}

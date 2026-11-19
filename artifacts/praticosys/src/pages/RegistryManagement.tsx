@@ -5,9 +5,9 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, shuffleRotationSchedule, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
-import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
+import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
 
 type Tab = 'USERS' | 'SCHOOLS' | 'EXAMINERS' | 'INSTRUCTORS';
@@ -2066,38 +2066,27 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                   )}
                                 </div>
                               ) : s.examRotation && activeSchedule.rotationConfig ? (
-                                /* Escala Principal via Rodízio (próximos 30 dias) */
+                                /* Escala Principal via Rodízio (somente próximos 7 dias a partir da data atual) */
                                 <div className="space-y-0.5">
                                   {(() => {
-                                    const upcomingRotation = (activeSchedule.rotationEntries ?? [])
-                                      .filter(entry => entry.date >= today)
-                                      .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
-                                    if (upcomingRotation.length === 0) {
+                                    const upcomingRotation7Days = filterUpcomingRotationNext7Days(activeSchedule.rotationEntries, today, 7);
+                                    if (upcomingRotation7Days.length === 0) {
                                       return (
                                         <span className="text-[11px] text-gray-400 italic">
-                                          Dias: {activeSchedule.rotationConfig.days.join(', ')} (sem datas nos próximos 30 dias)
+                                          Dias: {activeSchedule.rotationConfig.days.join(', ')} (sem datas nos próximos 7 dias)
                                         </span>
                                       );
                                     }
-                                    return (
-                                      <>
-                                        {upcomingRotation.slice(0, 4).map(entry => {
-                                          const examName = examiners.find(ex => ex.id === entry.examiner)?.name || 'Sem examinador';
-                                          return (
-                                            <div key={entry.id} className="text-[11px] text-gray-600">
-                                              <span className="font-bold text-gray-800">{formatRotationDateBR(entry.date)}</span>
-                                              {entry.time && <span> às {entry.time}h</span>}
-                                              <span className="text-blue-600 italic"> ({examName})</span>
-                                            </div>
-                                          );
-                                        })}
-                                        {upcomingRotation.length > 4 && (
-                                          <div className="text-[10px] text-gray-400">
-                                            + {upcomingRotation.length - 4} datas programadas (30 dias)
-                                          </div>
-                                        )}
-                                      </>
-                                    );
+                                    return upcomingRotation7Days.map(entry => {
+                                      const examName = examiners.find(ex => ex.id === entry.examiner || ex.name === entry.examiner)?.name || 'Sem examinador';
+                                      return (
+                                        <div key={entry.id} className="text-[11px] text-gray-600">
+                                          <span className="font-bold text-gray-800">{formatRotationDateBR(entry.date)}</span>
+                                          {entry.time && <span> às {entry.time}h</span>}
+                                          <span className="text-blue-600 italic"> ({examName})</span>
+                                        </div>
+                                      );
+                                    });
                                   })()}
                                 </div>
                               ) : (
@@ -2460,6 +2449,42 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     setFormData(applyRotationSyncToForm(formData, rotationConfig, { activateMain: true }));
                   };
 
+                  const handleShuffleSchedule = () => {
+                    if (!rotationConfig) return;
+                    const currentMain = formData.mainSchedule ?? initialFormData.mainSchedule!;
+                    const shuffled = shuffleRotationSchedule({
+                      schoolCity: formData.city,
+                      config: rotationConfig,
+                      existingEntries: currentMain.rotationEntries ?? [],
+                      suppressedDates: currentMain.suppressedRotationDates ?? [],
+                      pausedDates: currentMain.pausedDates ?? [],
+                      examiners,
+                      cities,
+                      blockedDates,
+                      systemSettings,
+                      today,
+                    });
+                    const nextMain: SchoolSchedule = {
+                      ...currentMain,
+                      active: true,
+                      days: [...rotationConfig.days],
+                      rotationConfig,
+                      rotationEntries: shuffled.entries,
+                      suppressedRotationDates: shuffled.suppressedDates,
+                    };
+                    const nextProv = formData.provisionalSchedule
+                      ? { ...formData.provisionalSchedule, active: false }
+                      : formData.provisionalSchedule;
+                    setRotationWarnings(shuffled.warnings);
+                    setRotationDistribution(shuffled.distribution);
+                    setFormData({
+                      ...formData,
+                      examRotation: true,
+                      mainSchedule: nextMain,
+                      provisionalSchedule: nextProv,
+                    });
+                  };
+
                   const distributionToShow = rotationDistribution.length > 0
                     ? rotationDistribution
                     : rotationConfig
@@ -2495,14 +2520,24 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                 Configurar Dias e Horários
                               </button>
                               {rotationConfig && (
-                                <button
-                                  type="button"
-                                  onClick={handleRefreshSchedule}
-                                  className="px-3 py-1.5 text-xs font-semibold rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 inline-flex items-center gap-1"
-                                >
-                                  <RefreshCw className="h-3.5 w-3.5" />
-                                  Atualizar 30 Dias
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={handleRefreshSchedule}
+                                    className="px-3 py-1.5 text-xs font-semibold rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 inline-flex items-center gap-1"
+                                  >
+                                    <RefreshCw className="h-3.5 w-3.5" />
+                                    Atualizar 30 Dias
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={handleShuffleSchedule}
+                                    className="px-3 py-1.5 text-xs font-semibold rounded border border-purple-200 bg-white text-purple-700 hover:bg-purple-50 inline-flex items-center gap-1"
+                                  >
+                                    <Shuffle className="h-3.5 w-3.5" />
+                                    Embaralhar
+                                  </button>
+                                </>
                               )}
                             </div>
                           )}

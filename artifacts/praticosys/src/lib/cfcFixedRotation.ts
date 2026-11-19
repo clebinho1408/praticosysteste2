@@ -42,7 +42,8 @@ export function rotationCandidates(
     return { eligible: [], reason: 'Rodízio de Provas desativado para esta autoescola.' };
   }
   // Autoescolas guardam o nome da cidade; a disponibilidade guarda IDs.
-  const city = cities.find(item => item.name.trim() === school.city?.trim());
+  const targetCity = (school.city ?? '').trim().toUpperCase();
+  const city = targetCity ? cities.find(item => item.name.trim().toUpperCase() === targetCity) : undefined;
   if (!city) return { eligible: [], reason: 'Cidade da autoescola não cadastrada ou não informada.' };
 
   const eligible = examiners.filter(examiner => {
@@ -76,15 +77,33 @@ export function planFixedScales(input: {
   const issues: FixedScaleIssue[] = [];
   const reserved: FixedCommitment[] = [];
 
-  // Reservar primeiro os examinadores das escolas com menos opções de atendimento.
+  // Reservar primeiro escalas com examinador/horário concretos e, depois, escolas com menos opções no rodízio semanal.
   for (const school of schools.filter(s => selected.has(s.id) && s.id !== 'PCD' && s.id !== 'CNH_BRASIL')
     .sort((a, b) => {
-      const options = (item: DrivingSchool) => item.examRotation
-        ? rotationCandidates(item, day, examiners, cities).eligible.length
-        : -1; // Escalas fixas sem rodízio reservam seus horários antes da distribuição.
+      const options = (item: DrivingSchool) => {
+        if (!item.examRotation) return -1;
+        const itemScale = resolveSchoolScaleForDate(item, date);
+        if (itemScale.kind === 'ROTATION_DATES' || itemScale.kind === 'PROVISIONAL_DATES') return -1;
+        return rotationCandidates(item, day, examiners, cities).eligible.length;
+      };
       return options(a) - options(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
     })) {
     const resolved = resolveSchoolScaleForDate(school, date);
+    const resolveExaminerId = (idOrName: string) =>
+      examiners.find(ex => ex.id === idOrName || ex.name === idOrName)?.id ?? idOrName;
+    const findExaminerConflict = (slotsToCheck: FixedScaleSlot[]) => {
+      for (const slot of slotsToCheck) {
+        const hasConflict = [...commitments, ...reserved].some(item =>
+          item.examinerId === slot.examinerId &&
+          item.scheduledDate === date &&
+          normalizeScaleTime(item.scheduledTime) === slot.scheduledTime);
+        if (hasConflict) {
+          const exName = examiners.find(ex => ex.id === slot.examinerId)?.name ?? slot.examinerId;
+          return `Examinador ${exName} já possui prova às ${slot.scheduledTime} nesta data.`;
+        }
+      }
+      return null;
+    };
 
     // ── Escala Provisória com specificDates ──────────────────────────────────
     if (resolved.kind === 'PROVISIONAL_DATES') {
@@ -98,9 +117,14 @@ export function planFixedScales(input: {
         issues.push({ school, reason: 'Já existe escala fixa para esta data; nenhuma prova foi duplicada.' });
         continue;
       }
-      const slots: FixedScaleSlot[] = provDates.map(d => ({ examinerId: d.examiner, scheduledTime: d.time }));
+      const slots: FixedScaleSlot[] = provDates.map(d => ({ examinerId: resolveExaminerId(d.examiner), scheduledTime: d.time }));
       if (new Set(slots.map(s => s.scheduledTime)).size !== slots.length) {
         issues.push({ school, reason: 'A escala provisória contém horários repetidos para esta data.' });
+        continue;
+      }
+      const conflictReason = findExaminerConflict(slots);
+      if (conflictReason) {
+        issues.push({ school, reason: conflictReason });
         continue;
       }
       plans.push({ school, slots });
@@ -124,9 +148,14 @@ export function planFixedScales(input: {
         issues.push({ school, reason: 'Já existe escala fixa para esta data; nenhuma prova foi duplicada.' });
         continue;
       }
-      const slots: FixedScaleSlot[] = resolved.entries.map(e => ({ examinerId: e.examiner, scheduledTime: e.time }));
+      const slots: FixedScaleSlot[] = resolved.entries.map(e => ({ examinerId: resolveExaminerId(e.examiner), scheduledTime: e.time }));
       if (new Set(slots.map(s => s.scheduledTime)).size !== slots.length) {
         issues.push({ school, reason: 'A Escala Rodízio contém horários repetidos para esta data.' });
+        continue;
+      }
+      const conflictReason = findExaminerConflict(slots);
+      if (conflictReason) {
+        issues.push({ school, reason: conflictReason });
         continue;
       }
       plans.push({ school, slots });

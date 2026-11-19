@@ -126,8 +126,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
             return error('Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa.', 409);
           }
         }
-        const city = school.examRotation
-          ? (await db.select().from(cities)).find(c => c.name.trim() === school.city?.trim())
+        const targetCity = (school.city ?? '').trim().toUpperCase();
+        const city = school.examRotation && targetCity
+          ? (await db.select().from(cities)).find(c => c.name.trim().toUpperCase() === targetCity)
           : null;
         if (school.examRotation && !city) {
           return error('Cidade da autoescola não cadastrada para o rodízio.', 409);

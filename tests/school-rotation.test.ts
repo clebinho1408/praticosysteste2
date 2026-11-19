@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   syncRollingRotationSchedule,
+  shuffleRotationSchedule,
+  filterUpcomingRotationNext7Days,
   findEligibleExaminersForSchool,
   isExaminerBlockedOnDateTime,
   isSystemDateBlockedForRotation,
@@ -276,4 +278,156 @@ test('resolveSchoolScaleForDate and planFixedScales support Escala Rodizio activ
 
   assert.equal(planned.issues.length, 0);
   assert.deepEqual(planned.plans[0].slots, [{ examinerId: 'ex-a', scheduledTime: '14:00' }]);
+});
+
+test('filterUpcomingRotationNext7Days includes only today through today+7 sorted by date and time', () => {
+  const entries = [
+    { id: '0', date: '2026-11-17', time: '14:00', examiner: 'ex-a' }, // passado
+    { id: '1', date: '2026-11-18', time: '15:00', examiner: 'ex-b' }, // hoje
+    { id: '2', date: '2026-11-18', time: '10:00', examiner: 'ex-a' }, // hoje (mais cedo)
+    { id: '3', date: '2026-11-23', time: '14:00', examiner: 'ex-a' }, // +5 dias
+    { id: '4', date: '2026-11-25', time: '14:00', examiner: 'ex-b' }, // +7 dias (limite inclusivo)
+    { id: '5', date: '2026-11-26', time: '14:00', examiner: 'ex-a' }, // +8 dias (fora dos 7 dias)
+  ];
+
+  const next7 = filterUpcomingRotationNext7Days(entries, '2026-11-18', 7);
+  assert.deepEqual(next7.map(e => e.id), ['2', '1', '3', '4']);
+});
+
+test('shuffleRotationSchedule reorders examiners while keeping equal distribution, vacations, holidays, and manual overrides', () => {
+  const exA = makeExaminer('ex-a', {
+    name: 'ALICE',
+    rotationAvailability: {
+      days: ['SEG', 'QUA'],
+      defaultTime: '10:30',
+      examsPerDay: 1 as const,
+      cityIds: ['c1'],
+    },
+    blockedPeriods: [
+      { id: 'b1', startDate: '2026-11-25', endDate: '2026-11-25', description: 'Férias', period: 'ALL_DAY' },
+    ],
+  });
+  const exB = makeExaminer('ex-b', {
+    name: 'BRUNO',
+    rotationAvailability: {
+      days: ['SEG', 'QUA'],
+      defaultTime: '15:00',
+      examsPerDay: 1 as const,
+      cityIds: ['c1'],
+    },
+  });
+  const config = { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' };
+
+  const initial = syncRollingRotationSchedule({
+    schoolCity: 'ITAPEMA',
+    config,
+    examiners: [exA, exB],
+    cities,
+    blockedDates: [{ date: '2026-12-07', description: 'Feriado' }],
+    today: '2026-11-23',
+    horizonDays: 30,
+  });
+
+  // Marca uma linha como manual e uma data como suprimida
+  const withManual = initial.entries
+    .filter(e => e.date !== '2026-12-09')
+    .map(e => e.date === '2026-11-30' ? { ...e, examiner: 'ex-a', time: '11:00', manual: true } : e);
+
+  const shuffled = shuffleRotationSchedule({
+    schoolCity: 'ITAPEMA',
+    config,
+    existingEntries: withManual,
+    suppressedDates: ['2026-12-09'],
+    examiners: [exA, exB],
+    cities,
+    blockedDates: [{ date: '2026-12-07', description: 'Feriado' }],
+    today: '2026-11-23',
+    horizonDays: 30,
+  });
+
+  assert.equal(shuffled.changed, true);
+  // Feriado e suprimida ausentes
+  assert.equal(shuffled.entries.some(e => e.date === '2026-12-07'), false);
+  assert.equal(shuffled.entries.some(e => e.date === '2026-12-09'), false);
+  // 2026-11-25 ex-a está de férias -> precisa ir para ex-b
+  assert.equal(shuffled.entries.find(e => e.date === '2026-11-25')?.examiner, 'ex-b');
+  // Edição manual mantida
+  const manualRow = shuffled.entries.find(e => e.date === '2026-11-30');
+  assert.equal(manualRow?.manual, true);
+  assert.equal(manualRow?.examiner, 'ex-a');
+  assert.equal(manualRow?.time, '11:00');
+  // Distribuição equilibrada
+  const countA = shuffled.entries.filter(e => e.examiner === 'ex-a').length;
+  const countB = shuffled.entries.filter(e => e.examiner === 'ex-b').length;
+  assert.ok(Math.abs(countA - countB) <= 1, `Distribuição desigual após embaralhar: A=${countA}, B=${countB}`);
+});
+
+test('planFixedScales pulls exact examiner and time per date for ROTATION_DATES and flags cross-school examiner conflict', () => {
+  const schoolRot = {
+    id: 's-rot',
+    name: 'AUTOESCOLA RODIZIO',
+    city: 'Itapema',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      frequency: '1_WEEK' as const,
+      days: ['SEG', 'QUA'],
+      slots: [],
+      rotationConfig: { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' },
+      rotationEntries: [
+        { id: 'r1', date: '2026-11-23', time: '10:30', examiner: 'ex-a', manual: false },
+        { id: 'r2', date: '2026-11-25', time: '15:00', examiner: 'ex-b', manual: false },
+      ],
+    },
+    provisionalSchedule: { active: false, frequency: '1_WEEK' as const, days: [], slots: [], specificDates: [] },
+  };
+  const schoolConflict = {
+    id: 's-other',
+    name: 'AUTOESCOLA CONFLITO',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      frequency: '1_WEEK' as const,
+      days: ['SEG'],
+      slots: [],
+      rotationConfig: { days: ['SEG'], startTime: '10:00', endTime: '16:00' },
+      rotationEntries: [
+        { id: 'r3', date: '2026-11-23', time: '10:30', examiner: 'ex-a', manual: false },
+      ],
+    },
+    provisionalSchedule: { active: false, frequency: '1_WEEK' as const, days: [], slots: [], specificDates: [] },
+  };
+
+  const day1 = planFixedScales({
+    date: '2026-11-23',
+    selectedSchoolIds: ['s-rot'],
+    schools: [schoolRot],
+    examiners: [makeExaminer('ex-a'), makeExaminer('ex-b')],
+    cities,
+    commitments: [],
+  });
+  assert.deepEqual(day1.plans[0].slots, [{ examinerId: 'ex-a', scheduledTime: '10:30' }]);
+
+  const day2 = planFixedScales({
+    date: '2026-11-25',
+    selectedSchoolIds: ['s-rot'],
+    schools: [schoolRot],
+    examiners: [makeExaminer('ex-a'), makeExaminer('ex-b')],
+    cities,
+    commitments: [],
+  });
+  assert.deepEqual(day2.plans[0].slots, [{ examinerId: 'ex-b', scheduledTime: '15:00' }]);
+
+  const conflicted = planFixedScales({
+    date: '2026-11-23',
+    selectedSchoolIds: ['s-rot', 's-other'],
+    schools: [schoolRot, schoolConflict],
+    examiners: [makeExaminer('ex-a'), makeExaminer('ex-b')],
+    cities,
+    commitments: [],
+  });
+  assert.equal(conflicted.plans.length, 1);
+  assert.equal(conflicted.issues.length, 1);
+  assert.match(conflicted.issues[0].reason, /já possui prova às 10:30/);
 });

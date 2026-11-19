@@ -1302,8 +1302,9 @@ router.post("/schedule-slots", async (req, res) => {
           return res.status(409).json({ error: "Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa." });
         }
       }
-      const city = school.examRotation
-        ? (await db.select().from(cities)).find(c => c.name.trim() === school.city?.trim())
+      const targetCity = (school.city ?? "").trim().toUpperCase();
+      const city = school.examRotation && targetCity
+        ? (await db.select().from(cities)).find(c => c.name.trim().toUpperCase() === targetCity)
         : null;
       if (school.examRotation && !city) {
         return res.status(409).json({ error: "Cidade da autoescola não cadastrada para o rodízio." });
