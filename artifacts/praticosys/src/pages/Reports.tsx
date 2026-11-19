@@ -1805,18 +1805,28 @@ const Reports: React.FC<{ reportTypeProp?: string; user?: User }> = ({ reportTyp
                                                                   {school.mainSchedule?.active ? (
                                                                       <>
                                                                           <div className="font-medium text-blue-700 print:text-black">{
+                                                                              school.examRotation && school.mainSchedule.rotationConfig ? `Escala Rodízio (${school.mainSchedule.rotationConfig.startTime} - ${school.mainSchedule.rotationConfig.endTime})` :
                                                                               school.mainSchedule.frequency === '1_WEEK' ? '1x na Semana' :
                                                                               school.mainSchedule.frequency === '2_WEEK' ? '2x na Semana' :
                                                                               school.mainSchedule.frequency === '3_WEEK' ? '3x na Semana' :
                                                                               school.mainSchedule.frequency === '2_DAY' ? '2x no Dia' :
                                                                               school.mainSchedule.frequency === '15_DAYS' ? 'A cada 15 dias' : school.mainSchedule.frequency
                                                                           }</div>
-                                                                          <div className="text-xs mt-0.5">{school.mainSchedule.days?.join(', ') || '-'}</div>
+                                                                          <div className="text-xs mt-0.5">{(school.examRotation && school.mainSchedule.rotationConfig?.days?.length ? school.mainSchedule.rotationConfig.days : school.mainSchedule.days)?.join(', ') || '-'}</div>
                                                                       </>
                                                                   ) : <span className="text-gray-400 print:text-black">-</span>}
                                                               </td>
                                                               <td className="px-4 py-2 text-gray-600 print:px-2 print:py-1 print:text-[10px] print:text-black align-top">
-                                                                  {school.mainSchedule?.active && school.mainSchedule.slots?.length > 0 ? (
+                                                                  {school.mainSchedule?.active && school.examRotation && Array.isArray(school.mainSchedule.rotationEntries) && school.mainSchedule.rotationEntries.length > 0 ? (
+                                                                      <ul className="space-y-1">
+                                                                          {school.mainSchedule.rotationEntries.slice(0, 6).map((entry: any, idx: number) => (
+                                                                              <li key={entry.id || idx} className="flex items-center gap-1.5 text-xs">
+                                                                                  <span className="font-mono font-medium bg-gray-100 px-1 rounded print:bg-transparent print:p-0">{entry.date?.split('-').reverse().join('/')} {entry.time}</span>
+                                                                                  <span className="text-gray-500 print:text-black">{entry.examiner ? (examiners.find(e => e.id === entry.examiner || e.name === entry.examiner)?.name || 'A Definir') : 'A Definir'}</span>
+                                                                              </li>
+                                                                          ))}
+                                                                      </ul>
+                                                                  ) : school.mainSchedule?.active && school.mainSchedule.slots?.length > 0 ? (
                                                                       <ul className="space-y-1">
                                                                           {school.mainSchedule.slots.map((slot: any, idx: number) => (
                                                                               <li key={idx} className="flex items-center gap-1.5 text-xs">

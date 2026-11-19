@@ -1,5 +1,9 @@
 import type { City, DrivingSchool, Examiner, SchoolSchedule } from '../types';
-import { mainSchedulePaused } from '../../../../functions/_school-schedule';
+import {
+  normalizeScaleTime,
+  resolveSchoolScaleForDate,
+  scaleWeekday,
+} from '../../../../functions/_school-schedule';
 
 export type FixedCommitment = {
   id?: string;
@@ -15,12 +19,11 @@ export type FixedScaleSlot = { examinerId: string; scheduledTime: string };
 export type FixedSchoolPlan = { school: DrivingSchool; slots: FixedScaleSlot[] };
 export type FixedScaleIssue = { school: DrivingSchool; reason: string };
 
-const weekdays = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SAB'];
 const validTime = (value?: string) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(value ?? '');
 const activeCommitment = (item: FixedCommitment) => item.status !== 'CANCELLED';
 
 export function fixedScaleDay(date: string): string {
-  return weekdays[new Date(`${date}T00:00:00`).getDay()];
+  return scaleWeekday(date);
 }
 
 export function activeSchoolSchedule(school: DrivingSchool): SchoolSchedule | null {
@@ -81,14 +84,12 @@ export function planFixedScales(input: {
         : -1; // Escalas fixas sem rodízio reservam seus horários antes da distribuição.
       return options(a) - options(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
     })) {
+    const resolved = resolveSchoolScaleForDate(school, date);
+
     // ── Escala Provisória com specificDates ──────────────────────────────────
-    // Quando a escala ativa é provisória, usa as datas específicas para a data
-    // exata da geração em vez de days[]/slots[].
-    if (school.provisionalSchedule?.active) {
-      const provDates = (school.provisionalSchedule.specificDates ?? [])
-        .filter(d => d.date === date && d.examiner && d.time);
+    if (resolved.kind === 'PROVISIONAL_DATES') {
+      const provDates = resolved.specificDates;
       if (provDates.length === 0) {
-        // Escala provisória ativa mas sem entrada para esta data → pula
         issues.push({ school, reason: 'Escala provisória ativa, mas sem data específica configurada para este dia.' });
         continue;
       }
@@ -107,18 +108,39 @@ export function planFixedScales(input: {
       continue;
     }
 
-    // ── Escala Principal (days[] + slots[]) ─────────────────────────────────
-    if (mainSchedulePaused(school, date)) {
+    if (resolved.kind === 'PAUSED') {
       issues.push({ school, reason: 'Escala Principal pausada nesta data.' });
       continue;
     }
-    const schedule = activeSchoolSchedule(school);
-    if (!schedule?.days?.includes(day)) {
+
+    // ── Escala Rodízio (cronograma de 30 dias com datas e examinadores) ───────
+    if (resolved.kind === 'ROTATION_DATES') {
+      if (resolved.entries.length === 0) {
+        issues.push({ school, reason: 'Escala Rodízio ativa, mas sem data configurada para este dia.' });
+        continue;
+      }
+      if (commitments.some(item => item.schoolId === school.id &&
+        item.scheduledDate === date && item.requestType === 'FIXA')) {
+        issues.push({ school, reason: 'Já existe escala fixa para esta data; nenhuma prova foi duplicada.' });
+        continue;
+      }
+      const slots: FixedScaleSlot[] = resolved.entries.map(e => ({ examinerId: e.examiner, scheduledTime: e.time }));
+      if (new Set(slots.map(s => s.scheduledTime)).size !== slots.length) {
+        issues.push({ school, reason: 'A Escala Rodízio contém horários repetidos para esta data.' });
+        continue;
+      }
+      plans.push({ school, slots });
+      reserved.push(...slots.map(slot => ({ ...slot, schoolId: school.id, scheduledDate: date })));
+      continue;
+    }
+
+    // ── Escala Semanal (Principal ou Provisória legada por days[] + slots[]) ─
+    if (resolved.kind === 'INACTIVE') {
       issues.push({ school, reason: 'Sem escala ativa para o dia selecionado.' });
       continue;
     }
 
-    const matchingSlots = (schedule.slots ?? []).filter(slot => !slot.day || slot.day === day);
+    const matchingSlots = resolved.slots;
     if (!matchingSlots.length) {
       issues.push({ school, reason: 'A escala ativa não tem provas configuradas para este dia.' });
       continue;
@@ -155,8 +177,8 @@ export function planFixedScales(input: {
       const choices = eligible.flatMap(examiner => {
         const availability = examiner.rotationAvailability!;
         const times = availability.examsPerDay === 2
-          ? [availability.defaultTime, availability.secondDefaultTime!]
-          : [availability.defaultTime];
+          ? [normalizeScaleTime(availability.defaultTime), normalizeScaleTime(availability.secondDefaultTime!)]
+          : [normalizeScaleTime(availability.defaultTime)];
         const appointments = [...commitments, ...reserved, ...tentative]
           .filter(item => item.examinerId === examiner.id && item.scheduledDate === date);
         // Candidatos e vagas podem representar a mesma prova. Contar a prova uma vez só.

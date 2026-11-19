@@ -5,7 +5,11 @@ import { eq, and } from 'drizzle-orm';
 import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatch, validateConfirmedEdit } from '../_cfc-confirmed.js';
 import { extraEditError, extraPatch } from '../_cfc-extra.js';
 import { isD1 } from '../_d1.js';
-import { mainSchedulePaused } from '../_school-schedule.js';
+import {
+  normalizeScaleTime,
+  resolveSchoolScaleForDate,
+  scaleWeekday,
+} from '../_school-schedule.js';
 
 function getSlotTable(examType: string) {
   return examType === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
@@ -62,40 +66,38 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         const school = (await db.select().from(drivingSchools)
           .where(eq(drivingSchools.id, schoolId)).limit(1))[0];
         if (!school) return error('Autoescola não encontrada.', 404);
-        if (mainSchedulePaused(school, date)) {
+        const resolved = resolveSchoolScaleForDate(school, date);
+        if (resolved.kind === 'PAUSED') {
           return error('Escala Principal pausada nesta data. Consulte a data novamente.', 409);
         }
-        const day = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SAB'][new Date(`${date}T00:00:00`).getDay()];
+        const day = scaleWeekday(date);
 
-        // ── Escala Provisória com specificDates ──────────────────────────────────
-        // Quando a escala ativa é provisória, os slots vêm de specificDates (não days[]/slots[]).
-        // A validação é feita verificando se as entradas enviadas coincidem com as specificDates
-        // configuradas para esta data exata; o rodízio de examinadores não se aplica.
-        if (school.provisionalSchedule?.active) {
-          const provDates: any[] = (school.provisionalSchedule.specificDates ?? [])
-            .filter((d: any) => d.date === date && d.examiner && d.time);
-          if (!provDates.length || provDates.length !== slots.length) {
-            return error('A escala provisória mudou. Consulte a data novamente.', 409);
+        // ── Escala Provisória ou Escala Rodízio (datas configuradas) ───────────────
+        if (resolved.kind === 'PROVISIONAL_DATES' || resolved.kind === 'ROTATION_DATES') {
+          const configuredEntries = resolved.kind === 'PROVISIONAL_DATES' ? resolved.specificDates : resolved.entries;
+          const mismatchMsg = resolved.kind === 'PROVISIONAL_DATES'
+            ? 'A escala provisória mudou. Consulte a data novamente.'
+            : 'A escala rodízio mudou. Consulte a data novamente.';
+          if (!configuredEntries.length || configuredEntries.length !== slots.length) {
+            return error(mismatchMsg, 409);
           }
           const ordered = (items: string[]) => [...items].sort().join('|');
-          if (ordered(provDates.map((d: any) => `${d.examiner}:${d.time}`)) !==
+          if (ordered(configuredEntries.map((d: any) => `${d.examiner}:${d.time}`)) !==
               ordered(slots.map((s: any) => `${s.examinerId}:${s.scheduledTime}`))) {
-            return error('A escala provisória mudou. Consulte a data novamente.', 409);
+            return error(mismatchMsg, 409);
           }
-          // Sem validação de rodízio para escala provisória — examinadores são fixos por specificDate.
           const existing = await db.select().from(cfcScheduleSlots).where(and(
             eq(cfcScheduleSlots.schoolId, schoolId), eq(cfcScheduleSlots.scheduledDate, date),
             eq(cfcScheduleSlots.requestType, 'FIXA')));
           if (existing.some((s: any) => s.status !== 'CANCELLED')) {
             return error('Esta autoescola já possui uma escala fixa nesta data.', 409);
           }
-          // Verificar conflito de horário do examinador (sem validar disponibilidade de rodízio).
           for (const examinerId of new Set<string>(slots.map((s: any) => s.examinerId))) {
             const booked = await db.select().from(cfcScheduleSlots).where(and(
               eq(cfcScheduleSlots.examinerId, examinerId), eq(cfcScheduleSlots.scheduledDate, date)));
             const active = booked.filter((s: any) => s.status !== 'CANCELLED');
             const assigned = slots.filter((s: any) => s.examinerId === examinerId);
-            if (assigned.some((s: any) => active.some((b: any) => b.scheduledTime === s.scheduledTime))) {
+            if (assigned.some((s: any) => active.some((b: any) => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
               return error('O examinador já possui prova nesse horário.', 409);
             }
           }
@@ -112,10 +114,8 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           return json(created);
         }
 
-        // ── Escala Principal (days[] + slots[]) ──────────────────────────────────
-        const schedule = school.mainSchedule?.active ? school.mainSchedule : null;
-        const configured = schedule?.days?.includes(day)
-          ? (schedule.slots ?? []).filter((s: any) => !s.day || s.day === day) : [];
+        // ── Escala Semanal (Principal ou Provisória legada por days[] + slots[]) ─
+        const configured = resolved.kind === 'WEEKLY_SLOTS' ? resolved.slots : [];
         if (!configured.length || configured.length !== slots.length) {
           return error('A escala da autoescola mudou. Consulte a data novamente.', 409);
         }
@@ -149,8 +149,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           if (school.examRotation) {
             const examiner = examinerRows[0];
             const availability = examiner?.rotationAvailability;
-            const times = availability?.examsPerDay === 2
-              ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime];
+            const times = (availability?.examsPerDay === 2
+              ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime])
+              .map(t => normalizeScaleTime(t));
             if (!examiner?.examRotation || examiner.canExamCommon === false ||
               !availability?.days?.includes(day) || !availability.cityIds?.includes(city!.id) ||
               ![1, 2].includes(availability.examsPerDay) ||
@@ -160,7 +161,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           }
           const capacity = examinerRows[0]?.examRotation
             ? examinerRows[0].rotationAvailability?.examsPerDay : null;
-          if (assigned.some((s: any) => active.some(b => b.scheduledTime === s.scheduledTime)) ||
+          if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime)) ||
             (capacity && active.length + assigned.length > capacity)) {
             return error('O examinador já possui prova nesse horário ou atingiu a capacidade diária.', 409);
           }

@@ -1,12 +1,13 @@
 
 import React, { useEffect, useState, useMemo } from 'react';
 import { api } from '../services/api';
-import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
+import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, RotationConfig, RotationScheduleEntry, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
-import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter } from '../../../../functions/_school-schedule';
+import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
+import { syncRollingRotationSchedule, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
-import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check } from 'lucide-react';
+import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
 
 type Tab = 'USERS' | 'SCHOOLS' | 'EXAMINERS' | 'INSTRUCTORS';
@@ -686,6 +687,12 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
   const [pauseDate, setPauseDate] = useState('');
   const [schoolSaveError, setSchoolSaveError] = useState('');
   const [draftProvisionalIds, setDraftProvisionalIds] = useState<Set<string>>(() => new Set());
+  const [isRotationConfigOpen, setIsRotationConfigOpen] = useState(false);
+  const [rotationConfigDraft, setRotationConfigDraft] = useState<RotationConfig>({ days: [], startTime: '10:00', endTime: '16:00' });
+  const [rotationConfigError, setRotationConfigError] = useState('');
+  const [rotationWarnings, setRotationWarnings] = useState<string[]>([]);
+  const [rotationDistribution, setRotationDistribution] = useState<{ examinerId: string; examinerName: string; count: number }[]>([]);
+  const [draftRotationIds, setDraftRotationIds] = useState<Set<string>>(() => new Set());
   // ── Pátios: editor inline (novo/edição) ────────────────────────────────
   const emptyYardDraft = { type: '' as SchoolYardType | '', address: '', reference: '' };
   const [yardDraft, setYardDraft] = useState<{ type: SchoolYardType | ''; address: string; reference: string }>(emptyYardDraft);
@@ -773,7 +780,22 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
   const fetch = async () => {
     const todayStr = businessDate();
 
-    let schools = await api.getSchoolsAsync();
+    let [schools, examinersData, citiesData, bdData, settingsData] = await Promise.all([
+      api.getSchoolsAsync(),
+      api.getExaminersAsync().catch(() => [] as Examiner[]),
+      api.getCities().catch(err => {
+        console.error("Erro ao carregar cidades:", err);
+        return [] as City[];
+      }),
+      api.getBlockedDates().catch(err => {
+        console.error("Erro ao carregar datas bloqueadas:", err);
+        return [] as BlockedDate[];
+      }),
+      api.getSettings().catch(err => {
+        console.error("Erro ao carregar configurações:", err);
+        return null as SystemSettings | null;
+      }),
+    ]);
 
     // ── Auto-ativar provisória quando activateFrom <= hoje ──
     const schoolsToActivateProv = schools.filter(s => {
@@ -808,33 +830,147 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
       // Re-fetch updated list
       schools = await api.getSchoolsAsync();
     }
-    setSchools(schools);
 
-    setExaminers(await api.getExaminersAsync());
-    try {
-      const citiesData = await api.getCities();
-      setCities(citiesData);
-    } catch (err) {
-      console.error("Erro ao carregar cidades:", err);
+    // ── Auto-rolling 30-day Escala Rodízio: remove datas passadas e completa próximas ──
+    const rotationUpdates: { id: string; mainSchedule: SchoolSchedule }[] = [];
+    schools = schools.map(s => {
+      if (!s.examRotation || !s.mainSchedule?.active || !s.mainSchedule.rotationConfig || s.provisionalSchedule?.active) {
+        return s;
+      }
+      const synced = syncRollingRotationSchedule({
+        schoolCity: s.city,
+        config: s.mainSchedule.rotationConfig,
+        existingEntries: s.mainSchedule.rotationEntries ?? [],
+        suppressedDates: s.mainSchedule.suppressedRotationDates ?? [],
+        pausedDates: s.mainSchedule.pausedDates ?? [],
+        examiners: examinersData,
+        cities: citiesData,
+        blockedDates: bdData,
+        systemSettings: settingsData,
+        today: todayStr,
+      });
+      if (!synced.changed) return s;
+      const updatedMain: SchoolSchedule = {
+        ...s.mainSchedule,
+        rotationEntries: synced.entries,
+        suppressedRotationDates: synced.suppressedDates,
+      };
+      rotationUpdates.push({ id: s.id, mainSchedule: updatedMain });
+      return { ...s, mainSchedule: updatedMain };
+    });
+
+    if (rotationUpdates.length > 0 && user?.role !== UserRole.CONSULTANT) {
+      await Promise.all(
+        rotationUpdates.map(u => api.updateSchool(u.id, { mainSchedule: u.mainSchedule }).catch(err => {
+          console.error("Erro ao atualizar rodízio automático:", err);
+        })),
+      );
     }
-    try {
-      const [bd, settings] = await Promise.all([
-        api.getBlockedDates(),
-        api.getSettings(),
-      ]);
-      setBlockedDates(bd);
-      setSystemSettings(settings);
-    } catch (err) {
-      console.error("Erro ao carregar datas bloqueadas:", err);
-    }
+
+    setSchools(schools);
+    setExaminers(examinersData);
+    setCities(citiesData);
+    setBlockedDates(bdData);
+    setSystemSettings(settingsData);
   };
   useEffect(() => { fetch(); }, []);
+
+  const computeDistributionSummary = (
+    entries: RotationScheduleEntry[],
+    schoolCity?: string | null,
+    config?: RotationConfig | null,
+    exList: Examiner[] = examiners,
+    cityList: City[] = cities,
+  ) => {
+    const examinerMap = new Map(exList.map(ex => [ex.id, ex]));
+    const base = config
+      ? findEligibleExaminersForSchool({ schoolCity, config, examiners: exList, cities: cityList }).eligible
+      : [];
+    const ids = new Set<string>([
+      ...base.map(e => e.id),
+      ...entries.map(e => e.examiner).filter(Boolean),
+    ]);
+    return [...ids]
+      .map(examinerId => ({
+        examinerId,
+        examinerName: examinerMap.get(examinerId)?.name ?? examinerId,
+        count: entries.filter(e => e.examiner === examinerId).length,
+      }))
+      .sort((a, b) => a.examinerName.localeCompare(b.examinerName));
+  };
+
+  const applyRotationSyncToForm = (
+    targetForm: Partial<DrivingSchool>,
+    config: RotationConfig,
+    options?: {
+      forceRebalanceAuto?: boolean;
+      activateMain?: boolean;
+      exList?: Examiner[];
+      cityList?: City[];
+      bdList?: BlockedDate[];
+      settings?: SystemSettings | null;
+      todayStr?: string;
+    },
+  ) => {
+    const exList = options?.exList ?? examiners;
+    const cityList = options?.cityList ?? cities;
+    const bdList = options?.bdList ?? blockedDates;
+    const settings = options?.settings ?? systemSettings;
+    const todayStr = options?.todayStr ?? businessDate();
+    const currentMain = targetForm.mainSchedule ?? initialFormData.mainSchedule!;
+    const synced = syncRollingRotationSchedule({
+      schoolCity: targetForm.city,
+      config,
+      existingEntries: currentMain.rotationEntries ?? [],
+      suppressedDates: currentMain.suppressedRotationDates ?? [],
+      pausedDates: currentMain.pausedDates ?? [],
+      examiners: exList,
+      cities: cityList,
+      blockedDates: bdList,
+      systemSettings: settings,
+      today: todayStr,
+      forceRebalanceAuto: options?.forceRebalanceAuto,
+    });
+    const nextMain: SchoolSchedule = {
+      ...currentMain,
+      active: options?.activateMain ? true : currentMain.active,
+      days: [...config.days],
+      rotationConfig: config,
+      rotationEntries: synced.entries,
+      suppressedRotationDates: synced.suppressedDates,
+    };
+    const nextProv = options?.activateMain && targetForm.provisionalSchedule
+      ? { ...targetForm.provisionalSchedule, active: false }
+      : targetForm.provisionalSchedule;
+    setRotationWarnings(synced.warnings);
+    setRotationDistribution(synced.distribution);
+    return {
+      ...targetForm,
+      examRotation: true,
+      mainSchedule: nextMain,
+      provisionalSchedule: nextProv,
+    };
+  };
 
   const openModal = async (school?: DrivingSchool) => {
     setEditing(school || null);
     setDraftProvisionalIds(new Set());
+    setDraftRotationIds(new Set());
+    setIsRotationConfigOpen(false);
+    setRotationConfigError('');
+    setRotationWarnings([]);
+    setRotationDistribution([]);
+
+    let exList = examiners;
+    try {
+      exList = await api.getExaminersAsync();
+      setExaminers(exList);
+    } catch (err) {
+      console.error("Erro ao carregar examinadores:", err);
+    }
+
     if (school) {
-      const loaded = { ...initialFormData, ...school };
+      let loaded: Partial<DrivingSchool> = { ...initialFormData, ...school };
       loaded.mainSchedule ||= initialFormData.mainSchedule;
       loaded.provisionalSchedule ||= initialFormData.provisionalSchedule;
       // Normalize provisionalSchedule.specificDates — may be null in older records
@@ -851,6 +987,9 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
       }
       // Pátios: registros antigos (um endereço por tipo) viram itens da lista editável
       loaded.yards = effectiveYards(loaded).map(y => ({ ...y, id: y.id.startsWith('legacy-') ? crypto.randomUUID() : y.id }));
+      if (loaded.examRotation && loaded.mainSchedule?.rotationConfig) {
+        loaded = applyRotationSyncToForm(loaded, loaded.mainSchedule.rotationConfig, { exList });
+      }
       setFormData(loaded);
     } else {
       setFormData(initialFormData);
@@ -858,21 +997,35 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
     resetYardDraft();
     setModalTab('MAIN');
     setIsModalOpen(true);
-    // Re-fetch examiners to ensure we have the latest list
-    try {
-      const exData = await api.getExaminersAsync();
-      setExaminers(exData);
-    } catch (err) {
-      console.error("Erro ao carregar examinadores:", err);
-    }
   };
 
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (formData.examRotation && formData.mainSchedule?.rotationConfig) {
+      const entries = formData.mainSchedule.rotationEntries ?? [];
+      const hasIncomplete = entries.some(entry => !isCalendarDate(entry.date) || !isValidScaleTime(entry.time) || !entry.examiner);
+      if (hasIncomplete) {
+        setSchoolSaveError('Preencha data, horário e examinador em todas as linhas do cronograma da Escala Rodízio ou exclua as linhas incompletas.');
+        return;
+      }
+    }
     // Pátios: a lista `yards` é a fonte única; os campos legados (um endereço por tipo)
     // são limpos para que endereços antigos não reapareçam no modal Endereços.
+    const normalizeWeeklySlots = (sched?: SchoolSchedule): SchoolSchedule | undefined => {
+      if (!sched) return sched;
+      const normalizedEntries = Array.isArray(sched.rotationEntries)
+        ? sched.rotationEntries.map(entry => ({
+            ...entry,
+            time: normalizeScaleTime(entry.time),
+          }))
+        : sched.rotationEntries;
+      const base = normalizedEntries !== undefined ? { ...sched, rotationEntries: normalizedEntries } : sched;
+      if (base.frequency === '2_WEEK' || base.frequency === '3_WEEK') return base;
+      return { ...base, slots: (base.slots ?? []).map(s => ({ ...s, day: '' })) };
+    };
     const payload: Partial<DrivingSchool> = {
       ...formData,
+      mainSchedule: normalizeWeeklySlots(formData.mainSchedule),
       yards: formData.yards ?? [],
       motoYardAddress: '',
       carYardAddress: '',
@@ -934,10 +1087,12 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
       const matchesSearch = s.name.toLowerCase().includes(searchTerm.toLowerCase());
       const matchesCity = !cityFilter || s.city === cityFilter;
       
-      // Check if any schedule (main or provisional) has the selected examiner
+      // Check if any schedule (main, rodizio or provisional) has the selected examiner
       const matchesExaminer = !examinerFilter || 
           (s.mainSchedule?.slots.some(slot => slot.examiner === examinerFilter)) ||
-          (s.provisionalSchedule?.slots.some(slot => slot.examiner === examinerFilter));
+          (s.mainSchedule?.rotationEntries?.some(entry => entry.examiner === examinerFilter)) ||
+          (s.provisionalSchedule?.slots.some(slot => slot.examiner === examinerFilter)) ||
+          (s.provisionalSchedule?.specificDates?.some(entry => entry.examiner === examinerFilter));
 
       const matchesScale = matchesSchoolScale(s, scheduleFilter);
 
@@ -1115,6 +1270,19 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
 
     return (
       <div className="space-y-4">
+        {type === 'main' && formData.examRotation && schedule.rotationConfig && (
+          <div className="rounded border border-blue-200 bg-blue-50 p-3 text-xs text-blue-800 flex items-start gap-2">
+            <Calendar className="h-4 w-4 text-blue-600 shrink-0 mt-0.5" />
+            <div>
+              <p className="font-semibold">Escala Principal gerenciada pela aba Escala Rodizio</p>
+              <p className="mt-0.5">
+                Dias: <strong>{schedule.rotationConfig.days.join(', ')}</strong> · Faixa de horários:{' '}
+                <strong>{schedule.rotationConfig.startTime} - {schedule.rotationConfig.endTime}</strong> ·{' '}
+                {(schedule.rotationEntries ?? []).filter(e => e.date >= today).length} datas nos próximos 30 dias.
+              </p>
+            </div>
+          </div>
+        )}
         <div className="flex justify-between items-center bg-gray-50 p-3 rounded border border-gray-200">
           <div>
             <h4 className="font-bold text-sm">{type === 'main' ? 'Escala Principal' : 'Escala Provisória'}</h4>
@@ -1856,17 +2024,23 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                         <td className="px-4 py-3">
                           {activeSchedule ? (
                             <div className="space-y-1">
-                              <div className="flex items-center gap-1">
+                                <div className="flex items-center gap-1">
                                 <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-green-100 text-green-700 uppercase">
                                   {scheduleType}
                                 </span>
                                 {scheduleType === 'Principal' && (
                                   <span className="text-xs font-medium text-gray-600">
-                                    {activeSchedule.frequency === '1_WEEK' && '1x na Semana'}
-                                    {activeSchedule.frequency === '2_WEEK' && '2x na Semana'}
-                                    {activeSchedule.frequency === '3_WEEK' && '3x na Semana'}
-                                    {activeSchedule.frequency === '2_DAY' && '2x no Dia'}
-                                    {activeSchedule.frequency === '15_DAYS' && 'A cada 15 dias'}
+                                    {s.examRotation && activeSchedule.rotationConfig ? (
+                                      <>Escala Rodízio ({activeSchedule.rotationConfig.startTime} - {activeSchedule.rotationConfig.endTime})</>
+                                    ) : (
+                                      <>
+                                        {activeSchedule.frequency === '1_WEEK' && '1x na Semana'}
+                                        {activeSchedule.frequency === '2_WEEK' && '2x na Semana'}
+                                        {activeSchedule.frequency === '3_WEEK' && '3x na Semana'}
+                                        {activeSchedule.frequency === '2_DAY' && '2x no Dia'}
+                                        {activeSchedule.frequency === '15_DAYS' && 'A cada 15 dias'}
+                                      </>
+                                    )}
                                   </span>
                                 )}
                               </div>
@@ -1890,6 +2064,41 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                         );
                                       })
                                   )}
+                                </div>
+                              ) : s.examRotation && activeSchedule.rotationConfig ? (
+                                /* Escala Principal via Rodízio (próximos 30 dias) */
+                                <div className="space-y-0.5">
+                                  {(() => {
+                                    const upcomingRotation = (activeSchedule.rotationEntries ?? [])
+                                      .filter(entry => entry.date >= today)
+                                      .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+                                    if (upcomingRotation.length === 0) {
+                                      return (
+                                        <span className="text-[11px] text-gray-400 italic">
+                                          Dias: {activeSchedule.rotationConfig.days.join(', ')} (sem datas nos próximos 30 dias)
+                                        </span>
+                                      );
+                                    }
+                                    return (
+                                      <>
+                                        {upcomingRotation.slice(0, 4).map(entry => {
+                                          const examName = examiners.find(ex => ex.id === entry.examiner)?.name || 'Sem examinador';
+                                          return (
+                                            <div key={entry.id} className="text-[11px] text-gray-600">
+                                              <span className="font-bold text-gray-800">{formatRotationDateBR(entry.date)}</span>
+                                              {entry.time && <span> às {entry.time}h</span>}
+                                              <span className="text-blue-600 italic"> ({examName})</span>
+                                            </div>
+                                          );
+                                        })}
+                                        {upcomingRotation.length > 4 && (
+                                          <div className="text-[10px] text-gray-400">
+                                            + {upcomingRotation.length - 4} datas programadas (30 dias)
+                                          </div>
+                                        )}
+                                      </>
+                                    );
+                                  })()}
                                 </div>
                               ) : (
                                 /* Escala Principal: mostrar slots */
@@ -1919,8 +2128,8 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                         <td className="px-4 py-3 text-right space-x-2">
                           {user?.role !== UserRole.CONSULTANT && (
                             <>
-                              <button onClick={() => openModal(s)} className="text-blue-600 hover:text-blue-800"><Edit2 className="h-4 w-4" /></button>
-                              <button onClick={() => handleDelete(s.id)} className="text-red-600 hover:text-red-800"><Trash2 className="h-4 w-4" /></button>
+                              <button type="button" onClick={() => openModal(s)} aria-label={`Editar ${s.name}`} title={`Editar ${s.name}`} className="text-blue-600 hover:text-blue-800"><Edit2 className="h-4 w-4" /></button>
+                              <button type="button" onClick={() => handleDelete(s.id)} aria-label={`Excluir ${s.name}`} title={`Excluir ${s.name}`} className="text-red-600 hover:text-red-800"><Trash2 className="h-4 w-4" /></button>
                             </>
                           )}
                         </td>
@@ -1952,12 +2161,13 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                 { id: 'MAIN', label: 'Dados Principais' },
                 { id: 'SERVICES', label: 'Serviços' },
                 { id: 'YARDS', label: 'Pátios' },
-                { id: 'RODIZIOS', label: 'Rodízios' },
+                { id: 'RODIZIOS', label: 'Escala Rodizio' },
                 { id: 'SCHEDULE_MAIN', label: 'Escala Principal' },
                 { id: 'SCHEDULE_PROV', label: 'Escala Provisória' }
               ].map(tab => (
                 <button
                   key={tab.id}
+                  type="button"
                   onClick={() => setModalTab(tab.id as any)}
                   className={`px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
                     modalTab === tab.id 
@@ -1998,7 +2208,14 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                         <select 
                           className="w-full border rounded p-2 bg-white text-gray-900" 
                           value={formData.city || ''} 
-                          onChange={e => setFormData({...formData, city: e.target.value})}
+                          onChange={e => {
+                            const updated = { ...formData, city: e.target.value };
+                            if (updated.examRotation && updated.mainSchedule?.rotationConfig) {
+                              setFormData(applyRotationSyncToForm(updated, updated.mainSchedule.rotationConfig, { forceRebalanceAuto: true }));
+                            } else {
+                              setFormData(updated);
+                            }
+                          }}
                         >
                           <option value="">Selecione uma cidade</option>
                           {cities.map(city => (
@@ -2150,34 +2367,352 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                   </div>
                 )}
 
-                {modalTab === 'RODIZIOS' && (
-                  <div className="space-y-4">
-                    <div className="rounded border bg-gray-50 p-4">
-                      <label className="flex items-center gap-3 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={formData.examRotation ?? false}
-                          onChange={e => setFormData({ ...formData, examRotation: e.target.checked })}
-                          className="w-4 h-4 text-blue-600"
-                        />
-                        <span className="text-sm font-medium">Rodízio de Provas</span>
-                      </label>
-                      <p className="text-xs text-gray-500 mt-1 ml-7">Quando ativado, esta autoescola participa do rodízio automático de examinadores.</p>
+                {modalTab === 'RODIZIOS' && (() => {
+                  const rotationConfig = formData.mainSchedule?.rotationConfig ?? null;
+                  const rotationEntries: RotationScheduleEntry[] = Array.isArray(formData.mainSchedule?.rotationEntries)
+                    ? formData.mainSchedule!.rotationEntries!
+                    : [];
+                  const visibleEntries = rotationEntries
+                    .filter(entry => !entry.date || entry.date >= today || draftRotationIds.has(entry.id))
+                    .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time));
+
+                  const openConfigModal = () => {
+                    setRotationConfigDraft(rotationConfig ? {
+                      days: [...rotationConfig.days],
+                      startTime: rotationConfig.startTime || '10:00',
+                      endTime: rotationConfig.endTime || '16:00',
+                    } : { days: [], startTime: '10:00', endTime: '16:00' });
+                    setRotationConfigError('');
+                    setIsRotationConfigOpen(true);
+                  };
+
+                  const handleCheckboxChange = (checked: boolean) => {
+                    if (checked) {
+                      openConfigModal();
+                    } else {
+                      setFormData(prev => ({
+                        ...prev,
+                        examRotation: false,
+                      }));
+                      setRotationWarnings([]);
+                      setRotationDistribution([]);
+                    }
+                  };
+
+                  const updateEntriesAndSuppressed = (
+                    nextEntries: RotationScheduleEntry[],
+                    nextSuppressed?: string[],
+                  ) => {
+                    const currentMain = formData.mainSchedule ?? initialFormData.mainSchedule!;
+                    setFormData({
+                      ...formData,
+                      mainSchedule: {
+                        ...currentMain,
+                        rotationEntries: nextEntries,
+                        suppressedRotationDates: nextSuppressed ?? currentMain.suppressedRotationDates ?? [],
+                      },
+                    });
+                    setRotationDistribution(computeDistributionSummary(nextEntries, formData.city, rotationConfig));
+                  };
+
+                  const handleAddEntry = () => {
+                    const id = crypto.randomUUID();
+                    setDraftRotationIds(ids => new Set([...ids, id]));
+                    updateEntriesAndSuppressed([
+                      ...rotationEntries,
+                      { id, date: '', time: rotationConfig?.startTime || '', examiner: '', manual: true },
+                    ]);
+                  };
+
+                  const handleUpdateEntry = (id: string, field: 'date' | 'time' | 'examiner', value: string) => {
+                    if (field === 'date') setDraftRotationIds(ids => new Set([...ids, id]));
+                    const nextEntries = rotationEntries.map(entry => {
+                      if (entry.id !== id) return entry;
+                      const updated: RotationScheduleEntry = { ...entry, [field]: value, manual: true };
+                      if (field === 'date' || field === 'time') {
+                        const ex = examiners.find(e => e.id === updated.examiner);
+                        if (ex && isCalendarDate(updated.date) && isExaminerBlockedOnDateTime(ex.blockedPeriods, updated.date, updated.time).blocked) {
+                          updated.examiner = '';
+                        }
+                      }
+                      return updated;
+                    });
+                    // Se o usuário mudou/reutilizou uma data antes excluída, removê-la das datas suprimidas
+                    const currentSuppressed = formData.mainSchedule?.suppressedRotationDates ?? [];
+                    const nextSuppressed = field === 'date' && isCalendarDate(value)
+                      ? currentSuppressed.filter(d => d !== value)
+                      : currentSuppressed;
+                    updateEntriesAndSuppressed(nextEntries, nextSuppressed);
+                  };
+
+                  const handleDeleteEntry = (entryToRemove: RotationScheduleEntry) => {
+                    const remaining = rotationEntries.filter(e => e.id !== entryToRemove.id);
+                    const currentSuppressed = formData.mainSchedule?.suppressedRotationDates ?? [];
+                    const stillHasDate = isCalendarDate(entryToRemove.date) && remaining.some(e => e.date === entryToRemove.date);
+                    const nextSuppressed = isCalendarDate(entryToRemove.date) && !stillHasDate && !currentSuppressed.includes(entryToRemove.date)
+                      ? [...currentSuppressed, entryToRemove.date].sort()
+                      : currentSuppressed;
+                    updateEntriesAndSuppressed(remaining, nextSuppressed);
+                  };
+
+                  const handleRefreshSchedule = () => {
+                    if (!rotationConfig) return;
+                    setFormData(applyRotationSyncToForm(formData, rotationConfig, { activateMain: true }));
+                  };
+
+                  const distributionToShow = rotationDistribution.length > 0
+                    ? rotationDistribution
+                    : rotationConfig
+                      ? computeDistributionSummary(visibleEntries, formData.city, rotationConfig)
+                      : [];
+
+                  return (
+                    <div className="space-y-4">
+                      <div className="rounded-lg border bg-gray-50 p-4 space-y-3">
+                        <div className="flex flex-wrap items-start justify-between gap-3">
+                          <div>
+                            <label className="flex items-center gap-3 cursor-pointer">
+                              <input
+                                type="checkbox"
+                                checked={formData.examRotation ?? false}
+                                onChange={e => handleCheckboxChange(e.target.checked)}
+                                className="w-4 h-4 text-blue-600"
+                              />
+                              <span className="text-sm font-semibold text-gray-900">Rodízio de Provas</span>
+                            </label>
+                            <p className="text-xs text-gray-500 mt-1 ml-7">
+                              Ao selecionar, configura os dias e faixa de horários, ativa esta escala como Escala Principal (desativando as demais) e gera o cronograma automático para os próximos 30 dias.
+                            </p>
+                          </div>
+
+                          {formData.examRotation && (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <button
+                                type="button"
+                                onClick={openConfigModal}
+                                className="px-3 py-1.5 text-xs font-semibold rounded border border-blue-200 bg-white text-blue-700 hover:bg-blue-50"
+                              >
+                                Configurar Dias e Horários
+                              </button>
+                              {rotationConfig && (
+                                <button
+                                  type="button"
+                                  onClick={handleRefreshSchedule}
+                                  className="px-3 py-1.5 text-xs font-semibold rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 inline-flex items-center gap-1"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                  Atualizar 30 Dias
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {formData.examRotation && rotationConfig && (
+                          <div className="ml-7 flex flex-wrap items-center gap-2 pt-2 border-t border-gray-200 text-xs">
+                            <span className={`px-2 py-0.5 rounded font-bold uppercase text-[10px] ${
+                              formData.mainSchedule?.active && !formData.provisionalSchedule?.active
+                                ? 'bg-green-100 text-green-700'
+                                : 'bg-amber-100 text-amber-700'
+                            }`}>
+                              {formData.mainSchedule?.active && !formData.provisionalSchedule?.active
+                                ? 'Escala Principal Ativa'
+                                : 'Escala Provisória Ativa (Principal em espera)'}
+                            </span>
+                            <span className="text-gray-700">
+                              Dias: <strong>{rotationConfig.days.join(', ')}</strong>
+                            </span>
+                            <span className="text-gray-400">·</span>
+                            <span className="text-gray-700">
+                              Horários: <strong>{rotationConfig.startTime} - {rotationConfig.endTime}</strong>
+                            </span>
+                          </div>
+                        )}
+                      </div>
+
+                      {formData.examRotation && rotationConfig && (
+                        <div className="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+                          <div className="flex flex-wrap items-center justify-between gap-2">
+                            <div>
+                              <h4 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                                <Calendar className="h-4 w-4 text-blue-600" />
+                                Cronograma dos Próximos 30 Dias ({visibleEntries.length})
+                              </h4>
+                              <p className="text-xs text-gray-500">
+                                Atualização contínua: datas passadas são removidas e novas datas futuras são incluídas até completar 30 dias à frente. Você pode editar ou excluir qualquer linha.
+                              </p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={handleAddEntry}
+                              className="text-xs bg-blue-50 text-blue-700 px-3 py-1.5 rounded border border-blue-200 hover:bg-blue-100 font-semibold"
+                            >
+                              + Adicionar Data
+                            </button>
+                          </div>
+
+                          {distributionToShow.length > 0 && (
+                            <div className="bg-slate-50 border border-slate-200 rounded p-2.5 flex flex-wrap items-center gap-2">
+                              <span className="text-[11px] font-bold uppercase text-slate-500 mr-1">Distribuição por examinador:</span>
+                              {distributionToShow.map(item => (
+                                <span key={item.examinerId} className="inline-flex items-center gap-1 text-xs bg-white border border-slate-200 px-2 py-0.5 rounded font-medium text-slate-700">
+                                  <span>{item.examinerName}:</span>
+                                  <strong className="text-blue-700">{item.count}</strong>
+                                </span>
+                              ))}
+                            </div>
+                          )}
+
+                          {rotationWarnings.length > 0 && (
+                            <div className="bg-amber-50 border border-amber-200 rounded p-3 text-xs text-amber-800 space-y-1">
+                              <div className="font-bold flex items-center gap-1.5">
+                                <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0" />
+                                <span>Avisos de validação do rodízio</span>
+                              </div>
+                              <ul className="list-disc pl-5 space-y-0.5">
+                                {rotationWarnings.slice(0, 6).map((w, idx) => (
+                                  <li key={idx}>{w}</li>
+                                ))}
+                                {rotationWarnings.length > 6 && (
+                                  <li>+ {rotationWarnings.length - 6} outros avisos</li>
+                                )}
+                              </ul>
+                            </div>
+                          )}
+
+                          {visibleEntries.length === 0 ? (
+                            <div className="p-6 text-center text-xs text-gray-500 italic border-2 border-dashed rounded-lg bg-gray-50">
+                              Nenhuma data gerada para os próximos 30 dias com os critérios atuais. Verifique a cidade da autoescola, os examinadores cadastrados com rodízio ativo e a faixa de horários.
+                            </div>
+                          ) : (
+                            <div className="space-y-2 max-h-[340px] overflow-y-auto pr-1">
+                              {visibleEntries.map(entry => {
+                                const weekday = isCalendarDate(entry.date) ? scaleWeekday(entry.date) : '';
+                                const sysBlock = entry.date ? isSystemDateBlockedForRotation(entry.date, blockedDates, systemSettings) : { blocked: false };
+                                const exObj = examiners.find(e => e.id === entry.examiner);
+                                const exBlock = exObj && entry.date ? isExaminerBlockedOnDateTime(exObj.blockedPeriods, entry.date, entry.time) : { blocked: false };
+                                const outsideWindow = Boolean(entry.time && isValidScaleTime(entry.time) && !isTimeWithinWindow(entry.time, rotationConfig.startTime, rotationConfig.endTime));
+
+                                return (
+                                  <div
+                                    key={entry.id}
+                                    className={`flex flex-wrap sm:flex-nowrap items-start gap-2 p-2.5 rounded-lg border ${
+                                      sysBlock.blocked || exBlock.blocked
+                                        ? 'border-red-200 bg-red-50/40'
+                                        : 'border-slate-200 bg-white'
+                                    }`}
+                                  >
+                                    <div className="w-[144px] shrink-0">
+                                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">
+                                        Data {weekday ? `(${weekday})` : ''}
+                                      </label>
+                                      <input
+                                        type="date"
+                                        aria-label={`Data da prova ${entry.date ? formatRotationDateBR(entry.date) : entry.id}`}
+                                        className={`w-full border rounded-lg px-2 py-1.5 text-xs focus:ring-2 outline-none ${
+                                          sysBlock.blocked
+                                            ? 'border-red-300 bg-red-50 text-red-700 focus:ring-red-400'
+                                            : 'border-slate-200 bg-white text-gray-900 focus:ring-blue-500'
+                                        }`}
+                                        value={entry.date}
+                                        min={today}
+                                        onChange={e => handleUpdateEntry(entry.id, 'date', e.target.value)}
+                                      />
+                                      {sysBlock.blocked && (
+                                        <p className="text-[10px] text-red-600 font-semibold mt-0.5 leading-tight">
+                                          Bloqueada: {sysBlock.reason}
+                                        </p>
+                                      )}
+                                    </div>
+
+                                    <div className="w-[128px] shrink-0">
+                                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Horário</label>
+                                      <input
+                                        type="time"
+                                        aria-label={`Horário da prova ${entry.date ? formatRotationDateBR(entry.date) : entry.id}`}
+                                        className={`w-full border rounded-lg px-2 py-1.5 text-xs focus:ring-2 outline-none ${
+                                          outsideWindow
+                                            ? 'border-amber-300 bg-amber-50 text-amber-800 focus:ring-amber-400'
+                                            : 'border-slate-200 bg-white text-gray-900 focus:ring-blue-500'
+                                        }`}
+                                        value={entry.time}
+                                        onChange={e => handleUpdateEntry(entry.id, 'time', e.target.value)}
+                                      />
+                                      {outsideWindow && (
+                                        <p className="text-[10px] text-amber-700 font-medium mt-0.5 leading-tight">
+                                          Fora de {rotationConfig.startTime}-{rotationConfig.endTime}
+                                        </p>
+                                      )}
+                                    </div>
+
+                                    <div className="flex-1 min-w-[160px]">
+                                      <label className="text-[10px] font-bold text-slate-500 uppercase tracking-wider block mb-1 flex items-center justify-between">
+                                        <span>Examinador</span>
+                                        <span className={`text-[9px] px-1.5 py-0.2 rounded font-bold ${
+                                          entry.manual ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-600'
+                                        }`}>
+                                          {entry.manual ? 'Editado' : 'Automático'}
+                                        </span>
+                                      </label>
+                                      <select
+                                        aria-label={`Examinador da prova ${entry.date ? formatRotationDateBR(entry.date) : entry.id}`}
+                                        className="w-full border border-slate-200 rounded-lg px-2 py-1.5 text-xs bg-white text-gray-900 focus:ring-2 focus:ring-blue-500 outline-none"
+                                        value={entry.examiner}
+                                        onChange={e => handleUpdateEntry(entry.id, 'examiner', e.target.value)}
+                                      >
+                                        <option value="">Selecione...</option>
+                                        {examiners.map(ex => {
+                                          const blk = entry.date
+                                            ? isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, entry.time)
+                                            : { blocked: false };
+                                          return (
+                                            <option key={ex.id} value={ex.id} disabled={blk.blocked}>
+                                              {blk.blocked ? `🔒 ${ex.name} — ${blk.reason}` : ex.name}
+                                            </option>
+                                          );
+                                        })}
+                                      </select>
+                                      {exBlock.blocked && (
+                                        <p className="text-[10px] text-red-600 font-semibold mt-0.5 leading-tight">
+                                          Afastamento/Férias: {exBlock.reason}
+                                        </p>
+                                      )}
+                                    </div>
+
+                                    <div className="shrink-0 pt-5">
+                                      <button
+                                        type="button"
+                                        onClick={() => handleDeleteEntry(entry)}
+                                        className="p-1.5 text-red-500 hover:text-red-700 hover:bg-red-50 rounded transition-colors"
+                                        title="Excluir data"
+                                        aria-label={`Excluir data ${entry.date ? formatRotationDateBR(entry.date) : entry.id}`}
+                                      >
+                                        <Trash2 className="h-4 w-4" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      )}
+
+                      <div className="rounded border bg-gray-50 p-4">
+                        <label className="flex items-center gap-3 cursor-pointer">
+                          <input
+                            type="checkbox"
+                            checked={formData.cnhBrasilProfile ?? false}
+                            onChange={e => setFormData({ ...formData, cnhBrasilProfile: e.target.checked })}
+                            className="w-4 h-4 text-blue-600"
+                          />
+                          <span className="text-sm font-medium">Perfil CNH do Brasil</span>
+                        </label>
+                        <p className="text-xs text-gray-500 mt-1 ml-7">Quando ativado, esta autoescola utiliza o perfil CNH do Brasil para agendamentos.</p>
+                      </div>
                     </div>
-                    <div className="rounded border bg-gray-50 p-4">
-                      <label className="flex items-center gap-3 cursor-pointer">
-                        <input
-                          type="checkbox"
-                          checked={formData.cnhBrasilProfile ?? false}
-                          onChange={e => setFormData({ ...formData, cnhBrasilProfile: e.target.checked })}
-                          className="w-4 h-4 text-blue-600"
-                        />
-                        <span className="text-sm font-medium">Perfil CNH do Brasil</span>
-                      </label>
-                      <p className="text-xs text-gray-500 mt-1 ml-7">Quando ativado, esta autoescola utiliza o perfil CNH do Brasil para agendamentos.</p>
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
                 {modalTab === 'SCHEDULE_MAIN' && renderScheduleConfig('main')}
                 {modalTab === 'SCHEDULE_PROV' && renderProvisionalScheduleConfig()}
               </form>
@@ -2186,6 +2721,188 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
             <div className="p-6 border-t bg-gray-50 flex justify-end gap-3">
               <button type="button" onClick={() => setIsModalOpen(false)} className="px-4 py-2 text-gray-600 hover:bg-gray-100 rounded">Cancelar</button>
               <button type="submit" form="school-form" className="px-4 py-2 bg-blue-600 text-white rounded hover:bg-blue-700">Salvar</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {isRotationConfigOpen && (
+        <div className="fixed inset-0 bg-black/50 z-[70] flex items-center justify-center p-4">
+          <div className="bg-white rounded-lg shadow-xl max-w-md w-full flex flex-col">
+            <div className="p-5 border-b flex items-center justify-between">
+              <div>
+                <h3 className="text-base font-bold text-gray-900">Configurar Escala Rodízio</h3>
+                <p className="text-xs text-gray-500 mt-0.5">
+                  Defina os dias da semana e o intervalo de horários das provas.
+                </p>
+              </div>
+              <button
+                type="button"
+                aria-label="Fechar configuração de rodízio"
+                onClick={() => setIsRotationConfigOpen(false)}
+                className="text-gray-400 hover:text-gray-600 p-1 rounded"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4">
+              {!formData.city && (
+                <div className="bg-amber-50 border border-amber-200 rounded p-2.5 text-xs text-amber-800">
+                  Selecione a cidade da autoescola na aba <strong>Dados Principais</strong> para que o preenchimento automático encontre os examinadores compatíveis.
+                </div>
+              )}
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Dias da semana com prova
+                </label>
+                <div className="flex flex-wrap gap-2">
+                  {([
+                    ['SEG', 'Seg'],
+                    ['TER', 'Ter'],
+                    ['QUA', 'Qua'],
+                    ['QUI', 'Qui'],
+                    ['SEX', 'Sex'],
+                    ['SAB', 'Sáb'],
+                  ] as const).map(([dayKey, label]) => {
+                    const selected = rotationConfigDraft.days.includes(dayKey);
+                    return (
+                      <label
+                        key={dayKey}
+                        className={`flex items-center gap-2 px-3 py-2 rounded border cursor-pointer text-xs font-semibold transition-colors ${
+                          selected
+                            ? 'bg-blue-600 text-white border-blue-600'
+                            : 'bg-white text-gray-700 border-gray-300 hover:bg-blue-50'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          className="sr-only"
+                          checked={selected}
+                          onChange={e => {
+                            setRotationConfigError('');
+                            setRotationConfigDraft(prev => ({
+                              ...prev,
+                              days: e.target.checked
+                                ? [...prev.days, dayKey]
+                                : prev.days.filter(d => d !== dayKey),
+                            }));
+                          }}
+                        />
+                        {label}
+                      </label>
+                    );
+                  })}
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-2">
+                  Entre quais horários (ex.: 10:00 - 16:00)
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label htmlFor="rotation-start-time" className="block text-xs text-gray-500 mb-1">
+                      Horário inicial
+                    </label>
+                    <input
+                      id="rotation-start-time"
+                      type="time"
+                      className="w-full border rounded p-2 text-sm bg-white text-gray-900"
+                      value={rotationConfigDraft.startTime}
+                      onChange={e => {
+                        setRotationConfigError('');
+                        setRotationConfigDraft(prev => ({ ...prev, startTime: e.target.value }));
+                      }}
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="rotation-end-time" className="block text-xs text-gray-500 mb-1">
+                      Horário final
+                    </label>
+                    <input
+                      id="rotation-end-time"
+                      type="time"
+                      className="w-full border rounded p-2 text-sm bg-white text-gray-900"
+                      value={rotationConfigDraft.endTime}
+                      onChange={e => {
+                        setRotationConfigError('');
+                        setRotationConfigDraft(prev => ({ ...prev, endTime: e.target.value }));
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+
+              {formData.city && rotationConfigDraft.days.length > 0 && isValidScaleTime(rotationConfigDraft.startTime) && isValidScaleTime(rotationConfigDraft.endTime) && normalizeScaleTime(rotationConfigDraft.startTime) <= normalizeScaleTime(rotationConfigDraft.endTime) && (() => {
+                const check = findEligibleExaminersForSchool({
+                  schoolCity: formData.city,
+                  config: {
+                    days: rotationConfigDraft.days,
+                    startTime: normalizeScaleTime(rotationConfigDraft.startTime),
+                    endTime: normalizeScaleTime(rotationConfigDraft.endTime),
+                  },
+                  examiners,
+                  cities,
+                });
+                return check.eligible.length > 0 ? (
+                  <div className="bg-green-50 border border-green-200 rounded p-2.5 text-xs text-green-800">
+                    ✓ {check.eligible.length} examinador(es) elegível(is) encontrado(s) para {formData.city}:{' '}
+                    <strong>{check.eligible.map(e => e.name).join(', ')}</strong>
+                  </div>
+                ) : (
+                  <div className="bg-amber-50 border border-amber-200 rounded p-2.5 text-xs text-amber-800">
+                    {check.issue}
+                  </div>
+                );
+              })()}
+
+              {rotationConfigError && (
+                <p className="text-xs text-red-600 font-medium">{rotationConfigError}</p>
+              )}
+            </div>
+
+            <div className="p-4 border-t bg-gray-50 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setIsRotationConfigOpen(false)}
+                className="px-4 py-2 text-sm text-gray-600 hover:bg-gray-100 rounded"
+              >
+                Cancelar
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  const start = normalizeScaleTime(rotationConfigDraft.startTime);
+                  const end = normalizeScaleTime(rotationConfigDraft.endTime);
+                  if (rotationConfigDraft.days.length === 0) {
+                    setRotationConfigError('Selecione ao menos um dia da semana.');
+                    return;
+                  }
+                  if (!isValidScaleTime(start) || !isValidScaleTime(end)) {
+                    setRotationConfigError('Informe o horário inicial e o horário final.');
+                    return;
+                  }
+                  if (start > end) {
+                    setRotationConfigError('O horário inicial não pode ser maior que o horário final.');
+                    return;
+                  }
+                  const normalizedConfig: RotationConfig = {
+                    days: [...rotationConfigDraft.days],
+                    startTime: start,
+                    endTime: end,
+                  };
+                  setFormData(prev => applyRotationSyncToForm(prev, normalizedConfig, {
+                    forceRebalanceAuto: true,
+                    activateMain: true,
+                  }));
+                  setIsRotationConfigOpen(false);
+                }}
+                className="px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded hover:bg-blue-700"
+              >
+                Confirmar e Gerar Cronograma
+              </button>
             </div>
           </div>
         </div>

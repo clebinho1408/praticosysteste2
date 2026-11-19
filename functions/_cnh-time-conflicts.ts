@@ -9,10 +9,12 @@ type Scale = {
   days?: string[];
   slots?: { day?: string; time?: string }[];
   specificDates?: { date?: string; time?: string }[];
+  rotationEntries?: { date?: string; time?: string }[];
   pausedDates?: string[];
 };
 type School = {
   id?: string; name?: string | null; cnhBrasilProfile?: boolean | null;
+  examRotation?: boolean | null;
   mainSchedule?: Scale | null; provisionalSchedule?: Scale | null;
 };
 type Entry = { day: string; time: string; date?: string };
@@ -32,7 +34,14 @@ export function cnhBancaConflict(candidate: Banca, existing: Banca[]): string | 
   return other ? `Já existe uma banca CNH do Brasil${other.code ? ` (${other.code})` : ''} em ${dateBR(date)} às ${time}. Escolha outra data ou horário, mesmo que o examinador seja diferente.` : null;
 }
 
-function mainEntries(schedule?: Scale | null): Entry[] {
+function mainEntries(schedule?: Scale | null, today = businessDate(), isRotation = false): Entry[] {
+  if (isRotation && Array.isArray(schedule?.rotationEntries) && schedule.rotationEntries.length > 0) {
+    return schedule.rotationEntries.flatMap(entry => {
+      const date = dateOnly(entry.date);
+      return isCalendarDate(date) && date >= today && timeOnly(entry.time)
+        ? [{ date, time: timeOnly(entry.time), day: days[new Date(`${date}T12:00:00Z`).getUTCDay()] }] : [];
+    });
+  }
   return (schedule?.slots || []).flatMap(slot =>
     (slot.day ? [slot.day].filter(day => schedule?.days?.includes(day)) : schedule?.days || [])
       .filter(day => days.includes(day) && timeOnly(slot.time))
@@ -66,7 +75,7 @@ function when(entry: Entry): string {
  */
 export function cnhSchoolScaleConflict(candidate: School, existing: School[], today = businessDate()): string | null {
   if (!candidate.cnhBrasilProfile) return null;
-  const main = mainEntries(candidate.mainSchedule);
+  const main = mainEntries(candidate.mainSchedule, today, Boolean(candidate.examRotation));
   const prov = provisionalEntries(candidate.provisionalSchedule, today);
   for (const [entries, label] of [[main, 'Principal'], [prov, 'Provisória']] as const) {
     const repeated = entries.find((entry, index) =>
@@ -75,7 +84,7 @@ export function cnhSchoolScaleConflict(candidate: School, existing: School[], to
   }
   for (const other of existing) {
     if (!other.cnhBrasilProfile || other.id === candidate.id) continue;
-    const otherMain = mainEntries(other.mainSchedule);
+    const otherMain = mainEntries(other.mainSchedule, today, Boolean(other.examRotation));
     const otherProv = provisionalEntries(other.provisionalSchedule, today);
     for (const [ownEntries, otherEntries, ownMain, comparedMain] of [
       [main, otherMain, candidate.mainSchedule, other.mainSchedule],

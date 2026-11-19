@@ -1,7 +1,12 @@
 import { Router } from "express";
 import { UpdateExamRequestBody } from "@workspace/api-zod";
 // @ts-ignore Shared calendar policy, also bundled into Cloudflare and the frontend.
-import { mainSchedulePaused, schoolPauseValidation } from "../../../../functions/_school-schedule.js";
+import {
+  normalizeScaleTime,
+  resolveSchoolScaleForDate,
+  scaleWeekday,
+  schoolPauseValidation,
+} from "../../../../functions/_school-schedule.js";
 // @ts-ignore Shared CNH time-conflict policy.
 import { cnhBancaConflict, cnhSchoolScaleConflict } from "../../../../functions/_cnh-time-conflicts.js";
 import { db } from "@workspace/db";
@@ -1242,19 +1247,56 @@ router.post("/schedule-slots", async (req, res) => {
       const school = (await db.select().from(drivingSchools)
         .where(eq(drivingSchools.id, schoolId)).limit(1))[0];
       if (!school) return res.status(404).json({ error: "Autoescola não encontrada." });
-      if (mainSchedulePaused(school, date)) {
+      const resolved = resolveSchoolScaleForDate(school, date);
+      if (resolved.kind === "PAUSED") {
         return res.status(409).json({ error: "Escala Principal pausada nesta data. Consulte a data novamente." });
       }
-      const day = ["DOM", "SEG", "TER", "QUA", "QUI", "SEX", "SAB"][new Date(`${date}T00:00:00`).getDay()];
-      const schedule = school.provisionalSchedule?.active ? school.provisionalSchedule :
-        school.mainSchedule?.active ? school.mainSchedule : null;
-      const configured = schedule?.days?.includes(day)
-        ? (schedule.slots ?? []).filter((s: any) => !s.day || s.day === day) : [];
+      const day = scaleWeekday(date);
+
+      if (resolved.kind === "PROVISIONAL_DATES" || resolved.kind === "ROTATION_DATES") {
+        const configuredEntries = resolved.kind === "PROVISIONAL_DATES" ? resolved.specificDates : resolved.entries;
+        const mismatchMsg = resolved.kind === "PROVISIONAL_DATES"
+          ? "A escala provisória mudou. Consulte a data novamente."
+          : "A escala rodízio mudou. Consulte a data novamente.";
+        if (!configuredEntries.length || configuredEntries.length !== slots.length) {
+          return res.status(409).json({ error: mismatchMsg });
+        }
+        const ordered = (items: string[]) => [...items].sort().join("|");
+        if (ordered(configuredEntries.map((d: any) => `${d.examiner}:${d.time}`)) !==
+          ordered(slots.map((s: any) => `${s.examinerId}:${s.scheduledTime}`))) {
+          return res.status(409).json({ error: mismatchMsg });
+        }
+        const existing = await db.select().from(cfcScheduleSlots).where(and(
+          eq(cfcScheduleSlots.schoolId, schoolId), eq(cfcScheduleSlots.scheduledDate, date),
+          eq(cfcScheduleSlots.requestType, "FIXA")));
+        if (existing.some(s => s.status !== "CANCELLED")) {
+          return res.status(409).json({ error: "Esta autoescola já possui uma escala fixa nesta data." });
+        }
+        for (const examinerId of new Set<string>(slots.map((s: any) => s.examinerId))) {
+          const booked = await db.select().from(cfcScheduleSlots).where(and(
+            eq(cfcScheduleSlots.examinerId, examinerId), eq(cfcScheduleSlots.scheduledDate, date)));
+          const active = booked.filter(s => s.status !== "CANCELLED");
+          const assigned = slots.filter((s: any) => s.examinerId === examinerId);
+          if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
+            return res.status(409).json({ error: "O examinador já possui prova nesse horário." });
+          }
+        }
+        const created = await db.insert(cfcScheduleSlots).values(slots.map((s: any, index: number) => ({
+          id: `auto-fixed:${schoolId}:${date}:${existing.length}:${index}`,
+          schoolId, scheduledDate: date, scheduledTime: s.scheduledTime, examinerId: s.examinerId,
+          examType: "COMMON", requestType: "FIXA", intendedCategory: "A,B",
+          status: "SCHEDULED", attendanceConfirmed: true, observation: "",
+          createdAt: new Date(), updatedAt: new Date(),
+        }))).returning();
+        return res.json(created);
+      }
+
+      const configured = resolved.kind === "WEEKLY_SLOTS" ? resolved.slots : [];
       if (!configured.length || configured.length !== slots.length) {
         return res.status(409).json({ error: "A escala da autoescola mudou. Consulte a data novamente." });
       }
       if (!school.examRotation) {
-        const ordered = (items: string[]) => items.sort().join("|");
+        const ordered = (items: string[]) => [...items].sort().join("|");
         if (ordered(configured.map((s: any) => `${s.examiner}:${s.time}`)) !==
           ordered(slots.map((s: any) => `${s.examinerId}:${s.scheduledTime}`))) {
           return res.status(409).json({ error: "Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa." });
@@ -1283,8 +1325,9 @@ router.post("/schedule-slots", async (req, res) => {
         if (school.examRotation) {
           const examiner = examinerRows[0];
           const availability = examiner?.rotationAvailability;
-          const times = availability?.examsPerDay === 2
-            ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime];
+          const times = (availability?.examsPerDay === 2
+            ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime])
+            .map(t => normalizeScaleTime(t));
           if (!examiner?.examRotation || examiner.canExamCommon === false ||
             !availability?.days?.includes(day) || !availability.cityIds?.includes(city!.id) ||
             ![1, 2].includes(availability.examsPerDay) ||
@@ -1294,7 +1337,7 @@ router.post("/schedule-slots", async (req, res) => {
         }
         const capacity = examinerRows[0]?.examRotation
           ? examinerRows[0].rotationAvailability?.examsPerDay : null;
-        if (assigned.some((s: any) => active.some(b => b.scheduledTime === s.scheduledTime)) ||
+        if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime)) ||
           (capacity && active.length + assigned.length > capacity)) {
           return res.status(409).json({ error: "O examinador já possui prova nesse horário ou atingiu a capacidade diária." });
         }

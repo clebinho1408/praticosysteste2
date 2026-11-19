@@ -441,7 +441,9 @@ export async function runMigrations() {
     await db.execute(sql`ALTER TABLE examinadores ADD COLUMN IF NOT EXISTS disponibilidade_rodizio jsonb`);
     await db.execute(sql`ALTER TABLE vagas_cfc ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb`);
     await db.execute(sql`ALTER TABLE vagas_pcd ADD COLUMN IF NOT EXISTS quantidades_categoria jsonb`);
-    await db.execute(sql.raw(PII_V3_NEON_SQL));
+    for (const stmt of PII_V3_NEON_SQL.split(';').map(s => s.trim()).filter(Boolean)) {
+      await db.execute(sql.raw(stmt));
+    }
 
     logger.info("DB migrations complete");
   } catch (err) {

@@ -64,6 +64,20 @@ export interface ScheduleSpecificDate {
   examiner: string; // examiner id
 }
 
+export interface RotationConfig {
+  days: string[];      // ['SEG', 'TER', ...]
+  startTime: string;   // 'HH:mm'
+  endTime: string;     // 'HH:mm'
+}
+
+export interface RotationScheduleEntry {
+  id: string;
+  date: string;      // 'YYYY-MM-DD'
+  time: string;      // 'HH:mm'
+  examiner: string;  // examiner id
+  manual?: boolean;  // true if manually edited or added
+}
+
 export interface SchoolSchedule {
   frequency: '1_WEEK' | '2_WEEK' | '3_WEEK' | '2_DAY' | '15_DAYS';
   days: string[]; // ['SEG', 'TER', ...]
@@ -72,6 +86,9 @@ export interface SchoolSchedule {
   pausedDates?: string[]; // Main schedule only: whole-day exceptions, without toggling active.
   specificDates?: ScheduleSpecificDate[]; // used by provisional schedule
   activateFrom?: string; // 'YYYY-MM-DD' — provisional: auto-activate on this date (undefined = manual only)
+  rotationConfig?: RotationConfig | null;
+  rotationEntries?: RotationScheduleEntry[] | null;
+  suppressedRotationDates?: string[] | null;
 }
 
 export type SchoolYardType = 'MOTO' | 'CARRO' | 'MUDANCA';
