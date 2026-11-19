@@ -7,6 +7,7 @@ import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatc
 import { extraEditError, extraPatch } from '../_cfc-extra.js';
 import { interestError, interestPatch } from '../_cfc-interest.js';
 import { modalityValidationError } from '../_cnh-exam-modality.js';
+import { coerceOptionalTimestamp } from '../_request-timestamps.js';
 import { UpdateExamRequestBody } from '../../lib/api-zod/src/generated/api.js';
 import { computeCpfHmac, decryptRequestPiiSafe, encryptRequestPii, maskCpf } from '../../db/pii-crypto.js';
 
@@ -128,6 +129,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const filtered = filterFields(body);
       if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
       if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
+      if (filtered.queueUpdatedAt !== undefined) {
+        filtered.queueUpdatedAt = coerceOptionalTimestamp(filtered.queueUpdatedAt);
+      }
       if (filtered.modulo !== 'CFC') {
         filtered.studentName = filtered.studentName || null;
         filtered.phone = filtered.phone || null;
@@ -164,8 +168,8 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const { id, updatedAt, createdAt, ...rawUpdates } = body;
       const filtered = filterFields(rawUpdates);
       if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
-      if (filtered.queueUpdatedAt && typeof filtered.queueUpdatedAt === 'string') {
-        filtered.queueUpdatedAt = new Date(filtered.queueUpdatedAt);
+      if (filtered.queueUpdatedAt !== undefined) {
+        filtered.queueUpdatedAt = coerceOptionalTimestamp(filtered.queueUpdatedAt);
       }
 
       // Encontra registro atual (camelCase via ORM)
@@ -258,7 +262,16 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         // Módulo mudou: mover linha atomicamente para a tabela destino
         // Merge camelCase (ORM) + incoming updates + modulo correto
         const mergedPlain = stripDroppedFields(
-          { ...found?.row, ...filtered, modulo: newModulo, updatedAt: new Date() },
+          {
+            ...found?.row,
+            ...filtered,
+            modulo: newModulo,
+            createdAt: coerceOptionalTimestamp(found?.row?.createdAt) ?? new Date(),
+            queueUpdatedAt: coerceOptionalTimestamp(
+              filtered.queueUpdatedAt !== undefined ? filtered.queueUpdatedAt : found?.row?.queueUpdatedAt,
+            ) ?? null,
+            updatedAt: new Date(),
+          },
           newModulo
         );
         const mergedToSave = newModulo === 'CFC'

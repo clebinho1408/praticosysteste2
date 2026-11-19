@@ -702,6 +702,7 @@ router.delete("/schedules", async (req, res) => {
 
 // ─── REQUESTS ─────────────────────────────────────────────────────────────────
 import { modalityValidationError } from "../../../../functions/_cnh-exam-modality.js";
+import { coerceOptionalTimestamp } from "../../../../functions/_request-timestamps.js";
 const ALLOWED_REQ_FIELDS = [
   "id", "studentName", "socialName", "cpf", "phone", "email", "address", "city",
   "requestType", "examType", "intendedCategory", "source", "schoolId",
@@ -823,6 +824,9 @@ router.post("/requests", async (req, res) => {
     for (const k of ALLOWED_REQ_FIELDS) { if (body[k] !== undefined) filtered[k] = body[k]; }
     if (!filtered.modulo) filtered.modulo = deriveModulo(filtered);
     if (filtered.paidFee !== undefined && filtered.taxaPaga === undefined) filtered.taxaPaga = filtered.paidFee;
+    if (filtered.queueUpdatedAt !== undefined) {
+      filtered.queueUpdatedAt = coerceOptionalTimestamp(filtered.queueUpdatedAt);
+    }
     const stripped = stripDroppedFields(filtered, filtered.modulo);
     const valuesToSave = stripped.modulo === "CFC"
       ? stripped
@@ -870,6 +874,9 @@ router.put("/requests", async (req, res) => {
     const updates: any = {};
     for (const k of ALLOWED_REQ_FIELDS) { if (rawUpdates[k] !== undefined) updates[k] = rawUpdates[k]; }
     if (updates.paidFee !== undefined && updates.taxaPaga === undefined) updates.taxaPaga = updates.paidFee;
+    if (updates.queueUpdatedAt !== undefined) {
+      updates.queueUpdatedAt = coerceOptionalTimestamp(updates.queueUpdatedAt);
+    }
     updates.updatedAt = new Date();
 
     // Busca registro para saber qual tabela atualizar e para auditoria
@@ -920,8 +927,11 @@ router.put("/requests", async (req, res) => {
       rawUpdates.result !== undefined &&
       Array.isArray(rawUpdates.examHistory);
     const isCurrentlyScheduled = found?.row?.status === "SCHEDULED";
+    // Supervisor pode remover candidatos da banca no módulo CNH Brasil
+    const isCnhBrasil = (found?.modulo ?? deriveModulo(rawUpdates)) === "CNH_BRASIL";
     if (
       (req as any).sessionUser?.role === "SUPERVISOR" &&
+      !isCnhBrasil &&
       (
         rawUpdates.scheduleId === null ||
         (
@@ -959,7 +969,16 @@ router.put("/requests", async (req, res) => {
       // Módulo mudou: mover linha atomicamente para a tabela destino
       // Merge do registro antigo (camelCase do ORM) com as atualizações
       const mergedPlain = stripDroppedFields(
-        { ...found?.row, ...updates, modulo: newModulo, updatedAt: new Date() },
+        {
+          ...found?.row,
+          ...updates,
+          modulo: newModulo,
+          createdAt: coerceOptionalTimestamp(found?.row?.createdAt) ?? new Date(),
+          queueUpdatedAt: coerceOptionalTimestamp(
+            updates.queueUpdatedAt !== undefined ? updates.queueUpdatedAt : found?.row?.queueUpdatedAt,
+          ) ?? null,
+          updatedAt: new Date(),
+        },
         newModulo
       );
       const mergedToSave = newModulo === "CFC"
