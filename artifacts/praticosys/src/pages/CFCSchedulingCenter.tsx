@@ -17,7 +17,7 @@ import {
 } from '../types';
 import { fixedScaleDay, planFixedScales, rotationCandidates } from '../lib/cfcFixedRotation';
 import { businessDate, resolveSchoolScaleForDate } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule } from '../../../../functions/_school-rotation';
+import { syncAllSchoolsRotationSchedules } from '../../../../functions/_school-rotation';
 import type { FixedCommitment } from '../lib/cfcFixedRotation';
 import { isDateBlocked, isDateInPast } from '../lib/dateBlocking';
 import { examinerCoversRequest } from '../../../../functions/_cfc-interest';
@@ -1097,31 +1097,13 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
           (user.role === UserRole.SUPERVISOR && !!user.allowedModules?.includes('cadastro') && !!user.allowedCadastroTabs?.includes('autoescolas'));
         if (canPersistSchoolSync) {
           const todayStr = businessDate();
-          const rotationUpdates: { id: string; mainSchedule: any }[] = [];
-          const syncedSchools = currentSchools.map(s => {
-            if (!s.examRotation || !s.mainSchedule?.active || !s.mainSchedule.rotationConfig || s.provisionalSchedule?.active) {
-              return s;
-            }
-            const synced = syncRollingRotationSchedule({
-              schoolCity: s.city,
-              config: s.mainSchedule.rotationConfig,
-              existingEntries: s.mainSchedule.rotationEntries ?? [],
-              suppressedDates: s.mainSchedule.suppressedRotationDates ?? [],
-              pausedDates: s.mainSchedule.pausedDates ?? [],
-              examiners: currentExaminers,
-              cities: currentCities,
-              blockedDates: currentBlockedDates,
-              systemSettings: currentSettings,
-              today: todayStr,
-            });
-            if (!synced.changed) return s;
-            const updatedMain = {
-              ...s.mainSchedule,
-              rotationEntries: synced.entries,
-              suppressedRotationDates: synced.suppressedDates,
-            };
-            rotationUpdates.push({ id: s.id, mainSchedule: updatedMain });
-            return { ...s, mainSchedule: updatedMain };
+          const { schools: syncedSchools, updates: rotationUpdates } = syncAllSchoolsRotationSchedules({
+            schools: currentSchools,
+            examiners: currentExaminers,
+            cities: currentCities,
+            blockedDates: currentBlockedDates,
+            systemSettings: currentSettings,
+            today: todayStr,
           });
           if (rotationUpdates.length > 0) {
             await Promise.all(

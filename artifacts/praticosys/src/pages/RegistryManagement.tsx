@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, shuffleRotationSchedule, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -831,33 +831,16 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
       schools = await api.getSchoolsAsync();
     }
 
-    // ── Auto-rolling 30-day Escala Rodízio: remove datas passadas e completa próximas ──
-    const rotationUpdates: { id: string; mainSchedule: SchoolSchedule }[] = [];
-    schools = schools.map(s => {
-      if (!s.examRotation || !s.mainSchedule?.active || !s.mainSchedule.rotationConfig || s.provisionalSchedule?.active) {
-        return s;
-      }
-      const synced = syncRollingRotationSchedule({
-        schoolCity: s.city,
-        config: s.mainSchedule.rotationConfig,
-        existingEntries: s.mainSchedule.rotationEntries ?? [],
-        suppressedDates: s.mainSchedule.suppressedRotationDates ?? [],
-        pausedDates: s.mainSchedule.pausedDates ?? [],
-        examiners: examinersData,
-        cities: citiesData,
-        blockedDates: bdData,
-        systemSettings: settingsData,
-        today: todayStr,
-      });
-      if (!synced.changed) return s;
-      const updatedMain: SchoolSchedule = {
-        ...s.mainSchedule,
-        rotationEntries: synced.entries,
-        suppressedRotationDates: synced.suppressedDates,
-      };
-      rotationUpdates.push({ id: s.id, mainSchedule: updatedMain });
-      return { ...s, mainSchedule: updatedMain };
+    // ── Auto-rolling 30-day Escala Rodízio: remove datas passadas e completa próximas evitando repetir examinador na mesma semana entre autoescolas ──
+    const { schools: syncedSchools, updates: rotationUpdates } = syncAllSchoolsRotationSchedules({
+      schools,
+      examiners: examinersData,
+      cities: citiesData,
+      blockedDates: bdData,
+      systemSettings: settingsData,
+      today: todayStr,
     });
+    schools = syncedSchools;
 
     if (rotationUpdates.length > 0 && user?.role !== UserRole.CONSULTANT) {
       await Promise.all(
@@ -910,6 +893,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
       bdList?: BlockedDate[];
       settings?: SystemSettings | null;
       todayStr?: string;
+      otherSchoolsList?: DrivingSchool[];
     },
   ) => {
     const exList = options?.exList ?? examiners;
@@ -917,13 +901,17 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
     const bdList = options?.bdList ?? blockedDates;
     const settings = options?.settings ?? systemSettings;
     const todayStr = options?.todayStr ?? businessDate();
+    const otherSchoolsList = options?.otherSchoolsList ?? schools;
+    const currentSchoolId = targetForm.id ?? editing?.id ?? null;
     const currentMain = targetForm.mainSchedule ?? initialFormData.mainSchedule!;
     const synced = syncRollingRotationSchedule({
+      currentSchoolId,
       schoolCity: targetForm.city,
       config,
       existingEntries: currentMain.rotationEntries ?? [],
       suppressedDates: currentMain.suppressedRotationDates ?? [],
       pausedDates: currentMain.pausedDates ?? [],
+      otherSchools: otherSchoolsList,
       examiners: exList,
       cities: cityList,
       blockedDates: bdList,
@@ -2418,7 +2406,13 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     const nextEntries = rotationEntries.map(entry => {
                       if (entry.id !== id) return entry;
                       const updated: RotationScheduleEntry = { ...entry, [field]: value, manual: true };
-                      if (field === 'date' || field === 'time') {
+                      if (field === 'examiner') {
+                        const ex = examiners.find(e => e.id === value);
+                        const defaultTime = ex ? resolveExaminerDefaultRotationTime(ex, rotationConfig, updated.date) : null;
+                        if (defaultTime) {
+                          updated.time = defaultTime;
+                        }
+                      } else if (field === 'date' || field === 'time') {
                         const ex = examiners.find(e => e.id === updated.examiner);
                         if (ex && isCalendarDate(updated.date) && isExaminerBlockedOnDateTime(ex.blockedPeriods, updated.date, updated.time).blocked) {
                           updated.examiner = '';
@@ -2446,18 +2440,23 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
 
                   const handleRefreshSchedule = () => {
                     if (!rotationConfig) return;
-                    setFormData(applyRotationSyncToForm(formData, rotationConfig, { activateMain: true }));
+                    setFormData(applyRotationSyncToForm(formData, rotationConfig, {
+                      forceRebalanceAuto: true,
+                      activateMain: true,
+                    }));
                   };
 
                   const handleShuffleSchedule = () => {
                     if (!rotationConfig) return;
                     const currentMain = formData.mainSchedule ?? initialFormData.mainSchedule!;
                     const shuffled = shuffleRotationSchedule({
+                      currentSchoolId: formData.id ?? editing?.id ?? null,
                       schoolCity: formData.city,
                       config: rotationConfig,
                       existingEntries: currentMain.rotationEntries ?? [],
                       suppressedDates: currentMain.suppressedRotationDates ?? [],
                       pausedDates: currentMain.pausedDates ?? [],
+                      otherSchools: schools,
                       examiners,
                       cities,
                       blockedDates,
@@ -2621,14 +2620,24 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                             </div>
                           ) : (
                             <div className="space-y-2 max-h-[340px] overflow-y-auto pr-1">
-                              {visibleEntries.map(entry => {
-                                const weekday = isCalendarDate(entry.date) ? scaleWeekday(entry.date) : '';
-                                const sysBlock = entry.date ? isSystemDateBlockedForRotation(entry.date, blockedDates, systemSettings) : { blocked: false };
-                                const exObj = examiners.find(e => e.id === entry.examiner);
-                                const exBlock = exObj && entry.date ? isExaminerBlockedOnDateTime(exObj.blockedPeriods, entry.date, entry.time) : { blocked: false };
-                                const outsideWindow = Boolean(entry.time && isValidScaleTime(entry.time) && !isTimeWithinWindow(entry.time, rotationConfig.startTime, rotationConfig.endTime));
+                              {(() => {
+                                const crossRepeatsByEntryId = new Map(
+                                  findCrossSchoolWeeklyRepeats({
+                                    entries: visibleEntries,
+                                    otherSchools: schools,
+                                    currentSchoolId: formData.id ?? editing?.id ?? null,
+                                    today,
+                                  }).map(r => [r.entryId, r]),
+                                );
+                                return visibleEntries.map(entry => {
+                                  const weekday = isCalendarDate(entry.date) ? scaleWeekday(entry.date) : '';
+                                  const sysBlock = entry.date ? isSystemDateBlockedForRotation(entry.date, blockedDates, systemSettings) : { blocked: false };
+                                  const exObj = examiners.find(e => e.id === entry.examiner);
+                                  const exBlock = exObj && entry.date ? isExaminerBlockedOnDateTime(exObj.blockedPeriods, entry.date, entry.time) : { blocked: false };
+                                  const outsideWindow = Boolean(entry.time && isValidScaleTime(entry.time) && !isTimeWithinWindow(entry.time, rotationConfig.startTime, rotationConfig.endTime));
+                                  const crossRepeat = crossRepeatsByEntryId.get(entry.id);
 
-                                return (
+                                  return (
                                   <div
                                     key={entry.id}
                                     className={`flex flex-wrap sm:flex-nowrap items-start gap-2 p-2.5 rounded-lg border ${
@@ -2712,6 +2721,11 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                           Afastamento/Férias: {exBlock.reason}
                                         </p>
                                       )}
+                                      {!exBlock.blocked && crossRepeat && (
+                                        <p className="text-[10px] text-amber-700 font-medium mt-0.5 leading-tight">
+                                          Mesma semana em: {crossRepeat.otherSchoolNames.join(', ')}
+                                        </p>
+                                      )}
                                     </div>
 
                                     <div className="shrink-0 pt-5">
@@ -2727,7 +2741,8 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                     </div>
                                   </div>
                                 );
-                              })}
+                                });
+                              })()}
                             </div>
                           )}
                         </div>

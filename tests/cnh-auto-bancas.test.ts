@@ -131,7 +131,23 @@ test('creates bancas 2 by 2 in date sequence with exact rotation examiner, time,
   const plan = planCnhRotationBancas({
     schools: [
       makeSchool(),
-      makeSchool({ id: 'school-no-cnh', name: 'APENAS CFC', cnhBrasilProfile: false }),
+      makeSchool({
+        id: 'school-no-cnh',
+        name: 'APENAS CFC',
+        city: 'BALNEARIO',
+        cnhBrasilProfile: false,
+        mainSchedule: {
+          active: true,
+          days: ['TER', 'QUI'],
+          slots: [],
+          pausedDates: [],
+          rotationConfig: { days: ['TER', 'QUI'], startTime: '08:00', endTime: '12:00' },
+          rotationEntries: [
+            { id: 'cfc-1', date: '2026-11-24', time: '09:00', examiner: 'ex-ter' },
+          ],
+          suppressedRotationDates: [],
+        },
+      }),
     ],
     schedules: [],
     examiners,

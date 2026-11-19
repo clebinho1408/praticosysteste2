@@ -158,6 +158,39 @@ export function getExaminerRotationTimesInWindow(
   return [...unique];
 }
 
+export function resolveExaminerDefaultRotationTime(
+  examiner: RotationExaminerLike | null | undefined,
+  config?: RotationConfig | null,
+  date?: string,
+): string | null {
+  const av = examiner?.rotationAvailability;
+  if (!av) return null;
+
+  const rawCandidates = av.examsPerDay === 2
+    ? [av.defaultTime, av.secondDefaultTime ?? '']
+    : [av.defaultTime];
+  const allValid: string[] = [];
+  for (const raw of rawCandidates) {
+    const t = normalizeScaleTime(raw);
+    if (isValidScaleTime(t) && !allValid.includes(t)) {
+      allValid.push(t);
+    }
+  }
+  if (allValid.length === 0) return null;
+
+  const inWindow = config ? getExaminerRotationTimesInWindow(examiner!, config) : [];
+  const pool = inWindow.length > 0 ? inWindow : allValid;
+
+  if (date && isCalendarDate(date)) {
+    const unblocked = pool.find(
+      t => !isExaminerBlockedOnDateTime(examiner?.blockedPeriods, date, t).blocked,
+    );
+    if (unblocked) return unblocked;
+  }
+
+  return pool[0];
+}
+
 export function findEligibleExaminersForSchool(input: {
   schoolCity?: string | null;
   config: RotationConfig;
@@ -194,12 +227,229 @@ export function findEligibleExaminersForSchool(input: {
   return { cityId, eligible };
 }
 
+export interface OtherSchoolRotationLike {
+  id: string;
+  name?: string;
+  city?: string | null;
+  examRotation?: boolean | null;
+  mainSchedule?: {
+    active?: boolean | null;
+    rotationConfig?: RotationConfig | null;
+    rotationEntries?: RotationScheduleEntry[] | null;
+    suppressedRotationDates?: string[] | null;
+    pausedDates?: string[] | null;
+    [key: string]: any;
+  } | null;
+  provisionalSchedule?: {
+    active?: boolean | null;
+    [key: string]: any;
+  } | null;
+}
+
+export function isActiveRotationSchool(school: OtherSchoolRotationLike | null | undefined): boolean {
+  return Boolean(
+    school &&
+      school.examRotation &&
+      school.mainSchedule?.active &&
+      school.mainSchedule?.rotationConfig &&
+      !school.provisionalSchedule?.active,
+  );
+}
+
+/** Retorna a segunda-feira (YYYY-MM-DD) que inicia a semana (SEG..DOM) da data informada. */
+export function getRotationWeekKey(date: string): string {
+  if (!isCalendarDate(date)) return '';
+  const dt = new Date(`${date}T12:00:00Z`);
+  const day = dt.getUTCDay(); // 0=DOM, 1=SEG, ..., 6=SAB
+  const diffToMonday = day === 0 ? -6 : 1 - day;
+  return addCalendarDays(date, diffToMonday);
+}
+
+interface CrossSchoolUsageIndex {
+  weekSchoolSets: Map<string, Set<string>>;
+  weekTotalCounts: Map<string, number>;
+  weekSchoolNames: Map<string, Map<string, string>>;
+  dateCounts: Map<string, number>;
+  dateTimeCounts: Map<string, number>;
+}
+
+function buildCrossSchoolUsageIndex(
+  otherSchools: OtherSchoolRotationLike[] | null | undefined,
+  currentSchoolId?: string | null,
+  today?: string,
+): CrossSchoolUsageIndex {
+  const weekSchoolSets = new Map<string, Set<string>>();
+  const weekTotalCounts = new Map<string, number>();
+  const weekSchoolNames = new Map<string, Map<string, string>>();
+  const dateCounts = new Map<string, number>();
+  const dateTimeCounts = new Map<string, number>();
+
+  if (!Array.isArray(otherSchools) || otherSchools.length === 0) {
+    return { weekSchoolSets, weekTotalCounts, weekSchoolNames, dateCounts, dateTimeCounts };
+  }
+
+  for (const school of otherSchools) {
+    if (!school || (currentSchoolId && school.id === currentSchoolId)) continue;
+    if (!isActiveRotationSchool(school)) continue;
+    const entries = school.mainSchedule?.rotationEntries;
+    if (!Array.isArray(entries) || entries.length === 0) continue;
+    const schoolLabel = String(school.name || school.id || '').trim() || school.id;
+
+    for (const entry of entries) {
+      if (!entry || !isCalendarDate(entry.date) || !entry.examiner) continue;
+      if (today && entry.date < today) continue;
+      const weekKey = getRotationWeekKey(entry.date);
+      const time = normalizeScaleTime(entry.time);
+      const weekExKey = `${weekKey}|${entry.examiner}`;
+
+      let schoolSet = weekSchoolSets.get(weekExKey);
+      if (!schoolSet) {
+        schoolSet = new Set<string>();
+        weekSchoolSets.set(weekExKey, schoolSet);
+      }
+      schoolSet.add(school.id);
+
+      let nameMap = weekSchoolNames.get(weekExKey);
+      if (!nameMap) {
+        nameMap = new Map<string, string>();
+        weekSchoolNames.set(weekExKey, nameMap);
+      }
+      nameMap.set(school.id, schoolLabel);
+
+      weekTotalCounts.set(weekExKey, (weekTotalCounts.get(weekExKey) ?? 0) + 1);
+
+      const dateExKey = `${entry.date}|${entry.examiner}`;
+      dateCounts.set(dateExKey, (dateCounts.get(dateExKey) ?? 0) + 1);
+
+      if (isValidScaleTime(time)) {
+        const dtExKey = `${entry.date}|${time}|${entry.examiner}`;
+        dateTimeCounts.set(dtExKey, (dateTimeCounts.get(dtExKey) ?? 0) + 1);
+      }
+    }
+  }
+
+  return { weekSchoolSets, weekTotalCounts, weekSchoolNames, dateCounts, dateTimeCounts };
+}
+
+export interface CrossSchoolWeeklyRepeat {
+  entryId: string;
+  date: string;
+  weekKey: string;
+  examinerId: string;
+  otherSchoolIds: string[];
+  otherSchoolNames: string[];
+}
+
+export function findCrossSchoolWeeklyRepeats(input: {
+  entries: RotationScheduleEntry[] | null | undefined;
+  otherSchools?: OtherSchoolRotationLike[] | null;
+  currentSchoolId?: string | null;
+  today?: string;
+}): CrossSchoolWeeklyRepeat[] {
+  if (!Array.isArray(input.entries) || input.entries.length === 0) return [];
+  const index = buildCrossSchoolUsageIndex(input.otherSchools, input.currentSchoolId, input.today);
+  const repeats: CrossSchoolWeeklyRepeat[] = [];
+  for (const entry of input.entries) {
+    if (!entry || !isCalendarDate(entry.date) || !entry.examiner) continue;
+    if (input.today && entry.date < input.today) continue;
+    const weekKey = getRotationWeekKey(entry.date);
+    const weekExKey = `${weekKey}|${entry.examiner}`;
+    const nameMap = index.weekSchoolNames.get(weekExKey);
+    if (!nameMap || nameMap.size === 0) continue;
+    repeats.push({
+      entryId: entry.id,
+      date: entry.date,
+      weekKey,
+      examinerId: entry.examiner,
+      otherSchoolIds: [...nameMap.keys()],
+      otherSchoolNames: [...nameMap.values()],
+    });
+  }
+  return repeats;
+}
+
+interface CandidateScore {
+  sameDateTime: number;
+  exceedsPerDay: number;
+  otherWeekPresence: number;
+  otherWeekTotal: number;
+  otherDateCount: number;
+  schoolCount: number;
+  thisWeekCount: number;
+}
+
+function scoreRotationCandidate(params: {
+  examiner: RotationExaminerLike;
+  date: string;
+  time: string;
+  weekKey: string;
+  crossIndex: CrossSchoolUsageIndex;
+  schoolCounts: Map<string, number>;
+  thisWeekCounts: Map<string, number>;
+  thisDateCounts: Map<string, number>;
+  thisDateTimeCounts: Map<string, number>;
+}): CandidateScore {
+  const {
+    examiner,
+    date,
+    time,
+    weekKey,
+    crossIndex,
+    schoolCounts,
+    thisWeekCounts,
+    thisDateCounts,
+    thisDateTimeCounts,
+  } = params;
+  const exId = examiner.id;
+  const weekExKey = `${weekKey}|${exId}`;
+  const dateExKey = `${date}|${exId}`;
+  const dtExKey = `${date}|${time}|${exId}`;
+
+  const otherDt = crossIndex.dateTimeCounts.get(dtExKey) ?? 0;
+  const thisDt = thisDateTimeCounts.get(dtExKey) ?? 0;
+  const sameDateTime = otherDt + thisDt > 0 ? 1 : 0;
+
+  const otherDateCount = crossIndex.dateCounts.get(dateExKey) ?? 0;
+  const thisDateCount = thisDateCounts.get(dateExKey) ?? 0;
+  const maxPerDay = examiner.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
+  const exceedsPerDay = otherDateCount + thisDateCount >= maxPerDay ? 1 : 0;
+
+  const otherWeekPresence = crossIndex.weekSchoolSets.get(weekExKey)?.size ?? 0;
+  const otherWeekTotal = crossIndex.weekTotalCounts.get(weekExKey) ?? 0;
+  const schoolCount = schoolCounts.get(exId) ?? 0;
+  const thisWeekCount = thisWeekCounts.get(weekExKey) ?? 0;
+
+  return {
+    sameDateTime,
+    exceedsPerDay,
+    otherWeekPresence,
+    otherWeekTotal,
+    otherDateCount,
+    schoolCount,
+    thisWeekCount,
+  };
+}
+
+function compareCandidateScores(a: CandidateScore, b: CandidateScore): number {
+  return (
+    a.sameDateTime - b.sameDateTime ||
+    a.exceedsPerDay - b.exceedsPerDay ||
+    a.otherWeekPresence - b.otherWeekPresence ||
+    a.otherWeekTotal - b.otherWeekTotal ||
+    a.otherDateCount - b.otherDateCount ||
+    a.schoolCount - b.schoolCount ||
+    a.thisWeekCount - b.thisWeekCount
+  );
+}
+
 export interface SyncRotationScheduleInput {
+  currentSchoolId?: string | null;
   schoolCity?: string | null;
   config: RotationConfig;
   existingEntries?: RotationScheduleEntry[] | null;
   suppressedDates?: string[] | null;
   pausedDates?: string[] | null;
+  otherSchools?: OtherSchoolRotationLike[] | null;
   examiners: RotationExaminerLike[];
   cities: RotationCityLike[];
   blockedDates?: RotationBlockedDateLike[];
@@ -240,6 +490,32 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
 
   const cityId = resolveCityIdByName(input.schoolCity, input.cities);
   const examinerMap = new Map(input.examiners.map(ex => [ex.id, ex]));
+  const crossIndex = buildCrossSchoolUsageIndex(input.otherSchools, input.currentSchoolId, today);
+  const hasOtherSchools = crossIndex.weekSchoolSets.size > 0;
+
+  const baseEligibility = findEligibleExaminersForSchool({
+    schoolCity: input.schoolCity,
+    config: normalizedConfig,
+    examiners: input.examiners,
+    cities: input.cities,
+  });
+
+  const listCandidatesForDate = (date: string): { examiner: RotationExaminerLike; time: string }[] => {
+    if (!cityId) return [];
+    const weekday = scaleWeekday(date);
+    if (!normalizedConfig.days.includes(weekday)) return [];
+    const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
+    for (const ex of baseEligibility.eligible) {
+      if (!ex.rotationAvailability?.days?.includes(weekday)) continue;
+      const times = getExaminerRotationTimesInWindow(ex, normalizedConfig);
+      for (const time of times) {
+        if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
+          candidates.push({ examiner: ex, time });
+        }
+      }
+    }
+    return candidates;
+  };
 
   const isAutoEntryStillValid = (entry: RotationScheduleEntry): boolean => {
     if (!isCalendarDate(entry.date) || entry.date < today || entry.date > maxDate) return false;
@@ -261,6 +537,8 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
 
   const rawExisting = Array.isArray(input.existingEntries) ? input.existingEntries : [];
   const keptEntries: RotationScheduleEntry[] = [];
+  const candidateAutoEntries: RotationScheduleEntry[] = [];
+
   for (const item of rawExisting) {
     if (!item || !isCalendarDate(item.date) || item.date < today) continue;
     if (item.manual) {
@@ -274,7 +552,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
       continue;
     }
     if (!input.forceRebalanceAuto && isAutoEntryStillValid(item)) {
-      keptEntries.push({
+      candidateAutoEntries.push({
         id: item.id || createId(),
         date: item.date,
         time: normalizeScaleTime(item.time),
@@ -284,9 +562,62 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     }
   }
 
+  // Rastreia compromissos manuais já fixados nesta escola para evitar conflitos na mesma semana/dia
+  const manualWeekCounts = new Map<string, number>();
+  for (const m of keptEntries) {
+    const wk = getRotationWeekKey(m.date);
+    if (wk && m.examiner) {
+      manualWeekCounts.set(`${wk}|${m.examiner}`, (manualWeekCounts.get(`${wk}|${m.examiner}`) ?? 0) + 1);
+    }
+  }
+
+  for (const autoEntry of candidateAutoEntries) {
+    if (hasOtherSchools) {
+      const weekKey = getRotationWeekKey(autoEntry.date);
+      const weekExKey = `${weekKey}|${autoEntry.examiner}`;
+      const dateExKey = `${autoEntry.date}|${autoEntry.examiner}`;
+      const dtExKey = `${autoEntry.date}|${autoEntry.time}|${autoEntry.examiner}`;
+      const ex = examinerMap.get(autoEntry.examiner);
+      const maxPerDay = ex?.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
+
+      const hasExactDateTimeClash = (crossIndex.dateTimeCounts.get(dtExKey) ?? 0) > 0;
+      const exceedsOtherDay = (crossIndex.dateCounts.get(dateExKey) ?? 0) >= maxPerDay;
+      const otherWeekPresence = crossIndex.weekSchoolSets.get(weekExKey)?.size ?? 0;
+
+      if (hasExactDateTimeClash || exceedsOtherDay || otherWeekPresence > 0) {
+        const alternatives = listCandidatesForDate(autoEntry.date);
+        const hasStrictlyBetterAlternative = alternatives.some(cand => {
+          if (cand.examiner.id === autoEntry.examiner && cand.time === autoEntry.time) return false;
+          const cWeekKey = `${weekKey}|${cand.examiner.id}`;
+          const cDateKey = `${autoEntry.date}|${cand.examiner.id}`;
+          const cDtKey = `${autoEntry.date}|${cand.time}|${cand.examiner.id}`;
+          const cMaxDay = cand.examiner.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
+          const cDtClash = (crossIndex.dateTimeCounts.get(cDtKey) ?? 0) > 0;
+          const cDayCount = crossIndex.dateCounts.get(cDateKey) ?? 0;
+          const cWeekPresence = crossIndex.weekSchoolSets.get(cWeekKey)?.size ?? 0;
+
+          if (cDtClash || cDayCount >= cMaxDay) return false;
+          if (hasExactDateTimeClash || exceedsOtherDay) return true;
+          const cManualWeek = manualWeekCounts.get(cWeekKey) ?? 0;
+          return cWeekPresence < otherWeekPresence && cManualWeek === 0;
+        });
+
+        if (hasStrictlyBetterAlternative) {
+          // Descarta entrada automática antiga para que o gerador selecione examinador sem repetir na semana
+          continue;
+        }
+      }
+    }
+    keptEntries.push(autoEntry);
+  }
+
   const coveredDates = new Set(keptEntries.map(e => e.date));
   const counts = new Map<string, number>();
   const lastDate = new Map<string, string>();
+  const thisWeekCounts = new Map<string, number>();
+  const thisDateCounts = new Map<string, number>();
+  const thisDateTimeCounts = new Map<string, number>();
+
   for (const ex of input.examiners) {
     counts.set(ex.id, 0);
   }
@@ -295,19 +626,23 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
       counts.set(entry.examiner, (counts.get(entry.examiner) ?? 0) + 1);
       const prev = lastDate.get(entry.examiner) ?? '';
       if (entry.date > prev) lastDate.set(entry.examiner, entry.date);
+      const wk = getRotationWeekKey(entry.date);
+      if (wk) {
+        thisWeekCounts.set(`${wk}|${entry.examiner}`, (thisWeekCounts.get(`${wk}|${entry.examiner}`) ?? 0) + 1);
+      }
+      thisDateCounts.set(`${entry.date}|${entry.examiner}`, (thisDateCounts.get(`${entry.date}|${entry.examiner}`) ?? 0) + 1);
+      const t = normalizeScaleTime(entry.time);
+      if (isValidScaleTime(t)) {
+        thisDateTimeCounts.set(`${entry.date}|${t}|${entry.examiner}`, (thisDateTimeCounts.get(`${entry.date}|${t}|${entry.examiner}`) ?? 0) + 1);
+      }
     }
   }
 
   const warnings: string[] = [];
-  const baseEligibility = findEligibleExaminersForSchool({
-    schoolCity: input.schoolCity,
-    config: normalizedConfig,
-    examiners: input.examiners,
-    cities: input.cities,
-  });
   if (baseEligibility.issue) {
     warnings.push(baseEligibility.issue);
   }
+  const seenCrossRepeatWarnings = new Set<string>();
 
   const generatedEntries: RotationScheduleEntry[] = [];
   const dates = listForwardDates(today, horizonDays);
@@ -319,17 +654,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     if (isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked) continue;
     if (!cityId) continue;
 
-    const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
-    for (const ex of baseEligibility.eligible) {
-      if (!ex.rotationAvailability?.days?.includes(weekday)) continue;
-      const times = getExaminerRotationTimesInWindow(ex, normalizedConfig);
-      for (const time of times) {
-        if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
-          candidates.push({ examiner: ex, time });
-        }
-      }
-    }
-
+    const candidates = listCandidatesForDate(date);
     if (candidates.length === 0) {
       if (baseEligibility.eligible.length > 0) {
         warnings.push(`Sem examinador disponível em ${formatRotationDateBR(date)} (${weekday}) — verifique afastamentos/férias ou horários.`);
@@ -337,9 +662,25 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
       continue;
     }
 
-    candidates.sort((a, b) => {
-      const countDiff = (counts.get(a.examiner.id) ?? 0) - (counts.get(b.examiner.id) ?? 0);
-      if (countDiff !== 0) return countDiff;
+    const weekKey = getRotationWeekKey(date);
+    const scored = candidates.map(cand => ({
+      ...cand,
+      score: scoreRotationCandidate({
+        examiner: cand.examiner,
+        date,
+        time: cand.time,
+        weekKey,
+        crossIndex,
+        schoolCounts: counts,
+        thisWeekCounts,
+        thisDateCounts,
+        thisDateTimeCounts,
+      }),
+    }));
+
+    scored.sort((a, b) => {
+      const scoreDiff = compareCandidateScores(a.score, b.score);
+      if (scoreDiff !== 0) return scoreDiff;
       const lastDiff = (lastDate.get(a.examiner.id) ?? '').localeCompare(lastDate.get(b.examiner.id) ?? '');
       if (lastDiff !== 0) return lastDiff;
       const nameDiff = a.examiner.name.localeCompare(b.examiner.name);
@@ -349,7 +690,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
       return a.examiner.id.localeCompare(b.examiner.id);
     });
 
-    const chosen = candidates[0];
+    const chosen = scored[0];
     generatedEntries.push({
       id: createId(),
       date,
@@ -360,6 +701,19 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     coveredDates.add(date);
     counts.set(chosen.examiner.id, (counts.get(chosen.examiner.id) ?? 0) + 1);
     lastDate.set(chosen.examiner.id, date);
+    if (weekKey) {
+      const wkExKey = `${weekKey}|${chosen.examiner.id}`;
+      thisWeekCounts.set(wkExKey, (thisWeekCounts.get(wkExKey) ?? 0) + 1);
+      if (chosen.score.otherWeekPresence > 0 && !seenCrossRepeatWarnings.has(wkExKey)) {
+        seenCrossRepeatWarnings.add(wkExKey);
+        const otherNames = [...(crossIndex.weekSchoolNames.get(wkExKey)?.values() ?? [])];
+        warnings.push(
+          `Semana de ${formatRotationDateBR(weekKey)}: ${chosen.examiner.name} também está escalado(a) em ${otherNames.join(', ')} (sem outro examinador livre nessa semana).`,
+        );
+      }
+    }
+    thisDateCounts.set(`${date}|${chosen.examiner.id}`, (thisDateCounts.get(`${date}|${chosen.examiner.id}`) ?? 0) + 1);
+    thisDateTimeCounts.set(`${date}|${chosen.time}|${chosen.examiner.id}`, (thisDateTimeCounts.get(`${date}|${chosen.time}|${chosen.examiner.id}`) ?? 0) + 1);
   }
 
   const finalEntries = [...keptEntries, ...generatedEntries].sort(
@@ -444,6 +798,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
 
   const cityId = resolveCityIdByName(input.schoolCity, input.cities);
   const examinerMap = new Map(input.examiners.map(ex => [ex.id, ex]));
+  const crossIndex = buildCrossSchoolUsageIndex(input.otherSchools, input.currentSchoolId, today);
 
   const rawExisting = Array.isArray(input.existingEntries) ? input.existingEntries : [];
   const manualEntries: RotationScheduleEntry[] = [];
@@ -515,15 +870,29 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
   );
 
   let chosenEntries: RotationScheduleEntry[] = [];
+  let chosenWarnings: string[] = [...baseWarnings];
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const counts = new Map<string, number>();
+    const thisWeekCounts = new Map<string, number>();
+    const thisDateCounts = new Map<string, number>();
+    const thisDateTimeCounts = new Map<string, number>();
+
     for (const ex of input.examiners) {
       counts.set(ex.id, 0);
     }
     for (const entry of manualEntries) {
       if (entry.date <= maxDate && entry.examiner) {
         counts.set(entry.examiner, (counts.get(entry.examiner) ?? 0) + 1);
+        const wk = getRotationWeekKey(entry.date);
+        if (wk) {
+          thisWeekCounts.set(`${wk}|${entry.examiner}`, (thisWeekCounts.get(`${wk}|${entry.examiner}`) ?? 0) + 1);
+        }
+        thisDateCounts.set(`${entry.date}|${entry.examiner}`, (thisDateCounts.get(`${entry.date}|${entry.examiner}`) ?? 0) + 1);
+        const t = normalizeScaleTime(entry.time);
+        if (isValidScaleTime(t)) {
+          thisDateTimeCounts.set(`${entry.date}|${t}|${entry.examiner}`, (thisDateTimeCounts.get(`${entry.date}|${t}|${entry.examiner}`) ?? 0) + 1);
+        }
       }
     }
 
@@ -539,14 +908,31 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
       .flatMap(level => fisherYatesShuffle(byConstraint.get(level)!, rng));
 
     const generated: RotationScheduleEntry[] = [];
+    const attemptWarnings = [...baseWarnings];
+    const seenCrossWarnings = new Set<string>();
+
     for (const slot of orderedSlots) {
-      let minCount = Infinity;
-      for (const candidate of slot.candidates) {
-        const count = counts.get(candidate.examiner.id) ?? 0;
-        if (count < minCount) minCount = count;
-      }
-      const tied = slot.candidates.filter(c => (counts.get(c.examiner.id) ?? 0) === minCount);
+      const weekKey = getRotationWeekKey(slot.date);
+      const scored = slot.candidates.map(cand => ({
+        ...cand,
+        score: scoreRotationCandidate({
+          examiner: cand.examiner,
+          date: slot.date,
+          time: cand.time,
+          weekKey,
+          crossIndex,
+          schoolCounts: counts,
+          thisWeekCounts,
+          thisDateCounts,
+          thisDateTimeCounts,
+        }),
+      }));
+
+      scored.sort((a, b) => compareCandidateScores(a.score, b.score));
+      const bestScore = scored[0].score;
+      const tied = scored.filter(c => compareCandidateScores(c.score, bestScore) === 0);
       const chosen = tied[Math.floor(rng() * tied.length)];
+
       generated.push({
         id: createId(),
         date: slot.date,
@@ -555,12 +941,26 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
         manual: false,
       });
       counts.set(chosen.examiner.id, (counts.get(chosen.examiner.id) ?? 0) + 1);
+      if (weekKey) {
+        const wkExKey = `${weekKey}|${chosen.examiner.id}`;
+        thisWeekCounts.set(wkExKey, (thisWeekCounts.get(wkExKey) ?? 0) + 1);
+        if (chosen.score.otherWeekPresence > 0 && !seenCrossWarnings.has(wkExKey)) {
+          seenCrossWarnings.add(wkExKey);
+          const otherNames = [...(crossIndex.weekSchoolNames.get(wkExKey)?.values() ?? [])];
+          attemptWarnings.push(
+            `Semana de ${formatRotationDateBR(weekKey)}: ${chosen.examiner.name} também está escalado(a) em ${otherNames.join(', ')} (sem outro examinador livre nessa semana).`,
+          );
+        }
+      }
+      thisDateCounts.set(`${slot.date}|${chosen.examiner.id}`, (thisDateCounts.get(`${slot.date}|${chosen.examiner.id}`) ?? 0) + 1);
+      thisDateTimeCounts.set(`${slot.date}|${chosen.time}|${chosen.examiner.id}`, (thisDateTimeCounts.get(`${slot.date}|${chosen.time}|${chosen.examiner.id}`) ?? 0) + 1);
     }
 
     const candidateFinal = [...manualEntries, ...generated].sort(
       (a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time),
     );
     chosenEntries = candidateFinal;
+    chosenWarnings = attemptWarnings;
     if (serializeEntries(candidateFinal) !== previousSignature) {
       break;
     }
@@ -585,8 +985,124 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
   return {
     entries: chosenEntries,
     suppressedDates: cleanedSuppressed,
-    warnings: baseWarnings,
+    warnings: chosenWarnings,
     distribution,
     changed,
   };
+}
+
+export interface SyncAllSchoolsRotationInput<TSchool extends OtherSchoolRotationLike> {
+  schools: TSchool[];
+  examiners: RotationExaminerLike[];
+  cities: RotationCityLike[];
+  blockedDates?: RotationBlockedDateLike[];
+  systemSettings?: RotationSystemSettingsLike | null;
+  today?: string;
+  horizonDays?: number;
+  forceRebalanceAuto?: boolean;
+  createId?: () => string;
+}
+
+export interface SyncAllSchoolsRotationResult<TSchool extends OtherSchoolRotationLike> {
+  schools: TSchool[];
+  updates: {
+    id: string;
+    mainSchedule: NonNullable<TSchool['mainSchedule']>;
+    warnings: string[];
+  }[];
+}
+
+export function syncAllSchoolsRotationSchedules<TSchool extends OtherSchoolRotationLike>(
+  input: SyncAllSchoolsRotationInput<TSchool>,
+): SyncAllSchoolsRotationResult<TSchool> {
+  const today = input.today ?? businessDate();
+  const workingSchools: TSchool[] = input.schools.map(s => ({ ...s }));
+  const indexById = new Map(workingSchools.map((s, idx) => [s.id, idx]));
+
+  const eligibleOrder = workingSchools
+    .filter(isActiveRotationSchool)
+    .map(s => {
+      const config = s.mainSchedule!.rotationConfig!;
+      const eligibleCount = findEligibleExaminersForSchool({
+        schoolCity: s.city,
+        config,
+        examiners: input.examiners,
+        cities: input.cities,
+      }).eligible.length;
+      const validFutureCount = (s.mainSchedule?.rotationEntries ?? []).filter(
+        e => e && isCalendarDate(e.date) && e.date >= today,
+      ).length;
+      return { id: s.id, name: s.name || '', eligibleCount, validFutureCount };
+    })
+    .sort(
+      (a, b) =>
+        a.eligibleCount - b.eligibleCount ||
+        b.validFutureCount - a.validFutureCount ||
+        a.name.localeCompare(b.name) ||
+        a.id.localeCompare(b.id),
+    );
+
+  const latestUpdateById = new Map<string, SyncAllSchoolsRotationResult<TSchool>['updates'][number]>();
+  const initialMainById = new Map(input.schools.map(s => [s.id, s.mainSchedule]));
+
+  for (let pass = 0; pass < 2; pass++) {
+    let passChanged = false;
+    for (const item of eligibleOrder) {
+      const idx = indexById.get(item.id);
+      if (idx === undefined) continue;
+      const school = workingSchools[idx];
+      const main = school.mainSchedule!;
+      const synced = syncRollingRotationSchedule({
+        currentSchoolId: school.id,
+        schoolCity: school.city,
+        config: main.rotationConfig!,
+        existingEntries: main.rotationEntries ?? [],
+        suppressedDates: main.suppressedRotationDates ?? [],
+        pausedDates: main.pausedDates ?? [],
+        otherSchools: workingSchools,
+        examiners: input.examiners,
+        cities: input.cities,
+        blockedDates: input.blockedDates,
+        systemSettings: input.systemSettings,
+        today,
+        horizonDays: input.horizonDays,
+        forceRebalanceAuto: pass === 0 ? input.forceRebalanceAuto : false,
+        createId: input.createId,
+      });
+
+      if (synced.changed) {
+        passChanged = true;
+        const updatedMain = {
+          ...main,
+          rotationEntries: synced.entries,
+          suppressedRotationDates: synced.suppressedDates,
+        } as NonNullable<TSchool['mainSchedule']>;
+
+        workingSchools[idx] = {
+          ...school,
+          mainSchedule: updatedMain,
+        };
+        latestUpdateById.set(school.id, {
+          id: school.id,
+          mainSchedule: updatedMain,
+          warnings: synced.warnings,
+        });
+      } else if (latestUpdateById.has(school.id)) {
+        latestUpdateById.set(school.id, {
+          id: school.id,
+          mainSchedule: main as NonNullable<TSchool['mainSchedule']>,
+          warnings: synced.warnings,
+        });
+      }
+    }
+    if (!passChanged) break;
+  }
+
+  const updates = [...latestUpdateById.values()].filter(u => {
+    const initial = initialMainById.get(u.id);
+    return JSON.stringify(initial?.rotationEntries ?? []) !== JSON.stringify(u.mainSchedule.rotationEntries ?? []) ||
+      JSON.stringify(initial?.suppressedRotationDates ?? []) !== JSON.stringify(u.mainSchedule.suppressedRotationDates ?? []);
+  });
+
+  return { schools: workingSchools, updates };
 }

@@ -193,7 +193,10 @@ export function planCnhRotationBancas(input: PlanCnhRotationBancasInput): PlanCn
   const newBancas: NewAutoCnhBanca[] = [];
   const schoolUpdates: { schoolId: string; mainSchedule: any }[] = [];
 
-  const eligibleSchools = input.schools
+  const workingSchools = input.schools.map(s => ({ ...s }));
+  const workingIndexById = new Map(workingSchools.map((s, idx) => [s.id, idx]));
+
+  const eligibleSchools = workingSchools
     .filter(isSchoolEligibleForCnhAutoBancas)
     .sort((a, b) => (a.name || '').localeCompare(b.name || '') || a.id.localeCompare(b.id));
 
@@ -201,11 +204,13 @@ export function planCnhRotationBancas(input: PlanCnhRotationBancasInput): PlanCn
     const main = school.mainSchedule!;
     const config = main.rotationConfig!;
     const synced = syncRollingRotationSchedule({
+      currentSchoolId: school.id,
       schoolCity: school.city,
       config,
       existingEntries: main.rotationEntries ?? [],
       suppressedDates: main.suppressedRotationDates ?? [],
       pausedDates: main.pausedDates ?? [],
+      otherSchools: workingSchools,
       examiners: input.examiners,
       cities: input.cities,
       blockedDates,
@@ -213,6 +218,17 @@ export function planCnhRotationBancas(input: PlanCnhRotationBancasInput): PlanCn
       today,
       createId,
     });
+    const wIdx = workingIndexById.get(school.id);
+    if (wIdx !== undefined && synced.changed) {
+      workingSchools[wIdx] = {
+        ...workingSchools[wIdx],
+        mainSchedule: {
+          ...main,
+          rotationEntries: synced.entries,
+          suppressedRotationDates: synced.suppressedDates,
+        },
+      };
+    }
 
     const entries = [...synced.entries].sort(
       (a, b) => dateOnly(a.date).localeCompare(dateOnly(b.date)) || normalizeScaleTime(a.time).localeCompare(normalizeScaleTime(b.time)),

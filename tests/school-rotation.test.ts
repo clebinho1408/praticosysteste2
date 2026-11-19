@@ -2,11 +2,15 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   syncRollingRotationSchedule,
+  syncAllSchoolsRotationSchedules,
   shuffleRotationSchedule,
+  findCrossSchoolWeeklyRepeats,
+  getRotationWeekKey,
   filterUpcomingRotationNext7Days,
   findEligibleExaminersForSchool,
   isExaminerBlockedOnDateTime,
   isSystemDateBlockedForRotation,
+  resolveExaminerDefaultRotationTime,
 } from '../functions/_school-rotation.js';
 import {
   resolveSchoolScaleForDate,
@@ -431,3 +435,291 @@ test('planFixedScales pulls exact examiner and time per date for ROTATION_DATES 
   assert.equal(conflicted.issues.length, 1);
   assert.match(conflicted.issues[0].reason, /já possui prova às 10:30/);
 });
+
+test('avoids repeating the same examiner across different rotation schools in the same week', () => {
+  const exA = makeExaminer('ex-a', {
+    name: 'ALICE',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '10:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exB = makeExaminer('ex-b', {
+    name: 'BRUNO',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '11:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exC = makeExaminer('ex-c', {
+    name: 'CARLOS',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '14:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exD = makeExaminer('ex-d', {
+    name: 'DANIEL',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '15:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const allExaminers = [exA, exB, exC, exD];
+
+  const configA = { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' };
+  const configB = { days: ['TER', 'QUI'], startTime: '10:00', endTime: '16:00' };
+
+  const syncedA = syncRollingRotationSchedule({
+    currentSchoolId: 'school-a',
+    schoolCity: 'ITAPEMA',
+    config: configA,
+    examiners: allExaminers,
+    cities,
+    today: '2026-11-23',
+    horizonDays: 30,
+  });
+
+  const schoolA = {
+    id: 'school-a',
+    name: 'AUTOESCOLA ALPHA',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: { active: true, rotationConfig: configA, rotationEntries: syncedA.entries },
+    provisionalSchedule: { active: false },
+  };
+
+  // Autoescola inativa ou em escala provisória não deve bloquear examinadores
+  const inactiveOther = {
+    id: 'school-inactive',
+    name: 'AUTOESCOLA PROVISORIA',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: { active: true, rotationConfig: configB, rotationEntries: syncedA.entries },
+    provisionalSchedule: { active: true },
+  };
+
+  const syncedB = syncRollingRotationSchedule({
+    currentSchoolId: 'school-b',
+    schoolCity: 'ITAPEMA',
+    config: configB,
+    otherSchools: [schoolA, inactiveOther],
+    examiners: allExaminers,
+    cities,
+    today: '2026-11-23',
+    horizonDays: 30,
+  });
+
+  assert.equal(syncedB.warnings.length, 0);
+  const repeats = findCrossSchoolWeeklyRepeats({
+    entries: syncedB.entries,
+    otherSchools: [schoolA],
+    currentSchoolId: 'school-b',
+    today: '2026-11-23',
+  });
+  assert.equal(repeats.length, 0, `Repetição inesperada na mesma semana: ${JSON.stringify(repeats)}`);
+
+  // Cada semana deve ter examinadores disjuntos entre Escola A e Escola B
+  const weeks = new Set(syncedA.entries.map(e => getRotationWeekKey(e.date)));
+  for (const wk of weeks) {
+    const exInA = new Set(syncedA.entries.filter(e => getRotationWeekKey(e.date) === wk).map(e => e.examiner));
+    const exInB = new Set(syncedB.entries.filter(e => getRotationWeekKey(e.date) === wk).map(e => e.examiner));
+    for (const id of exInA) {
+      assert.equal(exInB.has(id), false, `Examinador ${id} repetido na semana ${wk}`);
+    }
+  }
+});
+
+test('syncAllSchoolsRotationSchedules prioritizes constrained schools and heals existing weekly collisions', () => {
+  // ex-a e ex-b só atendem SEG/QUA; ex-c e ex-d atendem SEG..QUI
+  const exA = makeExaminer('ex-a', {
+    name: 'ALICE',
+    rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '10:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exB = makeExaminer('ex-b', {
+    name: 'BRUNO',
+    rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '11:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exC = makeExaminer('ex-c', {
+    name: 'CARLOS',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '14:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exD = makeExaminer('ex-d', {
+    name: 'DANIEL',
+    rotationAvailability: { days: ['SEG', 'TER', 'QUA', 'QUI'], defaultTime: '15:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+
+  const schoolA = {
+    id: 'school-a',
+    name: 'AUTOESCOLA A',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      rotationConfig: { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' },
+      // Simula conflito legado: escola A escalou ex-c e ex-d na semana 2026-11-23
+      rotationEntries: [
+        { id: 'old-1', date: '2026-11-23', time: '14:00', examiner: 'ex-c', manual: false },
+        { id: 'old-2', date: '2026-11-25', time: '15:00', examiner: 'ex-d', manual: false },
+      ],
+    },
+    provisionalSchedule: { active: false },
+  };
+  const schoolB = {
+    id: 'school-b',
+    name: 'AUTOESCOLA B',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      rotationConfig: { days: ['TER', 'QUI'], startTime: '10:00', endTime: '16:00' },
+      rotationEntries: [],
+    },
+    provisionalSchedule: { active: false },
+  };
+
+  const result = syncAllSchoolsRotationSchedules({
+    schools: [schoolA, schoolB],
+    examiners: [exA, exB, exC, exD],
+    cities,
+    today: '2026-11-23',
+    horizonDays: 13,
+  });
+
+  const updatedA = result.schools[0];
+  const updatedB = result.schools[1];
+
+  // Escola B só pode usar ex-c e ex-d; Escola A deve ter trocado para ex-a e ex-b na mesma semana
+  const repeats = findCrossSchoolWeeklyRepeats({
+    entries: updatedA.mainSchedule.rotationEntries,
+    otherSchools: [updatedB],
+    currentSchoolId: updatedA.id,
+    today: '2026-11-23',
+  });
+  assert.equal(repeats.length, 0);
+  assert.ok(result.updates.every(u => u.warnings.length === 0));
+  assert.ok(updatedB.mainSchedule.rotationEntries.every(e => e.examiner === 'ex-c' || e.examiner === 'ex-d'));
+  assert.ok(updatedA.mainSchedule.rotationEntries.every(e => e.examiner === 'ex-a' || e.examiner === 'ex-b'));
+});
+
+test('shuffleRotationSchedule avoids repeating examiners from other rotation schools in the same week', () => {
+  const examinersPool = [
+    makeExaminer('ex-a', { name: 'ALICE', rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '10:00', examsPerDay: 1 as const, cityIds: ['c1'] } }),
+    makeExaminer('ex-b', { name: 'BRUNO', rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '11:00', examsPerDay: 1 as const, cityIds: ['c1'] } }),
+    makeExaminer('ex-c', { name: 'CARLOS', rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '14:00', examsPerDay: 1 as const, cityIds: ['c1'] } }),
+    makeExaminer('ex-d', { name: 'DANIEL', rotationAvailability: { days: ['SEG', 'QUA'], defaultTime: '15:00', examsPerDay: 1 as const, cityIds: ['c1'] } }),
+  ];
+  const config = { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' };
+  const schoolA = {
+    id: 'school-a',
+    name: 'AUTOESCOLA A',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      rotationConfig: config,
+      rotationEntries: [
+        { id: 'a1', date: '2026-11-23', time: '10:00', examiner: 'ex-a', manual: false },
+        { id: 'a2', date: '2026-11-25', time: '11:00', examiner: 'ex-b', manual: false },
+        { id: 'a3', date: '2026-11-30', time: '14:00', examiner: 'ex-c', manual: false },
+        { id: 'a4', date: '2026-12-02', time: '15:00', examiner: 'ex-d', manual: false },
+      ],
+    },
+    provisionalSchedule: { active: false },
+  };
+
+  const shuffledB = shuffleRotationSchedule({
+    currentSchoolId: 'school-b',
+    schoolCity: 'ITAPEMA',
+    config,
+    otherSchools: [schoolA],
+    examiners: examinersPool,
+    cities,
+    today: '2026-11-23',
+    horizonDays: 10,
+  });
+
+  const repeats = findCrossSchoolWeeklyRepeats({
+    entries: shuffledB.entries,
+    otherSchools: [schoolA],
+    currentSchoolId: 'school-b',
+    today: '2026-11-23',
+  });
+  assert.equal(repeats.length, 0);
+});
+
+test('gracefully minimizes repeats and warns when total weekly slots across schools exceed available examiners', () => {
+  const exA = makeExaminer('ex-a', {
+    name: 'ALICE',
+    rotationAvailability: { days: ['SEG', 'TER'], defaultTime: '10:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const exB = makeExaminer('ex-b', {
+    name: 'BRUNO',
+    rotationAvailability: { days: ['SEG', 'TER'], defaultTime: '14:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  const schoolA = {
+    id: 'school-a',
+    name: 'AUTOESCOLA A',
+    city: 'ITAPEMA',
+    examRotation: true,
+    mainSchedule: {
+      active: true,
+      rotationConfig: { days: ['SEG', 'TER'], startTime: '10:00', endTime: '16:00' },
+      rotationEntries: [
+        { id: 'a1', date: '2026-11-23', time: '10:00', examiner: 'ex-a', manual: false },
+        { id: 'a2', date: '2026-11-24', time: '14:00', examiner: 'ex-b', manual: false },
+      ],
+    },
+    provisionalSchedule: { active: false },
+  };
+
+  const syncedB = syncRollingRotationSchedule({
+    currentSchoolId: 'school-b',
+    schoolCity: 'ITAPEMA',
+    config: { days: ['SEG', 'TER'], startTime: '10:00', endTime: '16:00' },
+    otherSchools: [schoolA],
+    examiners: [exA, exB],
+    cities,
+    today: '2026-11-23',
+    horizonDays: 6,
+  });
+
+  // Na segunda 23/11 ex-a está em schoolA às 10:00 -> schoolB deve escolher ex-b (14:00) para evitar colisão de horário
+  assert.equal(syncedB.entries.find(e => e.date === '2026-11-23')?.examiner, 'ex-b');
+  assert.equal(syncedB.entries.find(e => e.date === '2026-11-24')?.examiner, 'ex-a');
+  assert.ok(syncedB.warnings.some(w => w.includes('também está escalado')));
+});
+
+test('resolveExaminerDefaultRotationTime picks examiner default time respecting window and date blocks', () => {
+  const config = { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' };
+
+  const exSingle = makeExaminer('ex-single', {
+    rotationAvailability: { days: ['SEG'], defaultTime: '15:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  assert.equal(resolveExaminerDefaultRotationTime(exSingle, config, '2026-11-23'), '15:00');
+
+  const exSecondInWindow = makeExaminer('ex-second', {
+    rotationAvailability: {
+      days: ['SEG'],
+      defaultTime: '08:00', // fora da janela 10:00 - 16:00
+      secondDefaultTime: '14:30', // dentro da janela
+      examsPerDay: 2 as const,
+      cityIds: ['c1'],
+    },
+  });
+  assert.equal(resolveExaminerDefaultRotationTime(exSecondInWindow, config, '2026-11-23'), '14:30');
+
+  const exHalfDayBlock = makeExaminer('ex-half-block', {
+    rotationAvailability: {
+      days: ['SEG'],
+      defaultTime: '10:30',
+      secondDefaultTime: '14:00',
+      examsPerDay: 2 as const,
+      cityIds: ['c1'],
+    },
+    blockedPeriods: [
+      { id: 'b1', startDate: '2026-11-23', endDate: '2026-11-23', description: 'Médico', period: 'MORNING' },
+    ],
+  });
+  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-23'), '14:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-25'), '10:30');
+
+  const exOutsideWindowOnly = makeExaminer('ex-out', {
+    rotationAvailability: { days: ['SEG'], defaultTime: '08:00', examsPerDay: 1 as const, cityIds: ['c1'] },
+  });
+  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, config, '2026-11-23'), '08:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, null), '08:00');
+
+  const exNoAvail = makeExaminer('ex-none', { rotationAvailability: null });
+  assert.equal(resolveExaminerDefaultRotationTime(exNoAvail, config, '2026-11-23'), null);
+  assert.equal(resolveExaminerDefaultRotationTime(null, config), null);
+});
+
