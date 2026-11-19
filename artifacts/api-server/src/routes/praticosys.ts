@@ -1391,11 +1391,13 @@ router.post("/schedule-slots", async (req, res) => {
             return res.status(409).json({ error: "Rodízio de Provas desativado ou disponibilidade incompatível para o examinador." });
           }
         }
-        const capacity = examinerRows[0]?.examRotation
+        const capacity = school.examRotation && examinerRows[0]?.examRotation
           ? examinerRows[0].rotationAvailability?.examsPerDay : null;
-        if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime)) ||
-          (capacity && active.length + assigned.length > capacity)) {
-          return res.status(409).json({ error: "O examinador já possui prova nesse horário ou atingiu a capacidade diária." });
+        if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
+          return res.status(409).json({ error: "O examinador já possui prova nesse horário." });
+        }
+        if (capacity && active.length + assigned.length > capacity) {
+          return res.status(409).json({ error: "O examinador atingiu a capacidade diária." });
         }
       }
       // Um único INSERT grava todas as provas da autoescola ou nenhuma. IDs estáveis

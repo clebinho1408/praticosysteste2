@@ -4,12 +4,27 @@ import { cfcScheduleSlots, pcdScheduleSlots, examiners, drivingSchools, cities, 
 import { eq, and } from 'drizzle-orm';
 import { canManageConfirmed, isConfirmedCfc, confirmedAccessError, confirmedPatch, validateConfirmedEdit } from '../_cfc-confirmed.js';
 import { extraEditError, extraPatch } from '../_cfc-extra.js';
-import { isD1 } from '../_d1.js';
+import { d1Binding, isD1 } from '../_d1.js';
+import { NON_ROTATION_V4_STATEMENTS } from '../../db/non-rotation-capacity-v4-migration.js';
 import {
   normalizeScaleTime,
   resolveSchoolScaleForDate,
   scaleWeekday,
 } from '../_school-schedule.js';
+
+async function runSlotWriteWithTriggerUpgrade<T>(db: any, isNonRotation: boolean, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (e: any) {
+    const msg = `${String(e?.message ?? '')} ${String(e?.cause?.message ?? '')}`;
+    if (isD1(db) && isNonRotation && msg.includes('D1_EXAMINER_CAPACITY')) {
+      const binding = d1Binding(db);
+      await binding.batch(NON_ROTATION_V4_STATEMENTS.map(s => binding.prepare(s)));
+      return await fn();
+    }
+    throw e;
+  }
+}
 
 function getSlotTable(examType: string) {
   return examType === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
@@ -108,9 +123,11 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
             status: 'SCHEDULED', attendanceConfirmed: true, observation: '',
             createdAt: new Date(), updatedAt: new Date(),
           }));
-          const created = isD1(db)
-            ? (await db.batch(records.map((record: any) => db.insert(cfcScheduleSlots).values(record).returning()) as any)).flat()
-            : await db.insert(cfcScheduleSlots).values(records).returning();
+          const created = await runSlotWriteWithTriggerUpgrade(db, !school.examRotation, () => (
+            isD1(db)
+              ? db.batch(records.map((record: any) => db.insert(cfcScheduleSlots).values(record).returning()) as any).then((res: any) => res.flat())
+              : db.insert(cfcScheduleSlots).values(records).returning()
+          ));
           return json(created);
         }
 
@@ -160,11 +177,13 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
               return error('Rodízio de Provas desativado ou disponibilidade incompatível para o examinador.', 409);
             }
           }
-          const capacity = examinerRows[0]?.examRotation
+          const capacity = school.examRotation && examinerRows[0]?.examRotation
             ? examinerRows[0].rotationAvailability?.examsPerDay : null;
-          if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime)) ||
-            (capacity && active.length + assigned.length > capacity)) {
-            return error('O examinador já possui prova nesse horário ou atingiu a capacidade diária.', 409);
+          if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
+            return error('O examinador já possui prova nesse horário.', 409);
+          }
+          if (capacity && active.length + assigned.length > capacity) {
+            return error('O examinador atingiu a capacidade diária.', 409);
           }
         }
         const records = slots.map((s: any, index: number) => ({
@@ -174,9 +193,11 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           status: 'SCHEDULED', attendanceConfirmed: true, observation: '',
           createdAt: new Date(), updatedAt: new Date(),
         }));
-        const created = isD1(db)
-          ? (await db.batch(records.map((record: any) => db.insert(cfcScheduleSlots).values(record).returning()) as any)).flat()
-          : await db.insert(cfcScheduleSlots).values(records).returning();
+        const created = await runSlotWriteWithTriggerUpgrade(db, !school.examRotation, () => (
+          isD1(db)
+            ? db.batch(records.map((record: any) => db.insert(cfcScheduleSlots).values(record).returning()) as any).then((res: any) => res.flat())
+            : db.insert(cfcScheduleSlots).values(records).returning()
+        ));
         return json(created);
       }
       if ((body?.requestType || 'FIXA') === 'FIXA' &&
@@ -184,24 +205,29 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         return error('Acesso negado para criar escala fixa.', 403);
       }
       const table = getSlotTable(body.examType || '');
-      const newItem = await db.insert(table).values({
-        id: body.id || crypto.randomUUID(),
-        schoolId: body.schoolId,
-        examType: body.examType,
-        requestType: body.requestType || 'FIXA',
-        intendedCategory: body.intendedCategory,
-        scheduledDate: body.scheduledDate,
-        scheduledTime: body.scheduledTime,
-        examinerId: body.examinerId,
-        scheduleId: body.scheduleId,
-        scheduledCategory: body.scheduledCategory,
-        status: body.status || 'SCHEDULED',
-        attendanceConfirmed: body.attendanceConfirmed ?? false,
-        cancellationReason: body.cancellationReason,
-        observation: body.observation,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      }).returning();
+      const schoolRow = body.schoolId && (body.examType || '') !== 'PCD'
+        ? (await db.select({ examRotation: drivingSchools.examRotation }).from(drivingSchools).where(eq(drivingSchools.id, body.schoolId)).limit(1))[0]
+        : null;
+      const newItem = await runSlotWriteWithTriggerUpgrade(db, (body.examType || '') !== 'PCD' && !schoolRow?.examRotation, () =>
+        db.insert(table).values({
+          id: body.id || crypto.randomUUID(),
+          schoolId: body.schoolId,
+          examType: body.examType,
+          requestType: body.requestType || 'FIXA',
+          intendedCategory: body.intendedCategory,
+          scheduledDate: body.scheduledDate,
+          scheduledTime: body.scheduledTime,
+          examinerId: body.examinerId,
+          scheduleId: body.scheduleId,
+          scheduledCategory: body.scheduledCategory,
+          status: body.status || 'SCHEDULED',
+          attendanceConfirmed: body.attendanceConfirmed ?? false,
+          cancellationReason: body.cancellationReason,
+          observation: body.observation,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        }).returning(),
+      );
       return json(newItem[0]);
     }
 
@@ -244,21 +270,27 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const oldTable = oldModule === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
       const newTable = newModule === 'PCD' ? pcdScheduleSlots : cfcScheduleSlots;
 
+      const schoolIdForCheck = filtered.schoolId ?? found?.row?.schoolId;
+      const schoolRowForPut = newModule === 'CFC' && schoolIdForCheck
+        ? (await db.select({ examRotation: drivingSchools.examRotation }).from(drivingSchools).where(eq(drivingSchools.id, schoolIdForCheck)).limit(1))[0]
+        : null;
+      const isNonRotationPut = newModule === 'CFC' && !schoolRowForPut?.examRotation;
+
       let result: any;
       if (oldModule && oldModule !== newModule) {
         // examType mudou de categoria: mover slot atomicamente para a tabela correta
         // Merge camelCase (ORM) + incoming updates
         const merged = { ...found!.row, ...filtered, updatedAt: new Date() };
-        await db.batch([
+        await runSlotWriteWithTriggerUpgrade(db, isNonRotationPut, () => db.batch([
           db.insert(newTable).values(merged),
           db.delete(oldTable).where(eq(oldTable.id, id)),
-        ]);
+        ]));
         result = merged;
       } else {
-        const updated = await db.update(oldTable)
+        const updated = await runSlotWriteWithTriggerUpgrade(db, isNonRotationPut, () => db.update(oldTable)
           .set({ ...filtered, updatedAt: new Date() })
           .where(eq(oldTable.id, id))
-          .returning();
+          .returning());
         result = updated[0] ?? { id, ...updates };
       }
       return json(result);
@@ -288,8 +320,12 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
 
     return error('Method Not Allowed', 405);
   } catch (e: any) {
-    if (String(e.message).includes('D1_EXAMINER_') || String(e.cause?.message).includes('D1_EXAMINER_')) {
-      return error('O examinador já possui prova nesse horário ou atingiu a capacidade diária.', 409);
+    const rawErr = `${String(e?.message ?? '')} ${String(e?.cause?.message ?? '')}`;
+    if (rawErr.includes('D1_EXAMINER_CONFLICT')) {
+      return error('O examinador já possui prova nesse horário.', 409);
+    }
+    if (rawErr.includes('D1_EXAMINER_CAPACITY') || rawErr.includes('D1_EXAMINER_')) {
+      return error('O examinador atingiu a capacidade diária.', 409);
     }
     if (e.code === '23505' || e.cause?.code === '23505') {
       return error('A escala fixa já foi gerada por outra pessoa. Atualize os agendamentos.', 409);

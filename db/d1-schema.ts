@@ -9,6 +9,7 @@ import { migrateYardsInterestD1 } from './school-yards-interest-migration.js';
 import { migrateAuthSecurityD1 } from './auth-security-migration.js';
 import { migrateCleanupV2D1 } from './cleanup-v2-migration.js';
 import { migratePiiV3D1 } from './pii-v3-migration.js';
+import { VAGAS_CFC_TRIGGERS_V4, migrateNonRotationV4D1 } from './non-rotation-capacity-v4-migration.js';
 import { INITIAL_D1_V1_STATEMENTS } from './d1-v1-baseline.js';
 
 export const D1_NOW = "(strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))";
@@ -64,7 +65,7 @@ d1Tables.backups.push(extra('tamanho_armazenado_bytes', 'number'), extra('checks
 export function initialD1Statements(): string[] {
   return [...INITIAL_D1_V1_STATEMENTS];
 }
-export const d1AllocationTriggers = () => INITIAL_D1_V1_STATEMENTS.filter(s => s.startsWith('CREATE TRIGGER'));
+export const d1AllocationTriggers = () => [...VAGAS_CFC_TRIGGERS_V4];
 export const d1DropAllocationTriggers = () => ['insert', 'update'].map(event => `DROP TRIGGER IF EXISTS vagas_cfc_guard_${event}`);
 
 export async function d1Checksum(): Promise<string> {
@@ -90,6 +91,7 @@ export async function migrateD1(binding: D1Database): Promise<void> {
     await migrateAuthSecurityD1(binding);
     await migrateCleanupV2D1(binding);
     await migratePiiV3D1(binding);
+    await migrateNonRotationV4D1(binding);
     return;
   }
   const existing = await binding.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all<{ name: string }>();
@@ -107,4 +109,5 @@ export async function migrateD1(binding: D1Database): Promise<void> {
   await migrateAuthSecurityD1(binding);
   await migrateCleanupV2D1(binding);
   await migratePiiV3D1(binding);
+  await migrateNonRotationV4D1(binding);
 }

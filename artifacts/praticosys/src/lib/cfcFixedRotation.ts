@@ -189,6 +189,11 @@ export function planFixedScales(input: {
         issues.push({ school, reason: 'A escala ativa contém horários repetidos.' });
         continue;
       }
+      const conflictReason = findExaminerConflict(slots);
+      if (conflictReason) {
+        issues.push({ school, reason: conflictReason });
+        continue;
+      }
       plans.push({ school, slots });
       reserved.push(...slots.map(slot => ({ ...slot, schoolId: school.id, scheduledDate: date })));
       continue;

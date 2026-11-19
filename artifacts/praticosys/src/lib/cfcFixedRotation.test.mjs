@@ -130,3 +130,35 @@ test('reserves selected legacy fixed-scale commitments before rotating examiners
   });
   assert.equal(result.plans.find(p => p.school.id === 'escola').slots[0].examinerId, 'ex-b');
 });
+
+test('non-rotation schools have no daily examiner capacity limit across multiple schools or slots', () => {
+  const limitedExaminer = examiner('ex-a', ['cidade-a'], {
+    rotationAvailability: {
+      days: ['SEG'], cityIds: ['cidade-a'], defaultTime: '08:00',
+      secondDefaultTime: '', examsPerDay: 1,
+    },
+  });
+  const s1 = school('tijucas-1', {
+    examRotation: false,
+    mainSchedule: { active: true, frequency: '1_WEEK', days: ['SEG'], slots: [{ time: '08:00', examiner: 'ex-a' }] },
+  });
+  const s2 = school('tijucas-2', {
+    examRotation: false,
+    mainSchedule: { active: true, frequency: '1_WEEK', days: ['SEG'], slots: [{ time: '09:00', examiner: 'ex-a' }] },
+  });
+  const s3 = school('tijucas-3', {
+    examRotation: false,
+    mainSchedule: {
+      active: true, frequency: '2_DAY', days: ['SEG'],
+      slots: [{ time: '10:00', examiner: 'ex-a' }, { time: '11:00', examiner: 'ex-a' }],
+    },
+  });
+  const result = plan({
+    schools: [s1, s2, s3],
+    selectedSchoolIds: ['tijucas-1', 'tijucas-2', 'tijucas-3'],
+    examiners: [limitedExaminer],
+  });
+  assert.equal(result.issues.length, 0);
+  assert.equal(result.plans.length, 3);
+  assert.deepEqual(result.plans.map(p => p.slots).flat().map(s => s.scheduledTime), ['08:00', '09:00', '10:00', '11:00']);
+});
