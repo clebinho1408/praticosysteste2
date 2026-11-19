@@ -9,6 +9,8 @@ import {
 } from "../../../../functions/_school-schedule.js";
 // @ts-ignore Shared CNH time-conflict policy.
 import { cnhBancaConflict, cnhSchoolScaleConflict } from "../../../../functions/_cnh-time-conflicts.js";
+// @ts-ignore Shared CNH auto-bancas planner.
+import { mergePreservedAutoCnhBancaLinks, syncCnhRotationBancasOnDb } from "../../../../functions/_cnh-auto-bancas.js";
 import { db } from "@workspace/db";
 import {
   users, drivingSchools, examiners, instructors, vehicles,
@@ -409,7 +411,14 @@ router.post("/schools", async (req, res) => {
     const conflict = cnhSchoolScaleConflict({ ...req.body, id: undefined }, await db.select().from(drivingSchools));
     if (conflict) return res.status(409).json({ error: conflict });
     const item = await db.insert(drivingSchools).values({ id: crypto.randomUUID(), ...req.body }).returning();
-    return res.json(item[0]);
+    const synced = await syncCnhRotationBancasOnDb(db, {
+      drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
+    });
+    if (synced.created.length > 0) broadcast("schedules_updated", synced.created[0]);
+    const refreshed = item[0]?.id
+      ? (await db.select().from(drivingSchools).where(eq(drivingSchools.id, item[0].id)).limit(1))[0]
+      : item[0];
+    return res.json(refreshed ?? item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.put("/schools", async (req, res) => {
@@ -423,10 +432,18 @@ router.put("/schools", async (req, res) => {
     const existing = await db.select().from(drivingSchools);
     const current = existing.find(school => school.id === id);
     if (!current) return res.status(404).json({ error: "Autoescola não encontrada." });
+    if (updates.mainSchedule !== undefined) {
+      updates.mainSchedule = mergePreservedAutoCnhBancaLinks(updates.mainSchedule, current.mainSchedule);
+    }
     const conflict = cnhSchoolScaleConflict({ ...current, ...updates, id }, existing);
     if (conflict) return res.status(409).json({ error: conflict });
     const item = await db.update(drivingSchools).set(updates).where(eq(drivingSchools.id, id)).returning();
-    return res.json(item[0]);
+    const synced = await syncCnhRotationBancasOnDb(db, {
+      drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
+    });
+    if (synced.created.length > 0) broadcast("schedules_updated", synced.created[0]);
+    const refreshed = (await db.select().from(drivingSchools).where(eq(drivingSchools.id, id)).limit(1))[0];
+    return res.json(refreshed ?? item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.delete("/schools", async (req, res) => {
@@ -587,7 +604,12 @@ router.get("/schedules", async (_req, res) => {
         s.status = calc;
       }
     }
-    return res.json(schedules);
+    const synced = await syncCnhRotationBancasOnDb(
+      db,
+      { drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings },
+      { preloadedSchedules: schedules },
+    );
+    return res.json(synced.schedules);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.post("/schedules", async (req, res) => {
@@ -639,6 +661,9 @@ router.put("/schedules", async (req, res) => {
       const item = await db.update(examSchedules)
         .set({ status: "CANCELLED", cancellationReason: reason })
         .where(eq(examSchedules.id, id)).returning();
+      await syncCnhRotationBancasOnDb(db, {
+        drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
+      });
       broadcast("schedules_updated", item[0]);
       return res.json(item[0]);
     }
@@ -649,8 +674,19 @@ router.put("/schedules", async (req, res) => {
     const conflict = cnhBancaConflict({ ...current, ...normalized, id }, existing);
     if (conflict) return res.status(409).json({ error: conflict });
     const item = await db.update(examSchedules).set(normalized).where(eq(examSchedules.id, id)).returning();
-    broadcast("schedules_updated", item[0]);
-    return res.json(item[0]);
+    const updatedRow = item[0];
+    if (updatedRow) {
+      const nextStatus = calcStatus(updatedRow.date, updatedRow.time, updatedRow.status);
+      if (nextStatus !== updatedRow.status) {
+        await db.update(examSchedules).set({ status: nextStatus }).where(eq(examSchedules.id, id));
+        updatedRow.status = nextStatus;
+      }
+    }
+    await syncCnhRotationBancasOnDb(db, {
+      drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
+    });
+    broadcast("schedules_updated", updatedRow ?? item[0]);
+    return res.json(updatedRow ?? item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.delete("/schedules", async (req, res) => {

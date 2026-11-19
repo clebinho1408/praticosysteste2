@@ -1,8 +1,20 @@
 // functions/api/schedules.ts  →  GET|POST|PUT|DELETE /api/schedules
 import { getDb, json, error, parseBody, getQuery } from '../_db.js';
-import { examSchedules, cnhbrasilRequests, cfcRequests, pcdRequests, drivingSchools } from '../../db/schema.js';
+import {
+  examSchedules,
+  cnhbrasilRequests,
+  cfcRequests,
+  pcdRequests,
+  drivingSchools,
+  examiners,
+  cities,
+  examLocations,
+  blockedDates,
+  systemSettings,
+} from '../../db/schema.js';
 import { eq, and, desc, isNotNull, sql } from 'drizzle-orm';
 import { cnhBancaConflict } from '../_cnh-time-conflicts.js';
+import { syncCnhRotationBancasOnDb } from '../_cnh-auto-bancas.js';
 import { isD1 } from '../_d1.js';
 
 const calculateStatus = (dateStr: string, timeStr: string, currentStatus: string) => {
@@ -52,7 +64,20 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         }
       }
       if (updates.length) await Promise.all(updates);
-      return json(schedules);
+      const synced = await syncCnhRotationBancasOnDb(
+        db,
+        {
+          drivingSchools,
+          examSchedules,
+          examiners,
+          cities,
+          examLocations,
+          blockedDates,
+          systemSettings,
+        },
+        { preloadedSchedules: schedules },
+      );
+      return json(synced.schedules);
     }
 
     if (method === 'POST') {
@@ -136,6 +161,15 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           } catch {}
         }
 
+        await syncCnhRotationBancasOnDb(db, {
+          drivingSchools,
+          examSchedules,
+          examiners,
+          cities,
+          examLocations,
+          blockedDates,
+          systemSettings,
+        });
         return json(updated[0] ?? { id, status: 'CANCELLED' });
       }
 
@@ -163,6 +197,15 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         if (updates.time) dateTimeUpdate.scheduledTime = updates.time;
         await updateAllModuleTables(db, dateTimeUpdate, id);
       }
+      await syncCnhRotationBancasOnDb(db, {
+        drivingSchools,
+        examSchedules,
+        examiners,
+        cities,
+        examLocations,
+        blockedDates,
+        systemSettings,
+      });
       return json(current);
     }
 

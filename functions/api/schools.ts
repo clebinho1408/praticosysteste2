@@ -1,10 +1,22 @@
 // functions/api/schools.ts  →  GET|POST|PUT|DELETE /api/schools
 import { getDb, json, error, parseBody, getQuery } from '../_db.js';
-import { drivingSchools } from '../../db/schema.js';
+import {
+  drivingSchools,
+  examSchedules,
+  examiners,
+  cities,
+  examLocations,
+  blockedDates,
+  systemSettings,
+} from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { schoolPauseValidation } from '../_school-schedule.js';
 import { cnhSchoolScaleConflict } from '../_cnh-time-conflicts.js';
 import { schoolYardsValidation } from '../_school-yards.js';
+import {
+  mergePreservedAutoCnhBancaLinks,
+  syncCnhRotationBancasOnDb,
+} from '../_cnh-auto-bancas.js';
 
 import { isD1 } from '../_d1.js';
 
@@ -53,7 +65,19 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const conflict = cnhSchoolScaleConflict({ ...body, id: undefined }, await db.select().from(drivingSchools));
       if (conflict) return error(conflict, 409);
       const newItem = await db.insert(drivingSchools).values({ id: crypto.randomUUID(), ...body }).returning();
-      return json(newItem[0]);
+      await syncCnhRotationBancasOnDb(db, {
+        drivingSchools,
+        examSchedules,
+        examiners,
+        cities,
+        examLocations,
+        blockedDates,
+        systemSettings,
+      });
+      const refreshed = newItem[0]?.id
+        ? (await db.select().from(drivingSchools).where(eq(drivingSchools.id, newItem[0].id)).limit(1))[0]
+        : newItem[0];
+      return json(refreshed ?? newItem[0]);
     }
 
     if (method === 'PUT') {
@@ -68,10 +92,23 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const existing = await db.select().from(drivingSchools);
       const current = existing.find(school => school.id === id);
       if (!current) return error('Autoescola não encontrada.', 404);
+      if (updates.mainSchedule !== undefined) {
+        updates.mainSchedule = mergePreservedAutoCnhBancaLinks(updates.mainSchedule, current.mainSchedule);
+      }
       const conflict = cnhSchoolScaleConflict({ ...current, ...updates, id }, existing);
       if (conflict) return error(conflict, 409);
       const updated = await db.update(drivingSchools).set(updates).where(eq(drivingSchools.id, id)).returning();
-      return json(updated[0]);
+      await syncCnhRotationBancasOnDb(db, {
+        drivingSchools,
+        examSchedules,
+        examiners,
+        cities,
+        examLocations,
+        blockedDates,
+        systemSettings,
+      });
+      const refreshed = (await db.select().from(drivingSchools).where(eq(drivingSchools.id, id)).limit(1))[0];
+      return json(refreshed ?? updated[0]);
     }
 
     if (method === 'DELETE') {
