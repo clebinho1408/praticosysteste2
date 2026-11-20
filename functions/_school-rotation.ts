@@ -3,6 +3,7 @@ import {
   isCalendarDate,
   isValidScaleTime,
   normalizeScaleTime,
+  resolveSchoolScaleForDate,
   scaleWeekday,
 } from './_school-schedule.js';
 
@@ -1106,3 +1107,164 @@ export function syncAllSchoolsRotationSchedules<TSchool extends OtherSchoolRotat
 
   return { schools: workingSchools, updates };
 }
+
+export interface ExaminerScheduleSlotLike {
+  id?: string;
+  schoolId?: string | null;
+  examinerId?: string | null;
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  requestType?: string | null;
+  status?: string | null;
+}
+
+export interface ExaminerUpcomingScheduleItem {
+  id: string;
+  date: string;
+  time: string;
+  schoolId: string;
+  schoolName: string;
+  source: 'ROTATION' | 'PROVISIONAL' | 'WEEKLY' | 'CONFIRMED_SLOT';
+}
+
+export interface BuildExaminerUpcomingSchedulesInput {
+  examiner: {
+    id: string;
+    name?: string | null;
+    blockedPeriods?: RotationBlockedPeriodLike[] | null;
+  } | null | undefined;
+  schools: OtherSchoolRotationLike[];
+  scheduleSlots?: ExaminerScheduleSlotLike[] | null;
+  blockedDates?: RotationBlockedDateLike[] | null;
+  systemSettings?: RotationSystemSettingsLike | null;
+  today?: string;
+  horizonDays?: number;
+}
+
+export function buildExaminerUpcomingSchedules(
+  input: BuildExaminerUpcomingSchedulesInput,
+): ExaminerUpcomingScheduleItem[] {
+  const examiner = input.examiner;
+  if (!examiner?.id) return [];
+
+  const today = input.today && isCalendarDate(input.today) ? input.today : businessDate();
+  const horizonDays = Math.max(0, input.horizonDays ?? 30);
+  const maxDate = addCalendarDays(today, horizonDays);
+  const blockedDates = input.blockedDates ?? [];
+  const examinerNameUpper = String(examiner.name ?? '').trim().toUpperCase();
+
+  const matchesExaminer = (idOrName?: string | null): boolean => {
+    const raw = String(idOrName ?? '').trim();
+    if (!raw) return false;
+    if (raw === examiner.id) return true;
+    return examinerNameUpper !== '' && raw.toUpperCase() === examinerNameUpper;
+  };
+
+  const schoolMap = new Map<string, OtherSchoolRotationLike>();
+  for (const s of input.schools ?? []) {
+    if (s?.id) schoolMap.set(s.id, s);
+  }
+
+  const byKey = new Map<string, ExaminerUpcomingScheduleItem>();
+  const generatedFixedKeys = new Set<string>();
+
+  for (const slot of input.scheduleSlots ?? []) {
+    if (!slot || slot.status === 'CANCELLED') continue;
+    const date = String(slot.scheduledDate ?? '').trim();
+    if (!isCalendarDate(date) || date < today || date > maxDate) continue;
+    const schoolId = String(slot.schoolId ?? '').trim();
+    if (!schoolId || schoolId === 'PCD' || schoolId === 'CNH_BRASIL') continue;
+    if (slot.requestType === 'FIXA') {
+      generatedFixedKeys.add(`${schoolId}|${date}`);
+    }
+    if (!matchesExaminer(slot.examinerId)) continue;
+    const time = normalizeScaleTime(slot.scheduledTime);
+    const schoolName = schoolMap.get(schoolId)?.name || schoolId;
+    const key = `${date}|${time}|${schoolId}`;
+    byKey.set(key, {
+      id: slot.id || `slot:${key}`,
+      date,
+      time,
+      schoolId,
+      schoolName,
+      source: 'CONFIRMED_SLOT',
+    });
+  }
+
+  for (const date of listForwardDates(today, horizonDays)) {
+    const systemBlocked = isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked;
+    for (const school of input.schools ?? []) {
+      if (!school?.id || school.id === 'PCD' || school.id === 'CNH_BRASIL') continue;
+      if (generatedFixedKeys.has(`${school.id}|${date}`)) continue;
+
+      const resolved = resolveSchoolScaleForDate(
+        {
+          examRotation: Boolean(school.examRotation),
+          mainSchedule: school.mainSchedule as any,
+          provisionalSchedule: school.provisionalSchedule as any,
+        },
+        date,
+      );
+
+      if (resolved.kind === 'ROTATION_DATES') {
+        for (const entry of resolved.entries) {
+          if (!matchesExaminer(entry.examiner)) continue;
+          const time = normalizeScaleTime(entry.time);
+          const key = `${date}|${time}|${school.id}`;
+          if (!byKey.has(key)) {
+            byKey.set(key, {
+              id: `rot:${key}`,
+              date,
+              time,
+              schoolId: school.id,
+              schoolName: school.name || school.id,
+              source: 'ROTATION',
+            });
+          }
+        }
+      } else if (resolved.kind === 'PROVISIONAL_DATES') {
+        for (const entry of resolved.specificDates) {
+          if (!matchesExaminer(entry.examiner)) continue;
+          const time = normalizeScaleTime(entry.time);
+          const key = `${date}|${time}|${school.id}`;
+          if (!byKey.has(key)) {
+            byKey.set(key, {
+              id: `prov:${key}`,
+              date,
+              time,
+              schoolId: school.id,
+              schoolName: school.name || school.id,
+              source: 'PROVISIONAL',
+            });
+          }
+        }
+      } else if (resolved.kind === 'WEEKLY_SLOTS' && !school.examRotation) {
+        if (systemBlocked) continue;
+        for (const slot of resolved.slots) {
+          if (!matchesExaminer(slot.examiner)) continue;
+          const time = normalizeScaleTime(slot.time);
+          if (isExaminerBlockedOnDateTime(examiner.blockedPeriods, date, time).blocked) continue;
+          const key = `${date}|${time}|${school.id}`;
+          if (!byKey.has(key)) {
+            byKey.set(key, {
+              id: `weekly:${key}`,
+              date,
+              time,
+              schoolId: school.id,
+              schoolName: school.name || school.id,
+              source: 'WEEKLY',
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return [...byKey.values()].sort(
+    (a, b) =>
+      a.date.localeCompare(b.date) ||
+      a.time.localeCompare(b.time) ||
+      a.schoolName.localeCompare(b.schoolName),
+  );
+}
+

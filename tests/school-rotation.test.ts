@@ -11,6 +11,7 @@ import {
   isExaminerBlockedOnDateTime,
   isSystemDateBlockedForRotation,
   resolveExaminerDefaultRotationTime,
+  buildExaminerUpcomingSchedules,
 } from '../functions/_school-rotation.js';
 import {
   resolveSchoolScaleForDate,
@@ -722,4 +723,95 @@ test('resolveExaminerDefaultRotationTime picks examiner default time respecting 
   assert.equal(resolveExaminerDefaultRotationTime(exNoAvail, config, '2026-11-23'), null);
   assert.equal(resolveExaminerDefaultRotationTime(null, config), null);
 });
+
+test('buildExaminerUpcomingSchedules lists next 30 days with date, time, schoolName and drops past dates', () => {
+  const ex = makeExaminer('ex-1', {
+    name: 'EXAMINADOR UM',
+    blockedPeriods: [
+      { id: 'vac-1', startDate: '2026-11-30', endDate: '2026-11-30', description: 'Folga', period: 'ALL_DAY' },
+    ],
+  });
+  const schools = [
+    {
+      id: 'sch-rot',
+      name: 'AUTOESCOLA RODIZIO',
+      city: 'CIDADE A',
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        rotationConfig: { days: ['SEG', 'QUA'], startTime: '08:00', endTime: '18:00' },
+        rotationEntries: [
+          { id: 'past', date: '2026-11-20', time: '08:00', examiner: 'ex-1', manual: false }, // passou -> deve sair
+          { id: 'today', date: '2026-11-21', time: '10:00', examiner: 'ex-1', manual: false }, // hoje -> aparece
+          { id: 'other', date: '2026-11-25', time: '10:00', examiner: 'ex-2', manual: false }, // outro examinador
+          { id: 'd30', date: '2026-12-21', time: '14:00', examiner: 'ex-1', manual: false }, // +30 dias -> aparece
+          { id: 'd31', date: '2026-12-22', time: '14:00', examiner: 'ex-1', manual: false }, // >30 dias -> fora
+        ],
+      },
+      provisionalSchedule: { active: false, days: [], slots: [] },
+    },
+    {
+      id: 'sch-fixed',
+      name: 'AUTOESCOLA TIJUCAS',
+      city: 'CIDADE A',
+      examRotation: false,
+      mainSchedule: {
+        active: true,
+        days: ['SEG'],
+        slots: [{ day: 'SEG', time: '09:00', examiner: 'ex-1' }], // segundas: 2026-11-23, 2026-11-30 (férias!), 2026-12-07, 2026-12-14, 2026-12-21
+        pausedDates: ['2026-12-14'],
+      },
+      provisionalSchedule: { active: false, days: [], slots: [] },
+    },
+    {
+      id: 'sch-prov',
+      name: 'AUTOESCOLA PROVISORIA',
+      city: 'CIDADE A',
+      examRotation: false,
+      mainSchedule: { active: false, days: [], slots: [] },
+      provisionalSchedule: {
+        active: true,
+        specificDates: [{ id: 'p1', date: '2026-11-26', time: '15:30', examiner: 'ex-1' }],
+      },
+    },
+  ];
+  const scheduleSlots = [
+    // Já gerado para sch-fixed em 2026-11-23 -> não duplica
+    { id: 'sl-1', schoolId: 'sch-fixed', examinerId: 'ex-1', scheduledDate: '2026-11-23', scheduledTime: '09:00', requestType: 'FIXA', status: 'SCHEDULED' },
+  ];
+  const blockedDates = [{ date: '2026-12-07', description: 'Feriado local' }];
+
+  const items = buildExaminerUpcomingSchedules({
+    examiner: ex,
+    schools,
+    scheduleSlots,
+    blockedDates,
+    today: '2026-11-21',
+    horizonDays: 30,
+  });
+
+  assert.deepEqual(
+    items.map(i => `${i.date}|${i.time}|${i.schoolName}`),
+    [
+      '2026-11-21|10:00|AUTOESCOLA RODIZIO',
+      '2026-11-23|09:00|AUTOESCOLA TIJUCAS',
+      '2026-11-26|15:30|AUTOESCOLA PROVISORIA',
+      '2026-12-21|09:00|AUTOESCOLA TIJUCAS',
+      '2026-12-21|14:00|AUTOESCOLA RODIZIO',
+    ],
+  );
+
+  // Quando o dia avança para 2026-11-24, datas passadas saem automaticamente da lista
+  const nextDayItems = buildExaminerUpcomingSchedules({
+    examiner: ex,
+    schools,
+    scheduleSlots,
+    blockedDates,
+    today: '2026-11-24',
+    horizonDays: 30,
+  });
+  assert.equal(nextDayItems.some(i => i.date < '2026-11-24'), false);
+  assert.equal(nextDayItems[0].date, '2026-11-26');
+});
+
 

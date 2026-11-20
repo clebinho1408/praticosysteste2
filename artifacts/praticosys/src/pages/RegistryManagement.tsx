@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, ExaminerScheduleSlotLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2963,11 +2963,17 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
 
 const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [examiners, setExaminers] = useState<Examiner[]>([]);
+  const [schools, setSchools] = useState<DrivingSchool[]>([]);
+  const [scheduleSlots, setScheduleSlots] = useState<ExaminerScheduleSlotLike[]>([]);
+  const [blockedDates, setBlockedDates] = useState<BlockedDate[]>([]);
+  const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(null);
+  const [schedulesLoading, setSchedulesLoading] = useState(false);
+  const [today, setToday] = useState(() => businessDate());
   const [cities, setCities] = useState<City[]>([]);
   const [citiesError, setCitiesError] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editing, setEditing] = useState<Examiner | null>(null);
-  const [modalTab, setModalTab] = useState<'DADOS' | 'RODIZIO' | 'BLOQUEIOS'>('DADOS');
+  const [modalTab, setModalTab] = useState<'DADOS' | 'RODIZIO' | 'BLOQUEIOS' | 'ESCALAS'>('DADOS');
   const emptyRotation: ExaminerRotationAvailability = { days: [], defaultTime: '', secondDefaultTime: '', examsPerDay: 1, cityIds: [] };
   type ExaminerForm = { name: string; registrationNumber: string; categories: string[]; defaultMaxSlotsA: string; defaultMaxSlotsB: string; defaultMaxSlotsMudanca: string; examRotation: boolean; rotationAvailability: ExaminerRotationAvailability | null };
   const [formData, setFormData] = useState<ExaminerForm>({ name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: null });
@@ -3017,14 +3023,49 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       setExaminers(examiners);
     }
   };
+  const loadScheduleContext = async () => {
+    setSchedulesLoading(true);
+    try {
+      const [schoolsData, slotsData, blockedData, settingsData] = await Promise.all([
+        api.getSchoolsAsync(),
+        api.getScheduleSlots(),
+        api.getBlockedDates(),
+        api.getSettings(),
+      ]);
+      setSchools(schoolsData);
+      setScheduleSlots(slotsData);
+      setBlockedDates(blockedData);
+      setSystemSettings(settingsData);
+      setToday(businessDate());
+    } catch {
+      // mantém os dados já carregados em cache local caso alguma leitura falhe
+    } finally {
+      setSchedulesLoading(false);
+    }
+  };
+
   useEffect(() => {
     fetch();
+    loadScheduleContext();
     api.getCities().then(setCities).catch(() => setCitiesError('Não foi possível carregar as cidades.'));
+  }, []);
+
+  useEffect(() => {
+    const refreshDate = () => setToday(businessDate());
+    const onVisibility = () => { if (!document.hidden) refreshDate(); };
+    window.addEventListener('focus', refreshDate);
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      window.removeEventListener('focus', refreshDate);
+      document.removeEventListener('visibilitychange', onVisibility);
+    };
   }, []);
 
   const openModal = (ex?: Examiner) => {
     setEditing(ex || null);
     setModalTab('DADOS');
+    setToday(businessDate());
+    loadScheduleContext();
     setFormData(ex ? {
       name: ex.name,
       registrationNumber: ex.registrationNumber,
@@ -3042,6 +3083,23 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     setEditingPeriodId(null);
     setIsModalOpen(true);
   };
+
+  const upcomingSchedules = useMemo(() => {
+    if (!editing) return [];
+    return buildExaminerUpcomingSchedules({
+      examiner: {
+        id: editing.id,
+        name: formData.name || editing.name,
+        blockedPeriods,
+      },
+      schools,
+      scheduleSlots,
+      blockedDates,
+      systemSettings,
+      today,
+      horizonDays: 30,
+    });
+  }, [editing, formData.name, blockedPeriods, schools, scheduleSlots, blockedDates, systemSettings, today]);
 
   const saveRotation = () => {
     const validTime = (t: string | undefined) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t ?? '');
@@ -3351,23 +3409,23 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
 
       {isModalOpen && (
         <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
-          <div className="bg-white rounded-lg shadow-xl max-w-lg w-full flex flex-col max-h-[90vh]">
+          <div className="bg-white rounded-lg shadow-xl max-w-2xl w-full flex flex-col max-h-[90vh]">
             {/* Modal Header */}
             <div className="px-6 pt-6 pb-0">
               <h3 className="text-lg font-bold mb-4">{editing ? 'Editar Examinador' : 'Novo Examinador'}</h3>
               {/* Tabs */}
-              <div className="flex border-b mb-0">
+              <div className="flex border-b mb-0 overflow-x-auto">
                 <button
                   type="button"
                   onClick={() => setModalTab('DADOS')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${modalTab === 'DADOS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap ${modalTab === 'DADOS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
                 >
                   Dados Gerais
                 </button>
                 <button
                   type="button"
                   onClick={() => setModalTab('RODIZIO')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-1 ${modalTab === 'RODIZIO' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1 ${modalTab === 'RODIZIO' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
                 >
                   Rodízio
                   {formData.examRotation && (
@@ -3377,11 +3435,21 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                 <button
                   type="button"
                   onClick={() => setModalTab('BLOQUEIOS')}
-                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors flex items-center gap-1 ${modalTab === 'BLOQUEIOS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1 ${modalTab === 'BLOQUEIOS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
                 >
                   Afastamento / Férias
                   {blockedPeriods.length > 0 && (
                     <span className="ml-1 bg-orange-100 text-orange-700 text-xs font-bold px-1.5 py-0.5 rounded-full">{blockedPeriods.length}</span>
+                  )}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setModalTab('ESCALAS')}
+                  className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors whitespace-nowrap flex items-center gap-1 ${modalTab === 'ESCALAS' ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}
+                >
+                  Escalas
+                  {upcomingSchedules.length > 0 && (
+                    <span className="ml-1 bg-blue-100 text-blue-700 text-xs font-bold px-1.5 py-0.5 rounded-full">{upcomingSchedules.length}</span>
                   )}
                 </button>
               </div>
@@ -3768,6 +3836,63 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                             )}
                           </div>
                         ))}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* ── TAB: ESCALAS (PRÓXIMOS 30 DIAS) ── */}
+                {modalTab === 'ESCALAS' && (
+                  <div className="space-y-4">
+                    <div className="flex items-center justify-between gap-2 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
+                      <div>
+                        <p className="text-sm font-semibold text-blue-900">Escalas dos próximos 30 dias</p>
+                        <p className="text-xs text-blue-700">Datas anteriores à data atual são removidas automaticamente da lista.</p>
+                      </div>
+                      <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-white text-blue-700 border border-blue-200 whitespace-nowrap">
+                        {upcomingSchedules.length} {upcomingSchedules.length === 1 ? 'escala' : 'escalas'}
+                      </span>
+                    </div>
+
+                    {!editing ? (
+                      <p className="text-sm text-gray-500 text-center py-6">
+                        Salve o examinador para visualizar as escalas dos próximos 30 dias.
+                      </p>
+                    ) : schedulesLoading && upcomingSchedules.length === 0 ? (
+                      <p className="text-sm text-gray-500 text-center py-6">Carregando escalas...</p>
+                    ) : upcomingSchedules.length === 0 ? (
+                      <p className="text-sm text-gray-500 text-center py-6">
+                        Nenhuma escala encontrada nos próximos 30 dias.
+                      </p>
+                    ) : (
+                      <div className="border rounded-lg overflow-hidden">
+                        <table className="w-full text-sm text-left">
+                          <thead className="bg-gray-50 text-gray-600 border-b">
+                            <tr>
+                              <th className="px-3 py-2.5 font-semibold">Data</th>
+                              <th className="px-3 py-2.5 font-semibold">Horário</th>
+                              <th className="px-3 py-2.5 font-semibold">Autoescola</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-gray-100">
+                            {upcomingSchedules.map(item => (
+                              <tr key={item.id} className="hover:bg-gray-50">
+                                <td className="px-3 py-2.5 whitespace-nowrap">
+                                  <span className="font-semibold text-gray-900">{formatRotationDateBR(item.date)}</span>
+                                  <span className="ml-2 text-[11px] font-medium text-gray-500 bg-gray-100 px-1.5 py-0.5 rounded">
+                                    {scaleWeekday(item.date)}
+                                  </span>
+                                </td>
+                                <td className="px-3 py-2.5 whitespace-nowrap font-medium text-gray-800">
+                                  {item.time || '—'}
+                                </td>
+                                <td className="px-3 py-2.5 font-medium text-blue-700">
+                                  {item.schoolName}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
                       </div>
                     )}
                   </div>
