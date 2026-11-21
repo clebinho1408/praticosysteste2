@@ -64,6 +64,13 @@ export function addCalendarDays(date: string, days: number): string {
   return base.toISOString().slice(0, 10);
 }
 
+export function diffCalendarDays(earlierIso: string, laterIso: string): number {
+  if (!isCalendarDate(earlierIso) || !isCalendarDate(laterIso)) return 0;
+  const [ey, em, ed] = earlierIso.split('-').map(Number);
+  const [ly, lm, ld] = laterIso.split('-').map(Number);
+  return Math.round((Date.UTC(ly, lm - 1, ld) - Date.UTC(ey, em - 1, ed)) / 86400000);
+}
+
 export function listForwardDates(startDate: string, horizonDays = 30): string[] {
   if (!isCalendarDate(startDate) || horizonDays < 0) return [];
   const dates: string[] = [];
@@ -1226,6 +1233,7 @@ export function buildExaminerUpcomingSchedules(
 
   const byKey = new Map<string, ExaminerUpcomingScheduleItem>();
   const generatedFixedKeys = new Set<string>();
+  const activeFixedDatesBySchool = new Map<string, Set<string>>();
 
   const appointmentSources: (ExaminerScheduleSlotLike | ExaminerExamRequestLike)[] = [
     ...(input.scheduleSlots ?? []),
@@ -1235,10 +1243,19 @@ export function buildExaminerUpcomingSchedules(
   for (const item of appointmentSources) {
     if (!item) continue;
     const date = String(item.scheduledDate ?? '').split('T')[0].trim();
-    if (!isCalendarDate(date) || date < today || date > maxDate) continue;
+    if (!isCalendarDate(date)) continue;
     const schoolId = String(item.schoolId ?? '').trim();
     if (!schoolId || schoolId === 'CNH_BRASIL') continue;
     if (item.status === 'WAITING_SCHEDULING') continue;
+    if (item.requestType === 'FIXA' && item.status !== 'CANCELLED') {
+      let schoolFixedDates = activeFixedDatesBySchool.get(schoolId);
+      if (!schoolFixedDates) {
+        schoolFixedDates = new Set<string>();
+        activeFixedDatesBySchool.set(schoolId, schoolFixedDates);
+      }
+      schoolFixedDates.add(date);
+    }
+    if (date < today || date > maxDate) continue;
     if (item.requestType === 'FIXA') {
       generatedFixedKeys.add(`${schoolId}|${date}`);
     }
@@ -1257,6 +1274,17 @@ export function buildExaminerUpcomingSchedules(
         source: 'CONFIRMED_SLOT',
       });
     }
+  }
+
+  const biweeklyAnchorBySchool = new Map<string, string>();
+  const futureFixedDatesBySchool = new Map<string, string[]>();
+  for (const [schoolId, dateSet] of activeFixedDatesBySchool.entries()) {
+    const sorted = [...dateSet].sort();
+    const pastDates = sorted.filter(d => d < today);
+    if (pastDates.length > 0) {
+      biweeklyAnchorBySchool.set(schoolId, pastDates[pastDates.length - 1]);
+    }
+    futureFixedDatesBySchool.set(schoolId, sorted.filter(d => d >= today));
   }
 
   for (const sched of cnhSchedules) {
@@ -1286,6 +1314,9 @@ export function buildExaminerUpcomingSchedules(
     const systemBlocked = isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked;
     for (const school of input.schools ?? []) {
       if (!school?.id || school.id === 'PCD' || school.id === 'CNH_BRASIL') continue;
+      if (activeFixedDatesBySchool.get(school.id)?.has(date)) {
+        biweeklyAnchorBySchool.set(school.id, date);
+      }
       if (generatedFixedKeys.has(`${school.id}|${date}`)) continue;
 
       const resolved = resolveSchoolScaleForDate(
@@ -1348,6 +1379,14 @@ export function buildExaminerUpcomingSchedules(
         }
       } else if (resolved.kind === 'WEEKLY_SLOTS' && !school.examRotation) {
         if (systemBlocked) continue;
+        if (resolved.schedule.frequency === '15_DAYS') {
+          if (resolved.slots.length === 0) continue;
+          const lastAnchor = biweeklyAnchorBySchool.get(school.id);
+          if (lastAnchor && diffCalendarDays(lastAnchor, date) < 14) continue;
+          const futureFixedDates = futureFixedDatesBySchool.get(school.id) ?? [];
+          if (futureFixedDates.some(fd => fd > date && diffCalendarDays(date, fd) < 14)) continue;
+          biweeklyAnchorBySchool.set(school.id, date);
+        }
         for (const slot of resolved.slots) {
           if (!matchesExaminer(slot.examiner)) continue;
           const time = normalizeScaleTime(slot.time);
@@ -1374,6 +1413,34 @@ export function buildExaminerUpcomingSchedules(
       a.time.localeCompare(b.time) ||
       a.schoolName.localeCompare(b.schoolName),
   );
+}
+
+export function formatExaminerUpcomingSchedulesWhatsApp(input: {
+  examinerName?: string | null;
+  items: Pick<ExaminerUpcomingScheduleItem, 'date' | 'time' | 'schoolName'>[];
+}): string {
+  const lines: string[] = [];
+  lines.push('*Escala Prova Prática dos próximos 30 dias*');
+  const examinerName = String(input.examinerName ?? '').trim();
+  if (examinerName) {
+    lines.push(`Examinador: *${examinerName}*`);
+  }
+  lines.push('');
+
+  if (!Array.isArray(input.items) || input.items.length === 0) {
+    lines.push('Nenhuma escala encontrada nos próximos 30 dias.');
+  } else {
+    for (const item of input.items) {
+      const dateBr = formatRotationDateBR(item.date);
+      const weekday = scaleWeekday(item.date);
+      const time = item.time || '—';
+      lines.push(`• *${dateBr}${weekday ? ` (${weekday})` : ''}* - ${time} - ${item.schoolName}`);
+    }
+  }
+
+  lines.push('');
+  lines.push('Atenção: Caso queira ajustar os dias e horários ou cancelar alguma prova por favor nos avise com antecedência');
+  return lines.join('\n');
 }
 
 

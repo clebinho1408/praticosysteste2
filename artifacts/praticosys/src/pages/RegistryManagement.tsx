@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2970,6 +2970,7 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [blockedDates, setBlockedDates] = useState<BlockedDate[]>([]);
   const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(null);
   const [schedulesLoading, setSchedulesLoading] = useState(false);
+  const [copiedExaminerSchedule, setCopiedExaminerSchedule] = useState(false);
   const [today, setToday] = useState(() => businessDate());
   const [cities, setCities] = useState<City[]>([]);
   const [citiesError, setCitiesError] = useState('');
@@ -3099,6 +3100,7 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const openModal = (ex?: Examiner) => {
     setEditing(ex || null);
     setModalTab('DADOS');
+    setCopiedExaminerSchedule(false);
     setToday(businessDate());
     loadScheduleContext(schools.length > 0);
     setFormData(ex ? {
@@ -3138,6 +3140,39 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       horizonDays: 30,
     });
   }, [editing, formData.name, formData.examRotation, blockedPeriods, schools, scheduleSlots, requests, cnhSchedules, blockedDates, systemSettings, today]);
+
+  const handleCopyUpcomingSchedules = () => {
+    if (!editing || upcomingSchedules.length === 0) return;
+    const text = formatExaminerUpcomingSchedulesWhatsApp({
+      examinerName: formData.name || editing.name,
+      items: upcomingSchedules,
+    });
+    const markCopied = () => {
+      setCopiedExaminerSchedule(true);
+      window.setTimeout(() => setCopiedExaminerSchedule(false), 2000);
+    };
+    const copyWithFallback = () => {
+      try {
+        const ta = document.createElement('textarea');
+        ta.value = text;
+        ta.setAttribute('readonly', '');
+        ta.style.position = 'fixed';
+        ta.style.opacity = '0';
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand('copy');
+        document.body.removeChild(ta);
+        markCopied();
+      } catch {
+        // sem permissão de área de transferência
+      }
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(text).then(markCopied).catch(copyWithFallback);
+    } else {
+      copyWithFallback();
+    }
+  };
 
   const saveRotation = () => {
     const validTime = (t: string | undefined) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t ?? '');
@@ -3918,14 +3953,34 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                 {/* ── TAB: ESCALAS (PRÓXIMOS 30 DIAS) ── */}
                 {modalTab === 'ESCALAS' && (
                   <div className="space-y-4">
-                    <div className="flex items-center justify-between gap-2 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2 bg-blue-50 border border-blue-200 rounded-lg px-4 py-3">
                       <div>
                         <p className="text-sm font-semibold text-blue-900">Escalas dos próximos 30 dias</p>
                         <p className="text-xs text-blue-700">Datas anteriores à data atual são removidas automaticamente da lista.</p>
                       </div>
-                      <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-white text-blue-700 border border-blue-200 whitespace-nowrap">
-                        {upcomingSchedules.length} {upcomingSchedules.length === 1 ? 'escala' : 'escalas'}
-                      </span>
+                      <div className="flex items-center gap-2">
+                        <span className="text-xs font-bold px-2.5 py-1 rounded-full bg-white text-blue-700 border border-blue-200 whitespace-nowrap">
+                          {upcomingSchedules.length} {upcomingSchedules.length === 1 ? 'escala' : 'escalas'}
+                        </span>
+                        {editing && (
+                          <button
+                            type="button"
+                            onClick={handleCopyUpcomingSchedules}
+                            disabled={upcomingSchedules.length === 0}
+                            title="Copiar escala dos próximos 30 dias para WhatsApp"
+                            className={`flex items-center gap-1.5 px-3 py-1.5 rounded text-xs font-bold border transition-colors whitespace-nowrap ${
+                              upcomingSchedules.length === 0
+                                ? 'bg-gray-100 text-gray-400 border-gray-200 cursor-not-allowed'
+                                : copiedExaminerSchedule
+                                ? 'bg-green-100 text-green-700 border-green-300'
+                                : 'bg-white text-blue-700 border-blue-300 hover:bg-blue-100'
+                            }`}
+                          >
+                            {copiedExaminerSchedule ? <Check className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
+                            {copiedExaminerSchedule ? 'Copiado!' : 'Copiar para WhatsApp'}
+                          </button>
+                        )}
+                      </div>
                     </div>
 
                     {!editing ? (

@@ -12,6 +12,7 @@ import {
   isSystemDateBlockedForRotation,
   resolveExaminerDefaultRotationTime,
   buildExaminerUpcomingSchedules,
+  formatExaminerUpcomingSchedulesWhatsApp,
 } from '../functions/_school-rotation.js';
 import {
   resolveSchoolScaleForDate,
@@ -930,5 +931,104 @@ test('buildExaminerUpcomingSchedules reflects schedule edits, cancellations, req
   });
   assert.equal(itemsEx1NoRot.some(i => i.date === '2026-11-30'), false);
 });
+
+test('buildExaminerUpcomingSchedules respects 15_DAYS mainSchedule frequency instead of repeating every week', () => {
+  const ex = makeExaminer('ex-15', { name: 'EXAMINADOR QUINZENAL' });
+  const biweeklySchool = {
+    id: 'sch-15',
+    name: 'AUTOESCOLA QUINZENAL',
+    city: 'ITAPEMA',
+    examRotation: false,
+    mainSchedule: {
+      active: true,
+      frequency: '15_DAYS',
+      days: ['SEG'],
+      slots: [{ day: 'SEG', time: '10:00', examiner: 'ex-15' }],
+    },
+    provisionalSchedule: { active: false, days: [], slots: [] },
+  };
+  const weeklySchool = {
+    id: 'sch-wk',
+    name: 'AUTOESCOLA SEMANAL',
+    city: 'ITAPEMA',
+    examRotation: false,
+    mainSchedule: {
+      active: true,
+      frequency: '1_WEEK',
+      days: ['TER'],
+      slots: [{ day: 'TER', time: '09:00', examiner: 'ex-15' }],
+    },
+    provisionalSchedule: { active: false, days: [], slots: [] },
+  };
+
+  // Sem histórico prévio de FIXA: segundas em [2026-11-21..2026-12-21] são 23/11, 30/11, 07/12, 14/12, 21/12
+  // Quinzenal deve aparecer apenas em 23/11, 07/12 e 21/12 (nunca toda semana!)
+  const noHistory = buildExaminerUpcomingSchedules({
+    examiner: ex,
+    schools: [biweeklySchool, weeklySchool],
+    today: '2026-11-21',
+    horizonDays: 30,
+  });
+  assert.deepEqual(
+    noHistory.filter(i => i.schoolId === 'sch-15').map(i => i.date),
+    ['2026-11-23', '2026-12-07', '2026-12-21'],
+  );
+  // Semanal continua aparecendo todas as terças normalmente
+  assert.deepEqual(
+    noHistory.filter(i => i.schoolId === 'sch-wk').map(i => i.date),
+    ['2026-11-24', '2026-12-01', '2026-12-08', '2026-12-15'],
+  );
+
+  // Com FIXA recente na segunda-feira anterior (2026-11-16): 23/11 fica fora (< 14 dias), mostrando 30/11 e 14/12
+  const withRecentFixa = buildExaminerUpcomingSchedules({
+    examiner: ex,
+    schools: [biweeklySchool],
+    scheduleSlots: [
+      { id: 'prev-1', schoolId: 'sch-15', examinerId: 'ex-15', scheduledDate: '2026-11-16', scheduledTime: '10:00', requestType: 'FIXA', status: 'SCHEDULED' },
+    ],
+    today: '2026-11-21',
+    horizonDays: 30,
+  });
+  assert.deepEqual(
+    withRecentFixa.map(i => i.date),
+    ['2026-11-30', '2026-12-14'],
+  );
+
+  // Com FIXA já agendada para semana futura (2026-11-30), 23/11 não entra (< 14 dias antes de 30/11) e depois segue 14/12
+  const withFutureFixa = buildExaminerUpcomingSchedules({
+    examiner: ex,
+    schools: [biweeklySchool],
+    requests: [
+      { id: 'fut-1', schoolId: 'sch-15', examinerId: 'ex-15', scheduledDate: '2026-11-30', scheduledTime: '10:00', requestType: 'FIXA', status: 'SCHEDULED' },
+    ],
+    today: '2026-11-21',
+    horizonDays: 30,
+  });
+  assert.deepEqual(
+    withFutureFixa.map(i => i.date),
+    ['2026-11-30', '2026-12-14'],
+  );
+});
+
+test('formatExaminerUpcomingSchedulesWhatsApp formats title, items, and footer notice for WhatsApp', () => {
+  const message = formatExaminerUpcomingSchedulesWhatsApp({
+    examinerName: 'EXAMINADOR TESTE',
+    items: [
+      { date: '2026-11-23', time: '09:00', schoolName: 'AUTOESCOLA TIJUCAS' },
+      { date: '2026-11-30', time: '14:00', schoolName: 'AUTOESCOLA QUINZENAL' },
+    ],
+  });
+
+  const lines = message.split('\n');
+  assert.ok(lines[0].includes('Escala Prova Prática dos próximos 30 dias'));
+  assert.equal(lines[1], 'Examinador: *EXAMINADOR TESTE*');
+  assert.ok(message.includes('*23/11/2026 (SEG)* - 09:00 - AUTOESCOLA TIJUCAS'));
+  assert.ok(message.includes('*30/11/2026 (SEG)* - 14:00 - AUTOESCOLA QUINZENAL'));
+  assert.equal(
+    lines[lines.length - 1],
+    'Atenção: Caso queira ajustar os dias e horários ou cancelar alguma prova por favor nos avise com antecedência',
+  );
+});
+
 
 
