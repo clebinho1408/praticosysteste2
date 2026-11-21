@@ -1118,25 +1118,50 @@ export interface ExaminerScheduleSlotLike {
   status?: string | null;
 }
 
+export interface ExaminerExamRequestLike {
+  id?: string;
+  schoolId?: string | null;
+  examinerId?: string | null;
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  requestType?: string | null;
+  status?: string | null;
+  examType?: string | null;
+  modulo?: string | null;
+}
+
+export interface ExaminerCnhScheduleLike {
+  id?: string;
+  date?: string | null;
+  time?: string | null;
+  examinerIds?: string[] | null;
+  type?: string | null;
+  status?: string | null;
+  locationId?: string | null;
+}
+
 export interface ExaminerUpcomingScheduleItem {
   id: string;
   date: string;
   time: string;
   schoolId: string;
   schoolName: string;
-  source: 'ROTATION' | 'PROVISIONAL' | 'WEEKLY' | 'CONFIRMED_SLOT';
+  source: 'ROTATION' | 'PROVISIONAL' | 'WEEKLY' | 'CONFIRMED_SLOT' | 'CNH_BANCA';
 }
 
 export interface BuildExaminerUpcomingSchedulesInput {
   examiner: {
     id: string;
     name?: string | null;
+    examRotation?: boolean;
     blockedPeriods?: RotationBlockedPeriodLike[] | null;
   } | null | undefined;
   schools: OtherSchoolRotationLike[];
   scheduleSlots?: ExaminerScheduleSlotLike[] | null;
+  requests?: ExaminerExamRequestLike[] | null;
+  cnhSchedules?: ExaminerCnhScheduleLike[] | null;
   blockedDates?: RotationBlockedDateLike[] | null;
-  systemSettings?: RotationSystemSettingsLike | null;
+  systemSettings?: (RotationSystemSettingsLike & { pcdExamName?: string | null }) | null;
   today?: string;
   horizonDays?: number;
 }
@@ -1161,34 +1186,100 @@ export function buildExaminerUpcomingSchedules(
   };
 
   const schoolMap = new Map<string, OtherSchoolRotationLike>();
+  const bancaLinkByScheduleId = new Map<
+    string,
+    { schoolId: string; schoolName: string; entryId?: string; date: string; time: string }
+  >();
   for (const s of input.schools ?? []) {
-    if (s?.id) schoolMap.set(s.id, s);
+    if (!s?.id) continue;
+    schoolMap.set(s.id, s);
+    const links = Array.isArray(s.mainSchedule?.autoCnhBancaLinks) ? s.mainSchedule.autoCnhBancaLinks : [];
+    for (const link of links) {
+      if (!link?.scheduleId) continue;
+      bancaLinkByScheduleId.set(link.scheduleId, {
+        schoolId: s.id,
+        schoolName: s.name || s.id,
+        entryId: link.entryId,
+        date: String(link.date ?? '').split('T')[0],
+        time: normalizeScaleTime(link.time),
+      });
+    }
   }
+
+  const cnhSchedules = Array.isArray(input.cnhSchedules) ? input.cnhSchedules : [];
+  const cnhScheduleIds = new Set(cnhSchedules.map(s => s?.id).filter((id): id is string => Boolean(id)));
+  const overriddenRotationEntryIds = new Set<string>();
+  const overriddenRotationKeys = new Set<string>();
+  for (const [scheduleId, link] of bancaLinkByScheduleId.entries()) {
+    if (!cnhScheduleIds.has(scheduleId)) continue;
+    if (link.entryId) overriddenRotationEntryIds.add(link.entryId);
+    if (isCalendarDate(link.date)) {
+      overriddenRotationKeys.add(`${link.schoolId}|${link.date}|${link.time}`);
+    }
+  }
+
+  const resolveSchoolDisplayName = (schoolId: string): string => {
+    if (schoolId === 'PCD') return input.systemSettings?.pcdExamName || 'PROVA DIRECAO PCD';
+    if (schoolId === 'CNH_BRASIL') return 'CNH DO BRASIL';
+    return schoolMap.get(schoolId)?.name || schoolId;
+  };
 
   const byKey = new Map<string, ExaminerUpcomingScheduleItem>();
   const generatedFixedKeys = new Set<string>();
 
-  for (const slot of input.scheduleSlots ?? []) {
-    if (!slot || slot.status === 'CANCELLED') continue;
-    const date = String(slot.scheduledDate ?? '').trim();
+  const appointmentSources: (ExaminerScheduleSlotLike | ExaminerExamRequestLike)[] = [
+    ...(input.scheduleSlots ?? []),
+    ...(input.requests ?? []),
+  ];
+
+  for (const item of appointmentSources) {
+    if (!item) continue;
+    const date = String(item.scheduledDate ?? '').split('T')[0].trim();
     if (!isCalendarDate(date) || date < today || date > maxDate) continue;
-    const schoolId = String(slot.schoolId ?? '').trim();
-    if (!schoolId || schoolId === 'PCD' || schoolId === 'CNH_BRASIL') continue;
-    if (slot.requestType === 'FIXA') {
+    const schoolId = String(item.schoolId ?? '').trim();
+    if (!schoolId || schoolId === 'CNH_BRASIL') continue;
+    if (item.status === 'WAITING_SCHEDULING') continue;
+    if (item.requestType === 'FIXA') {
       generatedFixedKeys.add(`${schoolId}|${date}`);
     }
-    if (!matchesExaminer(slot.examinerId)) continue;
-    const time = normalizeScaleTime(slot.scheduledTime);
-    const schoolName = schoolMap.get(schoolId)?.name || schoolId;
+    if (item.status === 'CANCELLED') continue;
+    if (!matchesExaminer(item.examinerId)) continue;
+    const time = normalizeScaleTime(item.scheduledTime);
+    const schoolName = resolveSchoolDisplayName(schoolId);
     const key = `${date}|${time}|${schoolId}`;
-    byKey.set(key, {
-      id: slot.id || `slot:${key}`,
-      date,
-      time,
-      schoolId,
-      schoolName,
-      source: 'CONFIRMED_SLOT',
-    });
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        id: item.id || `slot:${key}`,
+        date,
+        time,
+        schoolId,
+        schoolName,
+        source: 'CONFIRMED_SLOT',
+      });
+    }
+  }
+
+  for (const sched of cnhSchedules) {
+    if (!sched || sched.status === 'CANCELLED') continue;
+    const date = String(sched.date ?? '').split('T')[0].trim();
+    if (!isCalendarDate(date) || date < today || date > maxDate) continue;
+    const examinersInBanca = Array.isArray(sched.examinerIds) ? sched.examinerIds : [];
+    if (!examinersInBanca.some(matchesExaminer)) continue;
+    const linked = sched.id ? bancaLinkByScheduleId.get(sched.id) : undefined;
+    const schoolId = linked?.schoolId || 'CNH_BRASIL';
+    const schoolName = linked?.schoolName || 'CNH DO BRASIL';
+    const time = normalizeScaleTime(sched.time);
+    const key = `${date}|${time}|${schoolId}`;
+    if (!byKey.has(key)) {
+      byKey.set(key, {
+        id: sched.id ? `banca:${sched.id}` : `banca:${key}`,
+        date,
+        time,
+        schoolId,
+        schoolName,
+        source: 'CNH_BANCA',
+      });
+    }
   }
 
   for (const date of listForwardDates(today, horizonDays)) {
@@ -1207,9 +1298,26 @@ export function buildExaminerUpcomingSchedules(
       );
 
       if (resolved.kind === 'ROTATION_DATES') {
+        const rawEntries = Array.isArray(school.mainSchedule?.rotationEntries)
+          ? school.mainSchedule!.rotationEntries
+          : [];
         for (const entry of resolved.entries) {
           if (!matchesExaminer(entry.examiner)) continue;
           const time = normalizeScaleTime(entry.time);
+          const rawEntry = rawEntries.find(
+            r =>
+              r &&
+              r.date === date &&
+              normalizeScaleTime(r.time) === time &&
+              matchesExaminer(r.examiner),
+          );
+          if (rawEntry?.id && overriddenRotationEntryIds.has(rawEntry.id)) continue;
+          if (overriddenRotationKeys.has(`${school.id}|${date}|${time}`)) continue;
+          if (!rawEntry?.manual) {
+            if (examiner.examRotation === false) continue;
+            if (systemBlocked) continue;
+            if (isExaminerBlockedOnDateTime(examiner.blockedPeriods, date, time).blocked) continue;
+          }
           const key = `${date}|${time}|${school.id}`;
           if (!byKey.has(key)) {
             byKey.set(key, {
@@ -1267,4 +1375,5 @@ export function buildExaminerUpcomingSchedules(
       a.schoolName.localeCompare(b.schoolName),
   );
 }
+
 

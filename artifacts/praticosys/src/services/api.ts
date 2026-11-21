@@ -30,6 +30,37 @@ function getAuthHeaders(): Record<string, string> {
   return {};
 }
 
+const SCHEDULE_SYNC_PREFIXES = [
+  '/schools',
+  '/schedule-slots',
+  '/requests',
+  '/schedules',
+  '/blocked-dates',
+  '/settings',
+  '/examiners',
+  '/cities',
+  '/backups',
+  '/risk-area',
+];
+
+export const PRATICOSYS_SYNC_CHANNEL = 'praticosys_sync';
+export const PRATICOSYS_SCHEDULES_CHANGED_EVENT = 'praticosys:schedules-changed';
+
+function notifyScheduleChange(endpoint: string) {
+  if (typeof window === 'undefined') return;
+  if (!SCHEDULE_SYNC_PREFIXES.some(prefix => endpoint.startsWith(prefix))) return;
+  try {
+    window.dispatchEvent(new CustomEvent(PRATICOSYS_SCHEDULES_CHANGED_EVENT, { detail: { endpoint } }));
+  } catch {}
+  try {
+    if (typeof BroadcastChannel !== 'undefined') {
+      const ch = new BroadcastChannel(PRATICOSYS_SYNC_CHANNEL);
+      ch.postMessage({ type: 'schedules-changed', endpoint });
+      ch.close();
+    }
+  } catch {}
+}
+
 async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const authHeaders = getAuthHeaders();
   const response = await fetch(`${API_BASE}${endpoint}`, {
@@ -65,8 +96,12 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
     throw new ApiRequestError(msg || `Erro ${response.status}: ${response.statusText}`, response.status);
   }
 
-  if (response.status === 204) return {} as T;
-  return response.json();
+  const method = (options?.method ?? 'GET').toUpperCase();
+  const result = response.status === 204 ? ({} as T) : await response.json();
+  if (method !== 'GET' && method !== 'HEAD') {
+    notifyScheduleChange(endpoint);
+  }
+  return result;
 }
 
 export const api = {

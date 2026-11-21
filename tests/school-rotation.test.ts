@@ -814,4 +814,121 @@ test('buildExaminerUpcomingSchedules lists next 30 days with date, time, schoolN
   assert.equal(nextDayItems[0].date, '2026-11-26');
 });
 
+test('buildExaminerUpcomingSchedules reflects schedule edits, cancellations, requests, CNH bancas, and rotation blocks', () => {
+  const ex1 = makeExaminer('ex-1', { name: 'EXAMINADOR UM', examRotation: true });
+  const ex2 = makeExaminer('ex-2', { name: 'EXAMINADOR DOIS', examRotation: true });
+
+  const schools = [
+    {
+      id: 'sch-rot',
+      name: 'AUTOESCOLA RODIZIO',
+      city: 'CIDADE A',
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        rotationConfig: { days: ['SEG', 'QUA'], startTime: '08:00', endTime: '18:00' },
+        rotationEntries: [
+          { id: 'r1', date: '2026-11-23', time: '08:00', examiner: 'ex-1', manual: false },
+          { id: 'r2', date: '2026-11-25', time: '10:00', examiner: 'ex-1', manual: false },
+          { id: 'r3', date: '2026-11-30', time: '09:00', examiner: 'ex-1', manual: false },
+        ],
+        autoCnhBancaLinks: [
+          { scheduleId: 'banca-1', date: '2026-11-25', time: '10:00', entryId: 'r2' },
+        ],
+      },
+      provisionalSchedule: { active: false, days: [], slots: [] },
+    },
+    {
+      id: 'sch-fixed',
+      name: 'AUTOESCOLA FIXA',
+      city: 'CIDADE A',
+      examRotation: false,
+      mainSchedule: {
+        active: true,
+        days: ['TER'],
+        slots: [{ day: 'TER', time: '09:00', examiner: 'ex-1' }], // 2026-11-24
+      },
+      provisionalSchedule: { active: false, days: [], slots: [] },
+    },
+  ];
+
+  // FIXA de 24/11 foi alterada para ex-2 às 11:30 em requests (ex-1 deve perder 24/11; ex-2 deve receber)
+  // FIXA de 23/11 em sch-rot foi cancelada (não deve voltar a mostrar template)
+  // EXTRA em sch-fixed para ex-1 em 27/11 e Banca CNH r2 alterada de ex-1 para ex-2 às 14:30
+  const requests = [
+    { id: 'req-fixa-edit', schoolId: 'sch-fixed', examinerId: 'ex-2', scheduledDate: '2026-11-24', scheduledTime: '11:30', requestType: 'FIXA', status: 'SCHEDULED' },
+    { id: 'req-extra', schoolId: 'sch-fixed', examinerId: 'ex-1', scheduledDate: '2026-11-27', scheduledTime: '16:00', requestType: 'EXTRA', status: 'SCHEDULED' },
+    { id: 'req-pcd', schoolId: 'PCD', examinerId: 'ex-1', scheduledDate: '2026-11-28', scheduledTime: '08:30', requestType: 'EXTRA', status: 'SCHEDULED' },
+    { id: 'req-wait', schoolId: 'sch-fixed', examinerId: 'ex-1', scheduledDate: '2026-11-29', scheduledTime: '08:00', requestType: 'EXTRA', status: 'WAITING_SCHEDULING' },
+  ];
+  const scheduleSlots = [
+    { id: 'slot-cancelled', schoolId: 'sch-rot', examinerId: 'ex-1', scheduledDate: '2026-11-23', scheduledTime: '08:00', requestType: 'FIXA', status: 'CANCELLED' },
+  ];
+  const cnhSchedules = [
+    { id: 'banca-1', date: '2026-11-25', time: '14:30', examinerIds: ['ex-2'], type: 'COMMON', status: 'OPEN' },
+  ];
+
+  const itemsEx1 = buildExaminerUpcomingSchedules({
+    examiner: ex1,
+    schools,
+    scheduleSlots,
+    requests,
+    cnhSchedules,
+    today: '2026-11-21',
+    horizonDays: 10,
+  });
+  assert.deepEqual(
+    itemsEx1.map(i => `${i.date}|${i.time}|${i.schoolName}`),
+    [
+      '2026-11-27|16:00|AUTOESCOLA FIXA',
+      '2026-11-28|08:30|PROVA DIRECAO PCD',
+      '2026-11-30|09:00|AUTOESCOLA RODIZIO',
+      '2026-12-01|09:00|AUTOESCOLA FIXA',
+    ],
+  );
+
+  const itemsEx2 = buildExaminerUpcomingSchedules({
+    examiner: ex2,
+    schools,
+    scheduleSlots,
+    requests,
+    cnhSchedules,
+    today: '2026-11-21',
+    horizonDays: 10,
+  });
+  assert.deepEqual(
+    itemsEx2.map(i => `${i.date}|${i.time}|${i.schoolName}`),
+    [
+      '2026-11-24|11:30|AUTOESCOLA FIXA',
+      '2026-11-25|14:30|AUTOESCOLA RODIZIO',
+    ],
+  );
+
+  // Se ex-1 desmarcar Participar do Rodízio ou cadastrar afastamento em 30/11, a linha r3 automática sai da lista imediatamente
+  const itemsEx1WithBlock = buildExaminerUpcomingSchedules({
+    examiner: {
+      ...ex1,
+      blockedPeriods: [{ id: 'f1', startDate: '2026-11-30', endDate: '2026-11-30', period: 'ALL_DAY' }],
+    },
+    schools,
+    scheduleSlots,
+    requests,
+    cnhSchedules,
+    today: '2026-11-21',
+    horizonDays: 10,
+  });
+  assert.equal(itemsEx1WithBlock.some(i => i.date === '2026-11-30'), false);
+
+  const itemsEx1NoRot = buildExaminerUpcomingSchedules({
+    examiner: { ...ex1, examRotation: false },
+    schools,
+    scheduleSlots,
+    requests,
+    cnhSchedules,
+    today: '2026-11-21',
+    horizonDays: 10,
+  });
+  assert.equal(itemsEx1NoRot.some(i => i.date === '2026-11-30'), false);
+});
+
 

@@ -1,11 +1,11 @@
 
 import React, { useEffect, useState, useMemo } from 'react';
-import { api } from '../services/api';
+import { api, PRATICOSYS_SCHEDULES_CHANGED_EVENT, PRATICOSYS_SYNC_CHANNEL } from '../services/api';
 import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, RotationConfig, RotationScheduleEntry, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, ExaminerScheduleSlotLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2965,6 +2965,8 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [examiners, setExaminers] = useState<Examiner[]>([]);
   const [schools, setSchools] = useState<DrivingSchool[]>([]);
   const [scheduleSlots, setScheduleSlots] = useState<ExaminerScheduleSlotLike[]>([]);
+  const [requests, setRequests] = useState<ExaminerExamRequestLike[]>([]);
+  const [cnhSchedules, setCnhSchedules] = useState<ExaminerCnhScheduleLike[]>([]);
   const [blockedDates, setBlockedDates] = useState<BlockedDate[]>([]);
   const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(null);
   const [schedulesLoading, setSchedulesLoading] = useState(false);
@@ -3023,24 +3025,28 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       setExaminers(examiners);
     }
   };
-  const loadScheduleContext = async () => {
-    setSchedulesLoading(true);
+  const loadScheduleContext = async (silent = false) => {
+    if (!silent) setSchedulesLoading(true);
     try {
-      const [schoolsData, slotsData, blockedData, settingsData] = await Promise.all([
+      const [schoolsData, slotsData, requestsData, cnhSchedulesData, blockedData, settingsData] = await Promise.all([
         api.getSchoolsAsync(),
         api.getScheduleSlots(),
+        api.getRequests().catch(() => [] as ExaminerExamRequestLike[]),
+        api.getSchedules().catch(() => [] as ExaminerCnhScheduleLike[]),
         api.getBlockedDates(),
         api.getSettings(),
       ]);
       setSchools(schoolsData);
       setScheduleSlots(slotsData);
+      setRequests(requestsData);
+      setCnhSchedules(cnhSchedulesData);
       setBlockedDates(blockedData);
       setSystemSettings(settingsData);
       setToday(businessDate());
     } catch {
       // mantém os dados já carregados em cache local caso alguma leitura falhe
     } finally {
-      setSchedulesLoading(false);
+      if (!silent) setSchedulesLoading(false);
     }
   };
 
@@ -3051,21 +3057,50 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   }, []);
 
   useEffect(() => {
-    const refreshDate = () => setToday(businessDate());
-    const onVisibility = () => { if (!document.hidden) refreshDate(); };
-    window.addEventListener('focus', refreshDate);
+    const refreshAll = () => {
+      setToday(businessDate());
+      loadScheduleContext(true);
+    };
+    const onVisibility = () => {
+      if (!document.hidden) refreshAll();
+    };
+    const onSchedulesChanged = () => {
+      fetch().catch(() => {});
+      loadScheduleContext(true);
+    };
+    window.addEventListener('focus', refreshAll);
+    window.addEventListener(PRATICOSYS_SCHEDULES_CHANGED_EVENT, onSchedulesChanged);
     document.addEventListener('visibilitychange', onVisibility);
+    let channel: BroadcastChannel | null = null;
+    try {
+      if (typeof BroadcastChannel !== 'undefined') {
+        channel = new BroadcastChannel(PRATICOSYS_SYNC_CHANNEL);
+        channel.onmessage = () => onSchedulesChanged();
+      }
+    } catch {}
     return () => {
-      window.removeEventListener('focus', refreshDate);
+      window.removeEventListener('focus', refreshAll);
+      window.removeEventListener(PRATICOSYS_SCHEDULES_CHANGED_EVENT, onSchedulesChanged);
       document.removeEventListener('visibilitychange', onVisibility);
+      channel?.close();
     };
   }, []);
+
+  useEffect(() => {
+    if (!isModalOpen) return;
+    loadScheduleContext(true);
+    if (modalTab !== 'ESCALAS') return;
+    const interval = window.setInterval(() => {
+      loadScheduleContext(true);
+    }, 4000);
+    return () => window.clearInterval(interval);
+  }, [isModalOpen, modalTab]);
 
   const openModal = (ex?: Examiner) => {
     setEditing(ex || null);
     setModalTab('DADOS');
     setToday(businessDate());
-    loadScheduleContext();
+    loadScheduleContext(schools.length > 0);
     setFormData(ex ? {
       name: ex.name,
       registrationNumber: ex.registrationNumber,
@@ -3090,16 +3125,19 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       examiner: {
         id: editing.id,
         name: formData.name || editing.name,
+        examRotation: formData.examRotation,
         blockedPeriods,
       },
       schools,
       scheduleSlots,
+      requests,
+      cnhSchedules,
       blockedDates,
       systemSettings,
       today,
       horizonDays: 30,
     });
-  }, [editing, formData.name, blockedPeriods, schools, scheduleSlots, blockedDates, systemSettings, today]);
+  }, [editing, formData.name, formData.examRotation, blockedPeriods, schools, scheduleSlots, requests, cnhSchedules, blockedDates, systemSettings, today]);
 
   const saveRotation = () => {
     const validTime = (t: string | undefined) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t ?? '');
@@ -3119,6 +3157,40 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     setFormData(prev => ({ ...prev, examRotation: false, rotationAvailability: null }));
     setRotationDraft({ ...emptyRotation });
     setRotationError('');
+  };
+
+  const syncSchoolsRotationAfterExaminerChange = async () => {
+    const canPersistSchoolSync = user.role === UserRole.ADMIN ||
+      (user.role === UserRole.SUPERVISOR && !!user.allowedModules?.includes('cadastro') && !!user.allowedCadastroTabs?.includes('autoescolas'));
+    if (!canPersistSchoolSync) return;
+    try {
+      const [schoolsData, examinersData, citiesData, bdData, settingsData] = await Promise.all([
+        api.getSchoolsAsync(),
+        api.getExaminersAsync(),
+        api.getCities(),
+        api.getBlockedDates(),
+        api.getSettings(),
+      ]);
+      const { schools: syncedSchools, updates: rotationUpdates } = syncAllSchoolsRotationSchedules({
+        schools: schoolsData,
+        examiners: examinersData,
+        cities: citiesData,
+        blockedDates: bdData,
+        systemSettings: settingsData,
+        today: businessDate(),
+      });
+      if (rotationUpdates.length > 0) {
+        await Promise.all(
+          rotationUpdates.map(u => api.updateSchool(u.id, { mainSchedule: u.mainSchedule }).catch(() => null)),
+        );
+      }
+      setSchools(syncedSchools);
+      setCities(citiesData);
+      setBlockedDates(bdData);
+      setSystemSettings(settingsData);
+    } catch (err) {
+      console.error('Erro ao ressincronizar rodízio após alteração do examinador:', err);
+    }
   };
 
   const handleSave = async (e: React.FormEvent) => {
@@ -3145,7 +3217,8 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
         });
       }
       setIsModalOpen(false);
-      fetch();
+      await Promise.all([fetch(), syncSchoolsRotationAfterExaminerChange()]);
+      loadScheduleContext(true);
     } catch (error) {
       console.error('Error saving examiner:', error);
       alert('Erro ao salvar examinador.');
@@ -3270,7 +3343,8 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
           isDestructive: true,
           onConfirm: async () => {
               await api.deleteExaminer(id);
-              fetch();
+              await Promise.all([fetch(), syncSchoolsRotationAfterExaminerChange()]);
+              loadScheduleContext(true);
           }
       });
   };
