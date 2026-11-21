@@ -1020,13 +1020,15 @@ test('formatExaminerUpcomingSchedulesWhatsApp formats title, items, and footer n
   });
 
   const lines = message.split('\n');
-  assert.ok(lines[0].includes('Escala Prova Prática dos próximos 30 dias'));
-  assert.equal(lines[1], 'Examinador: *EXAMINADOR TESTE*');
+  assert.equal(lines[0], '*Escala Prova Prática dos próximos 30 dias*');
+  assert.equal(lines[1], '');
+  assert.equal(lines[2], 'Examinador: *EXAMINADOR TESTE*');
+  assert.equal(lines[3], '');
   assert.ok(message.includes('*23/11/2026 (SEG)* - 09:00 - AUTOESCOLA TIJUCAS'));
   assert.ok(message.includes('*30/11/2026 (SEG)* - 14:00 - AUTOESCOLA QUINZENAL'));
   assert.equal(
     lines[lines.length - 1],
-    'Atenção: Caso queira ajustar os dias e horários ou cancelar alguma prova por favor nos avise com antecedência',
+    '⚠️ Atenção: Se houver necessidade de alterar os dias ou horários, ou de cancelar alguma prova, solicitamos que nos informe com antecedência.',
   );
 });
 

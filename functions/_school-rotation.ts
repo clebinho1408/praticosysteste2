@@ -1423,6 +1423,7 @@ export function formatExaminerUpcomingSchedulesWhatsApp(input: {
   lines.push('*Escala Prova Prática dos próximos 30 dias*');
   const examinerName = String(input.examinerName ?? '').trim();
   if (examinerName) {
+    lines.push('');
     lines.push(`Examinador: *${examinerName}*`);
   }
   lines.push('');
@@ -1439,7 +1440,7 @@ export function formatExaminerUpcomingSchedulesWhatsApp(input: {
   }
 
   lines.push('');
-  lines.push('Atenção: Caso queira ajustar os dias e horários ou cancelar alguma prova por favor nos avise com antecedência');
+  lines.push('⚠️ Atenção: Se houver necessidade de alterar os dias ou horários, ou de cancelar alguma prova, solicitamos que nos informe com antecedência.');
   return lines.join('\n');
 }
 
