@@ -1431,12 +1431,13 @@ export function formatExaminerUpcomingSchedulesWhatsApp(input: {
   if (!Array.isArray(input.items) || input.items.length === 0) {
     lines.push('Nenhuma escala encontrada nos próximos 30 dias.');
   } else {
-    for (const item of input.items) {
+    input.items.forEach((item, index) => {
+      if (index > 0) lines.push('');
       const dateBr = formatRotationDateBR(item.date);
       const weekday = scaleWeekday(item.date);
       const time = item.time || '—';
       lines.push(`• *${dateBr}${weekday ? ` (${weekday})` : ''}* - ${time} - ${item.schoolName}`);
-    }
+    });
   }
 
   lines.push('');
