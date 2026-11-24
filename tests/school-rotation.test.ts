@@ -13,6 +13,10 @@ import {
   resolveExaminerDefaultRotationTime,
   buildExaminerUpcomingSchedules,
   formatExaminerUpcomingSchedulesWhatsApp,
+  filterUpcomingExaminerRotationDates,
+  isRotationDateSlotEditable,
+  validateExaminerRotationDatesUpdate,
+  addCalendarDays,
 } from '../functions/_school-rotation.js';
 import {
   resolveSchoolScaleForDate,
@@ -1031,6 +1035,181 @@ test('formatExaminerUpcomingSchedulesWhatsApp formats title, items, and footer n
     '',
     '⚠️ Atenção: Se houver necessidade de alterar os dias ou horários, ou de cancelar alguma prova, solicitamos que nos informe com antecedência.',
   ]);
+});
+
+test('validateExaminerRotationDatesUpdate enforces 60-day range, blockedDates/weekends, 48h edit/delete lock, and auto-hides past dates', () => {
+  const now = new Date('2026-11-23T12:00:00Z');
+  const today = '2026-11-23';
+  const maxAllowed = addCalendarDays(today, 60); // 2027-01-22
+  const tooFar = addCalendarDays(today, 61);     // 2027-01-23
+
+  // 1. Rejeita data no passado
+  const pastRes = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 's1', date: '2026-11-22', time: '10:00', createdAt: now.toISOString() }],
+    today,
+    now,
+  });
+  assert.equal(pastRes.ok, false);
+
+  // 2. Rejeita data acima de 60 dias no futuro
+  const farRes = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 's2', date: tooFar, time: '10:00', createdAt: now.toISOString() }],
+    today,
+    now,
+  });
+  assert.equal(farRes.ok, false);
+
+  // 3. Rejeita data bloqueada em Bloqueio de Datas e final de semana quando blockWeekends = true
+  const blockedRes = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 's3', date: '2026-12-25', time: '10:00', createdAt: now.toISOString() }],
+    blockedDates: [{ date: '2026-12-25', description: 'Natal' }],
+    today,
+    now,
+  });
+  assert.equal(blockedRes.ok, false);
+
+  const weekendRes = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 's4', date: '2026-11-28', time: '10:00', createdAt: now.toISOString() }], // Sábado
+    systemSettings: { blockWeekends: true },
+    today,
+    now,
+  });
+  assert.equal(weekendRes.ok, false);
+
+  // 4. Aceita data no limite de 60 dias e grava createdAt do servidor
+  const validRes = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [
+      { id: 's-ok', date: maxAllowed, time: '14:30', createdAt: '1999-01-01T00:00:00Z' },
+    ],
+    blockedDates: [{ date: '2026-12-25', description: 'Natal' }],
+    systemSettings: { blockWeekends: true },
+    today,
+    now,
+  });
+  assert.equal(validRes.ok, true);
+  if (validRes.ok) {
+    assert.equal(validRes.availableDates.length, 1);
+    assert.equal(validRes.availableDates[0].date, maxAllowed);
+    assert.equal(validRes.availableDates[0].createdAt, now.toISOString());
+  }
+
+  // 5. Regra de 48h: dentro de 48h permite editar/excluir (preservando createdAt original); >48h bloqueia edição/exclusão
+  const within48h = new Date(now.getTime() - 47 * 3600 * 1000).toISOString();
+  const over48h = new Date(now.getTime() - 49 * 3600 * 1000).toISOString();
+  const existingSlots = [
+    { id: 'past-1', date: '2026-11-20', time: '09:00', createdAt: over48h }, // já passou → ocultado automaticamente
+    { id: 'locked-1', date: '2026-12-01', time: '10:00', createdAt: over48h },
+    { id: 'editable-1', date: '2026-12-02', time: '11:00', createdAt: within48h },
+  ];
+
+  assert.equal(isRotationDateSlotEditable(existingSlots[1], now).editable, false);
+  assert.equal(isRotationDateSlotEditable(existingSlots[2], now).editable, true);
+
+  // Tentar excluir ou editar slot > 48h deve falhar
+  const tryDeleteLocked = validateExaminerRotationDatesUpdate({
+    existingSlots,
+    nextSlots: [existingSlots[2]], // omitiu locked-1
+    today,
+    now,
+  });
+  assert.equal(tryDeleteLocked.ok, false);
+
+  const tryEditLocked = validateExaminerRotationDatesUpdate({
+    existingSlots,
+    nextSlots: [{ ...existingSlots[1], time: '15:00' }, existingSlots[2]],
+    today,
+    now,
+  });
+  assert.equal(tryEditLocked.ok, false);
+
+  // Editar slot dentro de 48h mantendo locked-1 intacto deve funcionar e preservar createdAt original
+  const editWithin48 = validateExaminerRotationDatesUpdate({
+    existingSlots,
+    nextSlots: [
+      existingSlots[1],
+      { ...existingSlots[2], time: '15:30' },
+    ],
+    today,
+    now,
+  });
+  assert.equal(editWithin48.ok, true);
+  if (editWithin48.ok) {
+    assert.equal(editWithin48.availableDates.length, 2);
+    assert.equal(editWithin48.availableDates[1].time, '15:30');
+    assert.equal(editWithin48.availableDates[1].createdAt, within48h);
+  }
+
+  // filterUpcomingExaminerRotationDates oculta automaticamente datas anteriores a hoje
+  const filtered = filterUpcomingExaminerRotationDates(existingSlots, today);
+  assert.deepEqual(filtered.map(s => s.id), ['locked-1', 'editable-1']);
+});
+
+test('school rotation & fixed scale planning work with examiner explicit availableDates', () => {
+  const exExplicit = makeExaminer('ex-mobile', {
+    name: 'MOBILE EXAMINER',
+    rotationAvailability: {
+      cityIds: ['c1'],
+      availableDates: [
+        { id: 'd1', date: '2026-11-23', time: '14:00', createdAt: '2026-11-22T10:00:00Z' },
+        { id: 'd2', date: '2026-11-25', time: '15:00', createdAt: '2026-11-22T10:00:00Z' },
+      ],
+    },
+  });
+
+  const config = { days: ['SEG', 'QUA'], startTime: '10:00', endTime: '16:00' };
+  const elig = findEligibleExaminersForSchool({
+    schoolCity: 'ITAPEMA',
+    config,
+    examiners: [exExplicit],
+    cities,
+    today: '2026-11-23',
+  });
+  assert.deepEqual(elig.eligible.map(e => e.id), ['ex-mobile']);
+
+  const synced = syncRollingRotationSchedule({
+    schoolCity: 'ITAPEMA',
+    config,
+    examiners: [exExplicit],
+    cities,
+    today: '2026-11-23',
+    horizonDays: 10,
+  });
+  assert.deepEqual(
+    synced.entries.map(e => `${e.date} ${e.time}`),
+    ['2026-11-23 14:00', '2026-11-25 15:00'],
+  );
+
+  const planned = planFixedScales({
+    date: '2026-11-25',
+    selectedSchoolIds: ['sch-rot'],
+    schools: [{
+      id: 'sch-rot',
+      name: 'ESCOLA RODIZIO',
+      phone: '',
+      email: '',
+      address: '',
+      city: 'ITAPEMA',
+      services: ['A', 'B'],
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        frequency: '1_WEEK',
+        days: ['QUA'],
+        slots: [{ day: 'QUA', time: '10:00', examiner: '' }],
+      },
+    }],
+    examiners: [exExplicit as any],
+    cities: cities as any,
+    commitments: [],
+  });
+  assert.equal(planned.issues.length, 0);
+  assert.equal(planned.plans[0].slots[0].examinerId, 'ex-mobile');
+  assert.equal(planned.plans[0].slots[0].scheduledTime, '15:00');
 });
 
 

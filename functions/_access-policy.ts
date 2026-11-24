@@ -156,7 +156,10 @@ export async function accessPolicy(db: any, schema: any, user: any) {
     for (const row of payload) {
       if (!await rowVisible(row, route)) continue;
       if (!globalReader && route === 'examiners') {
-        result.push(pickFields(row, ['id', 'name', 'categories', 'canExamCommon', 'canExamPCD']));
+        const fields = user.role === 'EXAMINER' && row.id === user.examinerId
+          ? ['id', 'name', 'categories', 'canExamCommon', 'canExamPCD', 'examRotation', 'rotationAvailability', 'blockedPeriods']
+          : ['id', 'name', 'categories', 'canExamCommon', 'canExamPCD'];
+        result.push(pickFields(row, fields));
       } else if (!globalReader && route === 'schools') {
         result.push(user.role === 'SCHOOL' && row.id === user.schoolId ? row : pickFields(row, ['id', 'name', 'city']));
       } else if (user.role === 'EXAMINER' && ['requests', 'schedule-slots'].includes(route) &&
@@ -211,6 +214,15 @@ export async function accessPolicy(db: any, schema: any, user: any) {
       return;
     }
     if (registryTabs[route]) {
+      if (route === 'examiners' && method === 'PUT' && user.role === 'EXAMINER') {
+        if (!body?.id || body.id !== user.examinerId) throw new AccessDenied();
+        if (Object.keys(body).some(k => !['id', 'rotationAvailability'].includes(k))) throw new AccessDenied();
+        const av = body.rotationAvailability;
+        if (!av || typeof av !== 'object' || Array.isArray(av) || !Array.isArray(av.availableDates)) {
+          throw new AccessDenied(400, 'Informe a lista de datas e horários disponíveis.');
+        }
+        return;
+      }
       if (!registroAllowed(user, route)) throw new AccessDenied();
       // Prevent a nested vehicle ID from escaping the parent instructor.
       if (route === 'instructors' && Array.isArray(body.vehicles)) {

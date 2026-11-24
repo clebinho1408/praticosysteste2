@@ -15,6 +15,7 @@ interface DatePickerProps {
   className?: string;
   id?: string;
   minDate?: string;
+  maxDate?: string;
   allowedWeekdays?: number[];
 }
 
@@ -27,6 +28,7 @@ const DatePicker: React.FC<DatePickerProps> = ({
   className = '',
   id,
   minDate,
+  maxDate,
   allowedWeekdays,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -37,6 +39,7 @@ const DatePicker: React.FC<DatePickerProps> = ({
   const isDateUnavailable = (date: Date) => {
     const dateStr = format(date, 'yyyy-MM-dd');
     return (minDate ? dateStr < minDate : isDateInPast(dateStr)) ||
+      (maxDate ? dateStr > maxDate : false) ||
       (allowedWeekdays !== undefined && !allowedWeekdays.includes(date.getDay())) ||
       isDateBlocked(dateStr, blockedDates, settings).blocked;
   };

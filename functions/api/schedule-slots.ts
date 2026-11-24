@@ -11,6 +11,10 @@ import {
   resolveSchoolScaleForDate,
   scaleWeekday,
 } from '../_school-schedule.js';
+import {
+  getExaminerMaxPerDayForDate,
+  getExaminerRotationTimesForDate,
+} from '../_school-rotation.js';
 
 async function runSlotWriteWithTriggerUpgrade<T>(db: any, isNonRotation: boolean, fn: () => Promise<T>): Promise<T> {
   try {
@@ -164,21 +168,24 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
           ]);
           const active = booked.filter(s => s.status !== 'CANCELLED');
           const assigned = slots.filter((s: any) => s.examinerId === examinerId);
+          const examiner = examinerRows[0];
           if (school.examRotation) {
-            const examiner = examinerRows[0];
             const availability = examiner?.rotationAvailability;
-            const times = (availability?.examsPerDay === 2
-              ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime])
-              .map(t => normalizeScaleTime(t));
+            const usesExplicit = Array.isArray(availability?.availableDates);
+            const times = getExaminerRotationTimesForDate(examiner, date);
+            const legacyValid = !usesExplicit &&
+              Boolean(availability?.days?.includes(day)) &&
+              [1, 2].includes(availability?.examsPerDay as any);
+            const explicitValid = usesExplicit && times.length > 0;
             if (!examiner?.examRotation || examiner.canExamCommon === false ||
-              !availability?.days?.includes(day) || !availability.cityIds?.includes(city!.id) ||
-              ![1, 2].includes(availability.examsPerDay) ||
+              !availability?.cityIds?.includes(city!.id) ||
+              (!legacyValid && !explicitValid) ||
               assigned.some((s: any) => !times.includes(s.scheduledTime))) {
               return error('Rodízio de Provas desativado ou disponibilidade incompatível para o examinador.', 409);
             }
           }
-          const capacity = school.examRotation && examinerRows[0]?.examRotation
-            ? examinerRows[0].rotationAvailability?.examsPerDay : null;
+          const capacity = school.examRotation && examiner?.examRotation
+            ? getExaminerMaxPerDayForDate(examiner, date) : null;
           if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
             return error('O examinador já possui prova nesse horário.', 409);
           }

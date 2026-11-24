@@ -1,5 +1,6 @@
 import type { City, DrivingSchool, Examiner, ExamSchedule } from '../types';
 import { fixedScaleDay, rotationCandidates } from './cfcFixedRotation.ts';
+import { getExaminerMaxPerDayForDate, getExaminerRotationTimesForDate } from '../../../../functions/_school-rotation';
 
 export type CnhBancaSuggestion = { examinerId: string; time: string };
 export type CnhBancaCommitment = {
@@ -23,22 +24,20 @@ export function cnhBancaSuggestions(
   if (!/^\d{4}-\d{2}-\d{2}$/.test(date) || Number.isNaN(new Date(`${date}T00:00:00`).getTime())) {
     return { options: [], reason: 'Selecione uma data válida.' };
   }
-  const { eligible, reason } = rotationCandidates(school, fixedScaleDay(date), examiners, cities);
+  const { eligible, reason } = rotationCandidates(school, fixedScaleDay(date), examiners, cities, date);
   if (reason) return { options: [], reason };
 
   const active = schedules.filter(s => s.status !== 'CANCELLED');
   const options = eligible.flatMap(examiner => {
-    const availability = examiner.rotationAvailability!;
-    const times = availability.examsPerDay === 2
-      ? [availability.defaultTime, availability.secondDefaultTime!]
-      : [availability.defaultTime];
+    const times = getExaminerRotationTimesForDate(examiner, date);
+    const maxPerDay = getExaminerMaxPerDayForDate(examiner, date);
     const booked = active.filter(s => s.date === date && s.examinerIds?.includes(examiner.id));
     const other = commitments.filter(item => item.examinerId === examiner.id && item.status !== 'CANCELLED');
     const occupied = new Set([
       ...booked.map(s => `banca:${s.id ?? `${s.date}:${s.time}`}`),
       ...other.map(item => `escala:${item.schoolId ?? ''}:${item.scheduledTime ?? ''}`),
     ]);
-    if (occupied.size >= availability.examsPerDay) return [];
+    if (occupied.size >= maxPerDay) return [];
     return times.filter(time => !booked.some(s => s.time === time) &&
         !other.some(item => item.scheduledTime === time))
       .map(time => ({ examinerId: examiner.id, time }));

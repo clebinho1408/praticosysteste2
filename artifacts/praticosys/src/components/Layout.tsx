@@ -411,7 +411,10 @@ const Layout: React.FC<LayoutProps> = ({ children, user, onLogout }) => {
                 </div>
                 {/* Botão Sair — visível em todos os tamanhos */}
                 <button
+                    type="button"
                     onClick={handleLogout}
+                    aria-label="Sair"
+                    title="Sair"
                     className="flex items-center gap-2 text-slate-400 hover:text-red-600 hover:bg-red-50 p-2 md:px-3 md:py-2 rounded-xl transition-all text-xs font-black uppercase tracking-wider"
                 >
                     <LogOut className="h-4 w-4" />

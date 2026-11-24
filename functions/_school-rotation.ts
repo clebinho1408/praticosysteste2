@@ -21,6 +21,13 @@ export interface RotationScheduleEntry {
   manual?: boolean;
 }
 
+export interface ExaminerRotationDateSlot {
+  id: string;
+  date: string;      // 'YYYY-MM-DD'
+  time: string;      // 'HH:mm'
+  createdAt: string; // ISO timestamp
+}
+
 export interface RotationBlockedPeriodLike {
   id?: string;
   startDate: string;
@@ -32,16 +39,17 @@ export interface RotationBlockedPeriodLike {
 export interface RotationExaminerLike {
   id: string;
   name: string;
-  canExamCommon?: boolean;
-  examRotation?: boolean;
+  canExamCommon?: boolean | null;
+  examRotation?: boolean | null;
   rotationAvailability?: {
-    days: string[];
-    defaultTime: string;
-    secondDefaultTime?: string;
-    examsPerDay: 1 | 2;
     cityIds: string[];
+    availableDates?: ExaminerRotationDateSlot[];
+    days?: string[];
+    defaultTime?: string;
+    secondDefaultTime?: string;
+    examsPerDay?: 1 | 2;
   } | null;
-  blockedPeriods?: RotationBlockedPeriodLike[];
+  blockedPeriods?: RotationBlockedPeriodLike[] | null;
 }
 
 export interface RotationCityLike {
@@ -147,15 +155,190 @@ export function resolveCityIdByName(schoolCity: string | undefined | null, citie
   return match?.id ?? null;
 }
 
+export const MAX_ROTATION_AVAILABILITY_DAYS = 60;
+export const ROTATION_EDIT_WINDOW_MS = 48 * 60 * 60 * 1000;
+
+export function filterUpcomingExaminerRotationDates(
+  slots: ExaminerRotationDateSlot[] | null | undefined,
+  today = businessDate(),
+): ExaminerRotationDateSlot[] {
+  if (!Array.isArray(slots) || !isCalendarDate(today)) return [];
+  return slots
+    .filter((s): s is ExaminerRotationDateSlot =>
+      Boolean(s && isCalendarDate(s.date) && s.date >= today && isValidScaleTime(normalizeScaleTime(s.time))),
+    )
+    .map(s => ({
+      ...s,
+      time: normalizeScaleTime(s.time),
+    }))
+    .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
+}
+
+export function isRotationDateSlotEditable(
+  slot: Pick<ExaminerRotationDateSlot, 'createdAt'> | null | undefined,
+  now = new Date(),
+): { editable: boolean; remainingMs: number; remainingHours: number; reason?: string } {
+  const createdMs = slot?.createdAt ? Date.parse(slot.createdAt) : Number.NaN;
+  if (!Number.isFinite(createdMs)) {
+    return {
+      editable: false,
+      remainingMs: 0,
+      remainingHours: 0,
+      reason: 'Prazo de 48h expirado (sem data de registro válida).',
+    };
+  }
+  const elapsed = now.getTime() - createdMs;
+  if (elapsed > ROTATION_EDIT_WINDOW_MS) {
+    return {
+      editable: false,
+      remainingMs: 0,
+      remainingHours: 0,
+      reason: 'Prazo de 48h após o cadastro expirado para editar ou excluir.',
+    };
+  }
+  const remainingMs = Math.max(0, ROTATION_EDIT_WINDOW_MS - Math.max(0, elapsed));
+  return {
+    editable: true,
+    remainingMs,
+    remainingHours: Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000))),
+  };
+}
+
+export function validateExaminerRotationDatesUpdate(input: {
+  existingSlots?: ExaminerRotationDateSlot[] | null;
+  nextSlots: ExaminerRotationDateSlot[];
+  blockedDates?: RotationBlockedDateLike[];
+  systemSettings?: RotationSystemSettingsLike | null;
+  today?: string;
+  now?: Date;
+  maxDaysAhead?: number;
+  createId?: () => string;
+}): { ok: true; availableDates: ExaminerRotationDateSlot[] } | { ok: false; error: string } {
+  const now = input.now ?? new Date();
+  const today = input.today && isCalendarDate(input.today) ? input.today : businessDate(now);
+  const maxDaysAhead = input.maxDaysAhead ?? MAX_ROTATION_AVAILABILITY_DAYS;
+  const maxDate = addCalendarDays(today, maxDaysAhead);
+  const blockedDates = input.blockedDates ?? [];
+  const createId = input.createId ?? (() => crypto.randomUUID());
+
+  if (!Array.isArray(input.nextSlots)) {
+    return { ok: false, error: 'Lista de datas e horários inválida.' };
+  }
+
+  const existingUpcoming = filterUpcomingExaminerRotationDates(input.existingSlots, today);
+  const existingById = new Map(existingUpcoming.map(s => [s.id, s]));
+  const incomingById = new Map<string, ExaminerRotationDateSlot>();
+  for (const item of input.nextSlots) {
+    if (item?.id) incomingById.set(item.id, item);
+  }
+
+  for (const stored of existingUpcoming) {
+    const windowState = isRotationDateSlotEditable(stored, now);
+    if (windowState.editable) continue;
+    const matched = incomingById.get(stored.id);
+    if (
+      !matched ||
+      matched.date !== stored.date ||
+      normalizeScaleTime(matched.time) !== normalizeScaleTime(stored.time)
+    ) {
+      return {
+        ok: false,
+        error: `A disponibilidade de ${formatRotationDateBR(stored.date)} às ${normalizeScaleTime(stored.time)} já ultrapassou 48h do cadastro e não pode ser editada ou excluída.`,
+      };
+    }
+  }
+
+  const seenDateTime = new Set<string>();
+  const validated: ExaminerRotationDateSlot[] = [];
+
+  for (const raw of input.nextSlots) {
+    if (!raw || typeof raw !== 'object') {
+      return { ok: false, error: 'Item de disponibilidade inválido.' };
+    }
+    const stored = raw.id ? existingById.get(raw.id) : undefined;
+    const date = String(raw.date ?? '').split('T')[0].trim();
+    const time = normalizeScaleTime(raw.time);
+
+    // Se um registro já existente venceu (passou para antes de hoje), oculta/descarta automaticamente.
+    if (stored && isCalendarDate(date) && date < today) {
+      continue;
+    }
+    if (!isCalendarDate(date)) {
+      return { ok: false, error: 'Informe uma data válida para todas as disponibilidades.' };
+    }
+    if (date < today) {
+      return { ok: false, error: `A data ${formatRotationDateBR(date)} já passou e não pode ser cadastrada.` };
+    }
+    if (!isValidScaleTime(time)) {
+      return { ok: false, error: `Informe um horário válido para ${formatRotationDateBR(date)}.` };
+    }
+
+    const isLockedStored = stored && !isRotationDateSlotEditable(stored, now).editable;
+    const dateChanged = !stored || stored.date !== date;
+
+    if (!isLockedStored && date > maxDate) {
+      return {
+        ok: false,
+        error: `As datas devem estar entre hoje e no máximo ${maxDaysAhead} dias no futuro (até ${formatRotationDateBR(maxDate)}).`,
+      };
+    }
+
+    if (dateChanged) {
+      const blockCheck = isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings);
+      if (blockCheck.blocked) {
+        return {
+          ok: false,
+          error: `A data ${formatRotationDateBR(date)} está bloqueada (${blockCheck.reason}).`,
+        };
+      }
+    }
+
+    const dtKey = `${date}|${time}`;
+    if (seenDateTime.has(dtKey)) {
+      return {
+        ok: false,
+        error: `Horário duplicado em ${formatRotationDateBR(date)} às ${time}.`,
+      };
+    }
+    seenDateTime.add(dtKey);
+
+    validated.push({
+      id: stored ? stored.id : (typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : createId()),
+      date,
+      time,
+      createdAt: stored ? stored.createdAt : now.toISOString(),
+    });
+  }
+
+  validated.sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
+  return { ok: true, availableDates: validated };
+}
+
+export function usesExplicitRotationDates(examiner: RotationExaminerLike | null | undefined): boolean {
+  return Array.isArray(examiner?.rotationAvailability?.availableDates);
+}
+
 export function getExaminerRotationTimesInWindow(
   examiner: RotationExaminerLike,
   config: RotationConfig,
+  today = businessDate(),
 ): string[] {
   const av = examiner.rotationAvailability;
   if (!av) return [];
+  if (Array.isArray(av.availableDates)) {
+    const configDays = new Set(config.days ?? []);
+    const unique = new Set<string>();
+    for (const slot of filterUpcomingExaminerRotationDates(av.availableDates, today)) {
+      if (configDays.size > 0 && !configDays.has(scaleWeekday(slot.date))) continue;
+      if (isTimeWithinWindow(slot.time, config.startTime, config.endTime)) {
+        unique.add(slot.time);
+      }
+    }
+    return [...unique];
+  }
   const rawTimes = av.examsPerDay === 2
-    ? [av.defaultTime, av.secondDefaultTime ?? '']
-    : [av.defaultTime];
+    ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
+    : [av.defaultTime ?? ''];
   const unique = new Set<string>();
   for (const raw of rawTimes) {
     const t = normalizeScaleTime(raw);
@@ -166,17 +349,82 @@ export function getExaminerRotationTimesInWindow(
   return [...unique];
 }
 
+export function getExaminerRotationTimesForDate(
+  examiner: RotationExaminerLike,
+  date: string,
+  config?: RotationConfig | null,
+): string[] {
+  const av = examiner.rotationAvailability;
+  if (!av || !isCalendarDate(date)) return [];
+  if (Array.isArray(av.availableDates)) {
+    const unique = new Set<string>();
+    for (const slot of av.availableDates) {
+      if (!slot || slot.date !== date) continue;
+      const t = normalizeScaleTime(slot.time);
+      if (!isValidScaleTime(t)) continue;
+      if (config && !isTimeWithinWindow(t, config.startTime, config.endTime)) continue;
+      unique.add(t);
+    }
+    return [...unique].sort();
+  }
+  const weekday = scaleWeekday(date);
+  if (!Array.isArray(av.days) || !av.days.includes(weekday)) return [];
+  if (config) return getExaminerRotationTimesInWindow(examiner, config);
+  const rawTimes = av.examsPerDay === 2
+    ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
+    : [av.defaultTime ?? ''];
+  const unique = new Set<string>();
+  for (const raw of rawTimes) {
+    const t = normalizeScaleTime(raw);
+    if (isValidScaleTime(t)) unique.add(t);
+  }
+  return [...unique];
+}
+
+export function getExaminerMaxPerDayForDate(
+  examiner: RotationExaminerLike | null | undefined,
+  date: string,
+): number {
+  const av = examiner?.rotationAvailability;
+  if (!av) return 1;
+  if (Array.isArray(av.availableDates)) {
+    const times = getExaminerRotationTimesForDate(examiner!, date);
+    return times.length;
+  }
+  return av.examsPerDay === 2 ? 2 : 1;
+}
+
 export function resolveExaminerDefaultRotationTime(
   examiner: RotationExaminerLike | null | undefined,
   config?: RotationConfig | null,
   date?: string,
+  today = businessDate(),
 ): string | null {
   const av = examiner?.rotationAvailability;
   if (!av) return null;
 
+  if (Array.isArray(av.availableDates)) {
+    const upcoming = filterUpcomingExaminerRotationDates(av.availableDates, today);
+    const matching = date && isCalendarDate(date)
+      ? upcoming.filter(s => s.date === date)
+      : upcoming;
+    const inWindow = config
+      ? matching.filter(s => isTimeWithinWindow(s.time, config.startTime, config.endTime))
+      : matching;
+    const pool = (inWindow.length > 0 ? inWindow : matching).map(s => s.time);
+    if (pool.length === 0) return null;
+    if (date && isCalendarDate(date)) {
+      const unblocked = pool.find(
+        t => !isExaminerBlockedOnDateTime(examiner?.blockedPeriods, date, t).blocked,
+      );
+      if (unblocked) return unblocked;
+    }
+    return pool[0];
+  }
+
   const rawCandidates = av.examsPerDay === 2
-    ? [av.defaultTime, av.secondDefaultTime ?? '']
-    : [av.defaultTime];
+    ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
+    : [av.defaultTime ?? ''];
   const allValid: string[] = [];
   for (const raw of rawCandidates) {
     const t = normalizeScaleTime(raw);
@@ -186,7 +434,7 @@ export function resolveExaminerDefaultRotationTime(
   }
   if (allValid.length === 0) return null;
 
-  const inWindow = config ? getExaminerRotationTimesInWindow(examiner!, config) : [];
+  const inWindow = config ? getExaminerRotationTimesInWindow(examiner!, config, today) : [];
   const pool = inWindow.length > 0 ? inWindow : allValid;
 
   if (date && isCalendarDate(date)) {
@@ -204,11 +452,13 @@ export function findEligibleExaminersForSchool(input: {
   config: RotationConfig;
   examiners: RotationExaminerLike[];
   cities: RotationCityLike[];
+  today?: string;
 }): {
   cityId: string | null;
   eligible: RotationExaminerLike[];
   issue?: string;
 } {
+  const today = input.today ?? businessDate();
   const cityId = resolveCityIdByName(input.schoolCity, input.cities);
   if (!cityId) {
     return {
@@ -222,14 +472,17 @@ export function findEligibleExaminersForSchool(input: {
     if (!ex.examRotation || ex.canExamCommon === false) return false;
     const av = ex.rotationAvailability;
     if (!av || !Array.isArray(av.cityIds) || !av.cityIds.includes(cityId)) return false;
+    if (Array.isArray(av.availableDates)) {
+      return getExaminerRotationTimesInWindow(ex, input.config, today).length > 0;
+    }
     if (!Array.isArray(av.days) || !av.days.some(d => configDays.has(d))) return false;
-    return getExaminerRotationTimesInWindow(ex, input.config).length > 0;
+    return getExaminerRotationTimesInWindow(ex, input.config, today).length > 0;
   });
   if (eligible.length === 0) {
     return {
       cityId,
       eligible: [],
-      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", cidade, dia e horário compatíveis.',
+      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", cidade, datas e horários compatíveis.',
     };
   }
   return { cityId, eligible };
@@ -419,8 +672,8 @@ function scoreRotationCandidate(params: {
 
   const otherDateCount = crossIndex.dateCounts.get(dateExKey) ?? 0;
   const thisDateCount = thisDateCounts.get(dateExKey) ?? 0;
-  const maxPerDay = examiner.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
-  const exceedsPerDay = otherDateCount + thisDateCount >= maxPerDay ? 1 : 0;
+  const maxPerDay = getExaminerMaxPerDayForDate(examiner, date);
+  const exceedsPerDay = maxPerDay <= 0 || otherDateCount + thisDateCount >= maxPerDay ? 1 : 0;
 
   const otherWeekPresence = crossIndex.weekSchoolSets.get(weekExKey)?.size ?? 0;
   const otherWeekTotal = crossIndex.weekTotalCounts.get(weekExKey) ?? 0;
@@ -506,6 +759,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     config: normalizedConfig,
     examiners: input.examiners,
     cities: input.cities,
+    today,
   });
 
   const listCandidatesForDate = (date: string): { examiner: RotationExaminerLike; time: string }[] => {
@@ -514,8 +768,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     if (!normalizedConfig.days.includes(weekday)) return [];
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
     for (const ex of baseEligibility.eligible) {
-      if (!ex.rotationAvailability?.days?.includes(weekday)) continue;
-      const times = getExaminerRotationTimesInWindow(ex, normalizedConfig);
+      const times = getExaminerRotationTimesForDate(ex, date, normalizedConfig);
       for (const time of times) {
         if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
           candidates.push({ examiner: ex, time });
@@ -535,8 +788,8 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     const ex = examinerMap.get(entry.examiner);
     if (!ex || !ex.examRotation || ex.canExamCommon === false) return false;
     const av = ex.rotationAvailability;
-    if (!av || !av.cityIds?.includes(cityId) || !av.days?.includes(weekday)) return false;
-    const validTimes = getExaminerRotationTimesInWindow(ex, normalizedConfig);
+    if (!av || !av.cityIds?.includes(cityId)) return false;
+    const validTimes = getExaminerRotationTimesForDate(ex, entry.date, normalizedConfig);
     const normalizedTime = normalizeScaleTime(entry.time);
     if (!validTimes.includes(normalizedTime)) return false;
     if (isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, normalizedTime).blocked) return false;
@@ -586,7 +839,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
       const dateExKey = `${autoEntry.date}|${autoEntry.examiner}`;
       const dtExKey = `${autoEntry.date}|${autoEntry.time}|${autoEntry.examiner}`;
       const ex = examinerMap.get(autoEntry.examiner);
-      const maxPerDay = ex?.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
+      const maxPerDay = getExaminerMaxPerDayForDate(ex, autoEntry.date);
 
       const hasExactDateTimeClash = (crossIndex.dateTimeCounts.get(dtExKey) ?? 0) > 0;
       const exceedsOtherDay = (crossIndex.dateCounts.get(dateExKey) ?? 0) >= maxPerDay;
@@ -599,7 +852,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
           const cWeekKey = `${weekKey}|${cand.examiner.id}`;
           const cDateKey = `${autoEntry.date}|${cand.examiner.id}`;
           const cDtKey = `${autoEntry.date}|${cand.time}|${cand.examiner.id}`;
-          const cMaxDay = cand.examiner.rotationAvailability?.examsPerDay === 2 ? 2 : 1;
+          const cMaxDay = getExaminerMaxPerDayForDate(cand.examiner, autoEntry.date);
           const cDtClash = (crossIndex.dateTimeCounts.get(cDtKey) ?? 0) > 0;
           const cDayCount = crossIndex.dateCounts.get(cDateKey) ?? 0;
           const cWeekPresence = crossIndex.weekSchoolSets.get(cWeekKey)?.size ?? 0;
@@ -829,6 +1082,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
     config: normalizedConfig,
     examiners: input.examiners,
     cities: input.cities,
+    today,
   });
 
   const baseWarnings: string[] = [];
@@ -846,8 +1100,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
 
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
     for (const ex of baseEligibility.eligible) {
-      if (!ex.rotationAvailability?.days?.includes(weekday)) continue;
-      const times = getExaminerRotationTimesInWindow(ex, normalizedConfig);
+      const times = getExaminerRotationTimesForDate(ex, date, normalizedConfig);
       for (const time of times) {
         if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
           candidates.push({ examiner: ex, time });
@@ -1036,6 +1289,7 @@ export function syncAllSchoolsRotationSchedules<TSchool extends OtherSchoolRotat
         config,
         examiners: input.examiners,
         cities: input.cities,
+        today,
       }).eligible.length;
       const validFutureCount = (s.mainSchedule?.rotationEntries ?? []).filter(
         e => e && isCalendarDate(e.date) && e.date >= today,

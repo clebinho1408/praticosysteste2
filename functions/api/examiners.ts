@@ -1,7 +1,8 @@
 // functions/api/examiners.ts  →  GET|POST|PUT|DELETE /api/examiners
 import { getDb, json, error, parseBody, getQuery } from '../_db.js';
-import { examiners } from '../../db/schema.js';
+import { examiners, blockedDates, systemSettings } from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
+import { applyExaminerSelfRotationUpdate, sanitizeAdminExaminerRotationAvailability } from '../_examiner-self-rotation.js';
 
 import { isD1 } from '../_d1.js';
 
@@ -43,6 +44,9 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if ((data as any)?.authorizedRoute !== 'examiners') return error('Acesso negado.', 403);
       await ensureSchema(db);
       const body = await parseBody<any>(request);
+      if (Object.hasOwn(body, 'rotationAvailability')) {
+        body.rotationAvailability = sanitizeAdminExaminerRotationAvailability(body.rotationAvailability);
+      }
       const newItem = await db.insert(examiners).values({ id: crypto.randomUUID(), ...body }).returning();
       return json(newItem[0]);
     }
@@ -51,7 +55,29 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if ((data as any)?.authorizedRoute !== 'examiners') return error('Acesso negado.', 403);
       await ensureSchema(db);
       const body = await parseBody<any>(request);
+      const sessionRole = (data as any)?.sessionUserRole;
+      const sessionExaminerId = (data as any)?.sessionUser?.examinerId;
+      if (sessionRole === 'EXAMINER') {
+        if (!sessionExaminerId || body?.id !== sessionExaminerId) {
+          return error('Acesso negado.', 403);
+        }
+        const res = await applyExaminerSelfRotationUpdate(
+          db,
+          { examiners, blockedDates, systemSettings },
+          sessionExaminerId,
+          body.rotationAvailability,
+        );
+        if (res.error) return error(res.error, res.status);
+        return json(res.updated);
+      }
       const { id, createdAt, updatedAt, ...updates } = body;
+      if (Object.hasOwn(updates, 'rotationAvailability')) {
+        const [stored] = await db.select().from(examiners).where(eq(examiners.id, id)).limit(1);
+        updates.rotationAvailability = sanitizeAdminExaminerRotationAvailability(
+          updates.rotationAvailability,
+          stored?.rotationAvailability,
+        );
+      }
       const updated = await db.update(examiners).set(updates).where(eq(examiners.id, id)).returning();
       return json(updated[0]);
     }

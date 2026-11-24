@@ -11,6 +11,10 @@ import {
 import { cnhBancaConflict, cnhSchoolScaleConflict } from "../../../../functions/_cnh-time-conflicts.js";
 // @ts-ignore Shared CNH auto-bancas planner.
 import { mergePreservedAutoCnhBancaLinks, syncCnhRotationBancasOnDb } from "../../../../functions/_cnh-auto-bancas.js";
+// @ts-ignore Shared examiner self-rotation and rotation capacity helpers.
+import { applyExaminerSelfRotationUpdate, sanitizeAdminExaminerRotationAvailability } from "../../../../functions/_examiner-self-rotation.js";
+// @ts-ignore Shared school rotation helpers.
+import { getExaminerMaxPerDayForDate, getExaminerRotationTimesForDate } from "../../../../functions/_school-rotation.js";
 import { db } from "@workspace/db";
 import {
   users, drivingSchools, examiners, instructors, vehicles,
@@ -466,14 +470,40 @@ router.get("/examiners", async (_req, res) => {
 router.post("/examiners", async (req, res) => {
   if ((req as any).authorizedRoute !== "examiners") return res.status(403).json({ error: "Acesso negado." });
   try {
-    const item = await db.insert(examiners).values({ id: crypto.randomUUID(), ...req.body }).returning();
+    const body = { ...req.body };
+    if (Object.hasOwn(body, "rotationAvailability")) {
+      body.rotationAvailability = sanitizeAdminExaminerRotationAvailability(body.rotationAvailability);
+    }
+    const item = await db.insert(examiners).values({ id: crypto.randomUUID(), ...body }).returning();
     return res.json(item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });
 router.put("/examiners", async (req, res) => {
   if ((req as any).authorizedRoute !== "examiners") return res.status(403).json({ error: "Acesso negado." });
   try {
+    const sessionUser = (req as any).sessionUser;
+    if (sessionUser?.role === "EXAMINER") {
+      if (!sessionUser.examinerId || req.body?.id !== sessionUser.examinerId) {
+        return res.status(403).json({ error: "Acesso negado." });
+      }
+      const result = await applyExaminerSelfRotationUpdate(
+        db,
+        { examiners, blockedDates, systemSettings },
+        sessionUser.examinerId,
+        req.body.rotationAvailability,
+      );
+      if (result.error) return res.status(result.status).json({ error: result.error });
+      broadcast("requests_updated", { examinerId: sessionUser.examinerId });
+      return res.json(result.updated);
+    }
     const { id, createdAt, ...updates } = req.body;
+    if (Object.hasOwn(updates, "rotationAvailability")) {
+      const [stored] = await db.select().from(examiners).where(eq(examiners.id, id)).limit(1);
+      updates.rotationAvailability = sanitizeAdminExaminerRotationAvailability(
+        updates.rotationAvailability,
+        stored?.rotationAvailability,
+      );
+    }
     const item = await db.update(examiners).set(updates).where(eq(examiners.id, id)).returning();
     return res.json(item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
@@ -1378,21 +1408,24 @@ router.post("/schedule-slots", async (req, res) => {
         ]);
         const active = booked.filter(s => s.status !== "CANCELLED");
         const assigned = slots.filter((s: any) => s.examinerId === examinerId);
+        const examiner = examinerRows[0];
         if (school.examRotation) {
-          const examiner = examinerRows[0];
           const availability = examiner?.rotationAvailability;
-          const times = (availability?.examsPerDay === 2
-            ? [availability.defaultTime, availability.secondDefaultTime] : [availability?.defaultTime])
-            .map(t => normalizeScaleTime(t));
+          const usesExplicit = Array.isArray(availability?.availableDates);
+          const times = getExaminerRotationTimesForDate(examiner, date);
+          const legacyValid = !usesExplicit &&
+            Boolean(availability?.days?.includes(day)) &&
+            [1, 2].includes(availability?.examsPerDay as any);
+          const explicitValid = usesExplicit && times.length > 0;
           if (!examiner?.examRotation || examiner.canExamCommon === false ||
-            !availability?.days?.includes(day) || !availability.cityIds?.includes(city!.id) ||
-            ![1, 2].includes(availability.examsPerDay) ||
+            !availability?.cityIds?.includes(city!.id) ||
+            (!legacyValid && !explicitValid) ||
             assigned.some((s: any) => !times.includes(s.scheduledTime))) {
             return res.status(409).json({ error: "Rodízio de Provas desativado ou disponibilidade incompatível para o examinador." });
           }
         }
-        const capacity = school.examRotation && examinerRows[0]?.examRotation
-          ? examinerRows[0].rotationAvailability?.examsPerDay : null;
+        const capacity = school.examRotation && examiner?.examRotation
+          ? getExaminerMaxPerDayForDate(examiner, date) : null;
         if (assigned.some((s: any) => active.some(b => normalizeScaleTime(b.scheduledTime) === s.scheduledTime))) {
           return res.status(409).json({ error: "O examinador já possui prova nesse horário." });
         }

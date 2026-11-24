@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2977,11 +2977,8 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editing, setEditing] = useState<Examiner | null>(null);
   const [modalTab, setModalTab] = useState<'DADOS' | 'RODIZIO' | 'BLOQUEIOS' | 'ESCALAS'>('DADOS');
-  const emptyRotation: ExaminerRotationAvailability = { days: [], defaultTime: '', secondDefaultTime: '', examsPerDay: 1, cityIds: [] };
   type ExaminerForm = { name: string; registrationNumber: string; categories: string[]; defaultMaxSlotsA: string; defaultMaxSlotsB: string; defaultMaxSlotsMudanca: string; examRotation: boolean; rotationAvailability: ExaminerRotationAvailability | null };
   const [formData, setFormData] = useState<ExaminerForm>({ name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: null });
-  const [rotationDraft, setRotationDraft] = useState<ExaminerRotationAvailability>(emptyRotation);
-  const [rotationError, setRotationError] = useState('');
 
   // Blocked periods state
   const [blockedPeriods, setBlockedPeriods] = useState<ExaminerBlockedPeriod[]>([]);
@@ -3111,10 +3108,13 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       defaultMaxSlotsB: ex.defaultMaxSlotsB != null ? String(ex.defaultMaxSlotsB) : '',
       defaultMaxSlotsMudanca: ex.defaultMaxSlotsMudanca != null ? String(ex.defaultMaxSlotsMudanca) : '',
       examRotation: ex.examRotation ?? false,
-      rotationAvailability: ex.rotationAvailability ?? null,
-    } : { name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: null });
-    setRotationDraft(ex?.rotationAvailability ? { ...emptyRotation, ...ex.rotationAvailability, days: [...(ex.rotationAvailability.days ?? [])], cityIds: [...(ex.rotationAvailability.cityIds ?? [])] } : { ...emptyRotation });
-    setRotationError('');
+      rotationAvailability: ex.rotationAvailability
+        ? {
+            cityIds: [...(ex.rotationAvailability.cityIds ?? [])],
+            availableDates: filterUpcomingExaminerRotationDates(ex.rotationAvailability.availableDates, businessDate()),
+          }
+        : null,
+    } : { name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: { cityIds: [], availableDates: [] } });
     setBlockedPeriods(ex?.blockedPeriods ? [...ex.blockedPeriods] : []);
     setNewPeriod({ startDate: '', endDate: '', description: '', period: 'ALL_DAY' });
     setEditingPeriodId(null);
@@ -3174,25 +3174,10 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     }
   };
 
-  const saveRotation = () => {
-    const validTime = (t: string | undefined) => /^(?:[01]\d|2[0-3]):[0-5]\d$/.test(t ?? '');
-    if (!rotationDraft.days.length || !validTime(rotationDraft.defaultTime) || (rotationDraft.examsPerDay === 2 && !validTime(rotationDraft.secondDefaultTime)) || !rotationDraft.cityIds.length) {
-      setRotationError('Selecione ao menos um dia e uma cidade e informe todos os horários padrão.');
-      return;
-    }
-    setFormData(prev => ({
-      ...prev,
-      examRotation: true,
-      rotationAvailability: { ...rotationDraft, secondDefaultTime: rotationDraft.examsPerDay === 2 ? rotationDraft.secondDefaultTime : '' },
-    }));
-    setRotationError('');
-  };
-
-  const clearRotation = () => {
-    setFormData(prev => ({ ...prev, examRotation: false, rotationAvailability: null }));
-    setRotationDraft({ ...emptyRotation });
-    setRotationError('');
-  };
+  const upcomingAvailableDates = useMemo(
+    () => filterUpcomingExaminerRotationDates(formData.rotationAvailability?.availableDates, today),
+    [formData.rotationAvailability?.availableDates, today],
+  );
 
   const syncSchoolsRotationAfterExaminerChange = async () => {
     const canPersistSchoolSync = user.role === UserRole.ADMIN ||
@@ -3231,8 +3216,20 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
     const hasMudanca = formData.categories.some(c => ['C', 'D', 'E'].includes(c));
+    const cleanedAvailableDates = filterUpcomingExaminerRotationDates(
+      formData.rotationAvailability?.availableDates ?? editing?.rotationAvailability?.availableDates,
+      businessDate(),
+    );
     const payload = {
       ...formData,
+      rotationAvailability: formData.rotationAvailability
+        ? {
+            cityIds: [...(formData.rotationAvailability.cityIds ?? [])],
+            availableDates: cleanedAvailableDates,
+          }
+        : formData.examRotation
+          ? { cityIds: [], availableDates: cleanedAvailableDates }
+          : null,
       defaultMaxSlotsA: formData.defaultMaxSlotsA !== '' ? Number(formData.defaultMaxSlotsA) : null,
       defaultMaxSlotsB: formData.defaultMaxSlotsB !== '' ? Number(formData.defaultMaxSlotsB) : null,
       defaultMaxSlotsMudanca: hasMudanca && formData.defaultMaxSlotsMudanca !== '' ? Number(formData.defaultMaxSlotsMudanca) : null,
@@ -3477,17 +3474,29 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                 <td className="px-4 py-3 text-center text-sm">{e.defaultMaxSlotsB != null ? e.defaultMaxSlotsB : <span className="text-gray-400">—</span>}</td>
                 <td className="px-4 py-3 text-center text-sm">{e.categories?.some(c => ['C','D','E'].includes(c)) ? (e.defaultMaxSlotsMudanca != null ? e.defaultMaxSlotsMudanca : <span className="text-gray-400">—</span>) : <span className="text-gray-300">-</span>}</td>
                 <td className="px-4 py-3 text-center text-sm">
-                  {e.examRotation && e.rotationAvailability ? (
-                    <span className="inline-flex items-center gap-1 bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-semibold" title={`Dias: ${e.rotationAvailability.days.join(', ')} | ${e.rotationAvailability.examsPerDay}x/dia`}>
-                      🔄 Ativo
-                    </span>
-                  ) : e.examRotation ? (
-                    <span className="inline-flex items-center gap-1 bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-xs font-semibold">
-                      ⚠️ Config.
-                    </span>
-                  ) : (
-                    <span className="text-gray-300">—</span>
-                  )}
+                  {(() => {
+                    const upcomingDates = filterUpcomingExaminerRotationDates(e.rotationAvailability?.availableDates, today);
+                    const hasCities = (e.rotationAvailability?.cityIds?.length ?? 0) > 0;
+                    const hasLegacyDays = (e.rotationAvailability?.days?.length ?? 0) > 0;
+                    if (e.examRotation && hasCities && (upcomingDates.length > 0 || hasLegacyDays)) {
+                      const title = upcomingDates.length > 0
+                        ? upcomingDates.map(d => `${formatRotationDateBR(d.date)} ${d.time}`).join(' | ')
+                        : `Dias: ${(e.rotationAvailability?.days ?? []).join(', ')}`;
+                      return (
+                        <span className="inline-flex items-center gap-1 bg-green-100 text-green-700 px-2 py-0.5 rounded text-xs font-semibold" title={title}>
+                          🔄 Ativo{upcomingDates.length > 0 ? ` (${upcomingDates.length})` : ''}
+                        </span>
+                      );
+                    }
+                    if (e.examRotation) {
+                      return (
+                        <span className="inline-flex items-center gap-1 bg-yellow-100 text-yellow-700 px-2 py-0.5 rounded text-xs font-semibold">
+                          ⚠️ Config.
+                        </span>
+                      );
+                    }
+                    return <span className="text-gray-300">—</span>;
+                  })()}
                 </td>
                 <td className="px-4 py-3 text-center text-sm">
                   {activeBlocks.length > 0 ? (
@@ -3501,8 +3510,8 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                 <td className="px-4 py-3 text-right space-x-2">
                   {user?.role !== UserRole.CONSULTANT && (
                     <>
-                      <button onClick={() => openModal(e)} className="text-blue-600 hover:text-blue-800"><Edit2 className="h-4 w-4" /></button>
-                      <button onClick={() => handleDelete(e.id)} className="text-red-600 hover:text-red-800"><Trash2 className="h-4 w-4" /></button>
+                      <button type="button" onClick={() => openModal(e)} aria-label={`Editar ${e.name}`} title="Editar" className="text-blue-600 hover:text-blue-800"><Edit2 className="h-4 w-4" /></button>
+                      <button type="button" onClick={() => handleDelete(e.id)} aria-label={`Excluir ${e.name}`} title="Excluir" className="text-red-600 hover:text-red-800"><Trash2 className="h-4 w-4" /></button>
                     </>
                   )}
                 </td>
@@ -3649,126 +3658,96 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                           type="checkbox"
                           checked={formData.examRotation}
                           onChange={e => {
-                            if (e.target.checked) {
-                              setFormData(prev => ({ ...prev, examRotation: true }));
-                            } else {
-                              clearRotation();
-                            }
+                            const checked = e.target.checked;
+                            setFormData(prev => ({
+                              ...prev,
+                              examRotation: checked,
+                              rotationAvailability: prev.rotationAvailability ?? {
+                                cityIds: [],
+                                availableDates: editing?.rotationAvailability?.availableDates ?? [],
+                              },
+                            }));
                           }}
                           className="w-4 h-4 text-blue-600"
                         />
                         <span className="text-sm font-medium">Participar do Rodízio de Provas</span>
                       </label>
-                      <p className="text-xs text-gray-500 mt-1 ml-6">Quando ativado, este examinador entra na rotação automática de bancas.</p>
+                      <p className="text-xs text-gray-500 mt-1 ml-6">
+                        Quando ativado, o card &quot;Rodízio CNH do Brasil&quot; fica disponível no acesso pelo celular do examinador para cadastrar datas e horários.
+                      </p>
                     </div>
 
                     {formData.examRotation && (
                       <>
-                        {/* Dias da semana */}
-                        <fieldset>
-                          <legend className="text-sm font-medium mb-2">Dias da semana</legend>
-                          <div className="flex flex-wrap gap-2">
-                            {([['SEG', 'Seg'], ['TER', 'Ter'], ['QUA', 'Qua'], ['QUI', 'Qui'], ['SEX', 'Sex'], ['SAB', 'Sáb'], ['DOM', 'Dom']] as const).map(([value, label]) => (
-                              <label key={value} className="flex items-center gap-2 px-3 py-2 rounded border cursor-pointer text-sm bg-white hover:bg-blue-50">
-                                <input
-                                  type="checkbox"
-                                  checked={rotationDraft.days.includes(value)}
-                                  onChange={e => setRotationDraft(prev => ({
-                                    ...prev,
-                                    days: e.target.checked ? [...prev.days, value] : prev.days.filter(d => d !== value),
-                                  }))}
-                                />
-                                {label}
-                              </label>
-                            ))}
-                          </div>
-                        </fieldset>
-
-                        {/* Provas por dia */}
-                        <fieldset>
-                          <legend className="text-sm font-medium mb-2">Provas por dia</legend>
-                          <div className="flex gap-5 text-sm">
-                            {([1, 2] as const).map(count => (
-                              <label key={count} className="flex items-center gap-2 cursor-pointer">
-                                <input
-                                  type="radio"
-                                  name="rotation-exams-per-day"
-                                  checked={rotationDraft.examsPerDay === count}
-                                  onChange={() => setRotationDraft(prev => ({ ...prev, examsPerDay: count }))}
-                                />
-                                {count === 1 ? 'Uma prova' : 'Duas provas'}
-                              </label>
-                            ))}
-                          </div>
-                        </fieldset>
-
-                        {/* Horários */}
-                        <div className={rotationDraft.examsPerDay === 2 ? 'grid grid-cols-1 sm:grid-cols-2 gap-3' : ''}>
-                          <div>
-                            <label className="block text-sm font-medium mb-1">
-                              {rotationDraft.examsPerDay === 2 ? 'Horário padrão da 1ª prova' : 'Horário padrão'}
-                            </label>
-                            <input
-                              type="time"
-                              value={rotationDraft.defaultTime}
-                              onChange={e => setRotationDraft(prev => ({ ...prev, defaultTime: e.target.value }))}
-                              className="w-full border rounded p-2 bg-white text-gray-900"
-                            />
-                          </div>
-                          {rotationDraft.examsPerDay === 2 && (
-                            <div>
-                              <label className="block text-sm font-medium mb-1">Horário padrão da 2ª prova</label>
-                              <input
-                                type="time"
-                                value={rotationDraft.secondDefaultTime ?? ''}
-                                onChange={e => setRotationDraft(prev => ({ ...prev, secondDefaultTime: e.target.value }))}
-                                className="w-full border rounded p-2 bg-white text-gray-900"
-                              />
-                            </div>
-                          )}
-                        </div>
-
-                        {/* Cidades */}
+                        {/* Cidades atendidas */}
                         <fieldset>
                           <legend className="text-sm font-medium mb-2">Cidades atendidas</legend>
                           {citiesError && <p className="text-sm text-red-600">{citiesError}</p>}
                           {!citiesError && cities.length === 0 && <p className="text-sm text-gray-500">Nenhuma cidade cadastrada.</p>}
-                          <div className="max-h-36 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2 border rounded p-2 bg-gray-50">
-                            {cities.map(city => (
-                              <label key={city.id} className="flex items-center gap-2 text-sm cursor-pointer">
-                                <input
-                                  type="checkbox"
-                                  checked={rotationDraft.cityIds.includes(city.id)}
-                                  onChange={e => setRotationDraft(prev => ({
-                                    ...prev,
-                                    cityIds: e.target.checked ? [...prev.cityIds, city.id] : prev.cityIds.filter(id => id !== city.id),
-                                  }))}
-                                />
-                                {city.name}
-                              </label>
-                            ))}
+                          <div className="max-h-40 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2 border rounded p-2.5 bg-gray-50">
+                            {cities.map(city => {
+                              const selectedCityIds = formData.rotationAvailability?.cityIds ?? [];
+                              return (
+                                <label key={city.id} className="flex items-center gap-2 text-sm cursor-pointer">
+                                  <input
+                                    type="checkbox"
+                                    checked={selectedCityIds.includes(city.id)}
+                                    onChange={e => {
+                                      const nextCityIds = e.target.checked
+                                        ? [...selectedCityIds, city.id]
+                                        : selectedCityIds.filter(id => id !== city.id);
+                                      setFormData(prev => ({
+                                        ...prev,
+                                        rotationAvailability: {
+                                          cityIds: nextCityIds,
+                                          availableDates: prev.rotationAvailability?.availableDates ?? [],
+                                        },
+                                      }));
+                                    }}
+                                  />
+                                  {city.name}
+                                </label>
+                              );
+                            })}
                           </div>
                         </fieldset>
 
-                        {rotationError && <p className="text-sm text-red-600 font-medium">{rotationError}</p>}
-
-                        {/* Resumo salvo */}
-                        {formData.rotationAvailability && (
-                          <div className="bg-green-50 border border-green-200 rounded p-3 text-xs text-green-800">
-                            <p className="font-semibold mb-1">✓ Disponibilidade confirmada</p>
-                            <p>Dias: {formData.rotationAvailability.days.join(', ')}</p>
-                            <p>Horário: {formData.rotationAvailability.defaultTime}{formData.rotationAvailability.examsPerDay === 2 ? ` e ${formData.rotationAvailability.secondDefaultTime}` : ''}</p>
-                            <p>Cidades: {formData.rotationAvailability.cityIds.map(id => cities.find(c => c.id === id)?.name ?? id).join(', ')}</p>
+                        {/* Datas e horários cadastrados pelo examinador no acesso pelo celular */}
+                        <div className="space-y-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-sm font-medium text-gray-800">
+                              Datas e horários disponíveis (via acesso do examinador)
+                            </span>
+                            {upcomingAvailableDates.length > 0 && (
+                              <span className="bg-blue-100 text-blue-700 text-xs font-bold px-2 py-0.5 rounded-full">
+                                {upcomingAvailableDates.length} horário(s)
+                              </span>
+                            )}
                           </div>
-                        )}
-
-                        <button
-                          type="button"
-                          onClick={saveRotation}
-                          className="flex items-center gap-2 bg-blue-600 text-white px-4 py-2 rounded text-sm hover:bg-blue-700"
-                        >
-                          <Save className="h-4 w-4" /> Confirmar disponibilidade
-                        </button>
+                          <p className="text-xs text-gray-500">
+                            As datas e horários abaixo são cadastrados pelo próprio examinador no celular. Datas que já passaram são ocultadas automaticamente.
+                          </p>
+                          {upcomingAvailableDates.length === 0 ? (
+                            <div className="rounded border border-dashed border-gray-300 bg-gray-50 p-4 text-center text-xs text-gray-500 italic">
+                              Nenhuma data futura cadastrada pelo examinador até o momento.
+                            </div>
+                          ) : (
+                            <div className="max-h-56 overflow-y-auto border rounded-lg divide-y divide-gray-100 bg-white">
+                              {upcomingAvailableDates.map(slot => (
+                                <div key={slot.id} className="flex items-center justify-between px-3 py-2 text-sm">
+                                  <div className="flex items-center gap-2 font-medium text-gray-800">
+                                    <Calendar className="h-4 w-4 text-blue-600 shrink-0" />
+                                    <span>{formatRotationDateBR(slot.date)}</span>
+                                    <span className="text-xs text-gray-400">({scaleWeekday(slot.date)})</span>
+                                  </div>
+                                  <span className="inline-flex items-center bg-blue-50 text-blue-800 border border-blue-200 px-2.5 py-0.5 rounded font-bold text-xs">
+                                    {slot.time}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </div>
                       </>
                     )}
                   </div>

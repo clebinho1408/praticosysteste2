@@ -124,12 +124,20 @@ export interface DrivingSchool {
   provisionalSchedule?: SchoolSchedule;
 }
 
+export interface ExaminerRotationDateSlot {
+  id: string;
+  date: string;      // 'YYYY-MM-DD'
+  time: string;      // 'HH:mm'
+  createdAt: string; // ISO timestamp
+}
+
 export interface ExaminerRotationAvailability {
-  days: string[]; // SEG, TER, QUA, QUI, SEX, SAB, DOM
-  defaultTime: string; // HH:mm — primeira prova
-  secondDefaultTime?: string; // HH:mm — segunda prova, quando houver
-  examsPerDay: 1 | 2;
   cityIds: string[];
+  availableDates?: ExaminerRotationDateSlot[];
+  days?: string[]; // Legado: SEG, TER, QUA, QUI, SEX, SAB, DOM
+  defaultTime?: string; // Legado: HH:mm — primeira prova
+  secondDefaultTime?: string; // Legado: HH:mm — segunda prova, quando houver
+  examsPerDay?: 1 | 2; // Legado
 }
 
 export type BlockedPeriodSlot = 'ALL_DAY' | 'MORNING' | 'AFTERNOON';

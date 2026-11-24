@@ -1,9 +1,14 @@
 import type { City, DrivingSchool, Examiner, SchoolSchedule } from '../types';
 import {
+  businessDate,
   normalizeScaleTime,
   resolveSchoolScaleForDate,
   scaleWeekday,
 } from '../../../../functions/_school-schedule';
+import {
+  getExaminerMaxPerDayForDate,
+  getExaminerRotationTimesForDate,
+} from '../../../../functions/_school-rotation';
 
 export type FixedCommitment = {
   id?: string;
@@ -37,6 +42,7 @@ export function rotationCandidates(
   day: string,
   examiners: Examiner[],
   cities: City[],
+  date?: string,
 ): { eligible: Examiner[]; reason?: string } {
   if (!school.examRotation) {
     return { eligible: [], reason: 'Rodízio de Provas desativado para esta autoescola.' };
@@ -46,19 +52,31 @@ export function rotationCandidates(
   const city = targetCity ? cities.find(item => item.name.trim().toUpperCase() === targetCity) : undefined;
   if (!city) return { eligible: [], reason: 'Cidade da autoescola não cadastrada ou não informada.' };
 
+  const today = businessDate();
   const eligible = examiners.filter(examiner => {
     const availability = examiner.rotationAvailability;
-    return examiner.examRotation && examiner.canExamCommon !== false &&
-      availability?.days?.includes(day) &&
-      availability.cityIds?.includes(city.id) &&
+    if (!examiner.examRotation || examiner.canExamCommon === false || !availability?.cityIds?.includes(city.id)) {
+      return false;
+    }
+    if (Array.isArray(availability.availableDates)) {
+      if (date) {
+        return getExaminerRotationTimesForDate(examiner, date).length > 0;
+      }
+      return availability.availableDates.some(
+        slot => slot.date >= today && scaleWeekday(slot.date) === day && validTime(normalizeScaleTime(slot.time)),
+      );
+    }
+    return Boolean(
+      availability.days?.includes(day) &&
       validTime(availability.defaultTime) &&
       (availability.examsPerDay === 1 ||
         (availability.examsPerDay === 2 && validTime(availability.secondDefaultTime) &&
-          availability.secondDefaultTime !== availability.defaultTime));
+          availability.secondDefaultTime !== availability.defaultTime)),
+    );
   });
   return eligible.length
     ? { eligible }
-    : { eligible: [], reason: 'Nenhum examinador com rodízio, dia, cidade e horários compatíveis.' };
+    : { eligible: [], reason: 'Nenhum examinador com rodízio, data, cidade e horários compatíveis.' };
 }
 
 export function planFixedScales(input: {
@@ -84,7 +102,7 @@ export function planFixedScales(input: {
         if (!item.examRotation) return -1;
         const itemScale = resolveSchoolScaleForDate(item, date);
         if (itemScale.kind === 'ROTATION_DATES' || itemScale.kind === 'PROVISIONAL_DATES') return -1;
-        return rotationCandidates(item, day, examiners, cities).eligible.length;
+        return rotationCandidates(item, day, examiners, cities, date).eligible.length;
       };
       return options(a) - options(b) || a.name.localeCompare(b.name) || a.id.localeCompare(b.id);
     })) {
@@ -199,7 +217,7 @@ export function planFixedScales(input: {
       continue;
     }
 
-    const { eligible, reason } = rotationCandidates(school, day, examiners, cities);
+    const { eligible, reason } = rotationCandidates(school, day, examiners, cities, date);
     if (reason) {
       issues.push({ school, reason });
       continue;
@@ -209,16 +227,14 @@ export function planFixedScales(input: {
     const tentative: FixedCommitment[] = [];
     for (const _slot of matchingSlots) {
       const choices = eligible.flatMap(examiner => {
-        const availability = examiner.rotationAvailability!;
-        const times = availability.examsPerDay === 2
-          ? [normalizeScaleTime(availability.defaultTime), normalizeScaleTime(availability.secondDefaultTime!)]
-          : [normalizeScaleTime(availability.defaultTime)];
+        const times = getExaminerRotationTimesForDate(examiner, date);
+        const maxPerDay = getExaminerMaxPerDayForDate(examiner, date);
         const appointments = [...commitments, ...reserved, ...tentative]
           .filter(item => item.examinerId === examiner.id && item.scheduledDate === date);
         // Candidatos e vagas podem representar a mesma prova. Contar a prova uma vez só.
         const occupied = new Set(appointments.map(item =>
           `${item.schoolId ?? ''}|${item.scheduledTime ?? item.id ?? ''}`));
-        if (occupied.size >= availability.examsPerDay) return [];
+        if (occupied.size >= maxPerDay) return [];
         return times.flatMap((time, order) =>
           !appointments.some(item => item.scheduledTime === time) &&
           ![...reserved, ...tentative].some(item =>
