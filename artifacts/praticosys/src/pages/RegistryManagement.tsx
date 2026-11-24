@@ -1,11 +1,11 @@
 
 import React, { useEffect, useState, useMemo } from 'react';
 import { api, PRATICOSYS_SCHEDULES_CHANGED_EVENT, PRATICOSYS_SYNC_CHANNEL } from '../services/api';
-import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, RotationConfig, RotationScheduleEntry, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
+import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardType, Examiner, ExaminerBlockedPeriod, ExaminerRotationAvailability, ExaminerRotationDateSlot, Instructor, Vehicle, SchoolSchedule, ScheduleSpecificDate, RotationConfig, RotationScheduleEntry, City, ExamLocation, BlockedDate, SystemSettings } from '../types';
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, findSchoolsSchedulingExaminerRotationSlot, getExaminerAvailableSlotStatus, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, updateExaminerAvailableDateSlot, removeExaminerAvailableDateSlot, findSchoolsSchedulingExaminerRotationSlot, getExaminerAvailableSlotStatus, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2946,6 +2946,11 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [modalTab, setModalTab] = useState<'DADOS' | 'RODIZIO' | 'BLOQUEIOS' | 'ESCALAS'>('DADOS');
   type ExaminerForm = { name: string; registrationNumber: string; categories: string[]; defaultMaxSlotsA: string; defaultMaxSlotsB: string; defaultMaxSlotsMudanca: string; examRotation: boolean; rotationAvailability: ExaminerRotationAvailability | null };
   const [formData, setFormData] = useState<ExaminerForm>({ name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: null });
+  const availableDatesDirtyRef = React.useRef(false);
+  const editingAvailableSlotIdRef = React.useRef<string | null>(null);
+  const [editingAvailableSlotId, setEditingAvailableSlotId] = useState<string | null>(null);
+  const [editAvailableSlotDraft, setEditAvailableSlotDraft] = useState<{ date: string; time: string }>({ date: '', time: '' });
+  const [availableSlotEditError, setAvailableSlotEditError] = useState<string | null>(null);
 
   // Blocked periods state
   const [blockedPeriods, setBlockedPeriods] = useState<ExaminerBlockedPeriod[]>([]);
@@ -3029,26 +3034,28 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
         if (!prev) return prev;
         const match = freshExaminers.find(ex => ex.id === prev.id);
         if (!match) return prev;
-        const freshDates = filterUpcomingExaminerRotationDates(
-          match.rotationAvailability?.availableDates,
-          currentToday,
-        );
-        setFormData(fd => ({
-          ...fd,
-          rotationAvailability: fd.rotationAvailability
-            ? {
-                ...fd.rotationAvailability,
-                availableDates: freshDates,
-              }
-            : match.rotationAvailability
+        if (!availableDatesDirtyRef.current && editingAvailableSlotIdRef.current === null) {
+          const freshDates = filterUpcomingExaminerRotationDates(
+            match.rotationAvailability?.availableDates,
+            currentToday,
+          );
+          setFormData(fd => ({
+            ...fd,
+            rotationAvailability: fd.rotationAvailability
               ? {
-                  schoolIds: Array.isArray(match.rotationAvailability.schoolIds)
-                    ? [...match.rotationAvailability.schoolIds]
-                    : [],
+                  ...fd.rotationAvailability,
                   availableDates: freshDates,
                 }
-              : null,
-        }));
+              : match.rotationAvailability
+                ? {
+                    schoolIds: Array.isArray(match.rotationAvailability.schoolIds)
+                      ? [...match.rotationAvailability.schoolIds]
+                      : [],
+                    availableDates: freshDates,
+                  }
+                : null,
+          }));
+        }
         return match;
       });
     }
@@ -3099,6 +3106,11 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     setEditing(ex || null);
     setModalTab('DADOS');
     setCopiedExaminerSchedule(false);
+    availableDatesDirtyRef.current = false;
+    editingAvailableSlotIdRef.current = null;
+    setEditingAvailableSlotId(null);
+    setEditAvailableSlotDraft({ date: '', time: '' });
+    setAvailableSlotEditError(null);
     setToday(businessDate());
     loadScheduleContext(schools.length > 0);
     const deriveInitialSchoolIds = (av?: ExaminerRotationAvailability | null): string[] => {
@@ -3232,12 +3244,103 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     }
   };
 
+  const handleStartEditAvailableSlot = (slot: ExaminerRotationDateSlot) => {
+    editingAvailableSlotIdRef.current = slot.id;
+    setEditingAvailableSlotId(slot.id);
+    setEditAvailableSlotDraft({
+      date: slot.date,
+      time: normalizeScaleTime(slot.time),
+    });
+    setAvailableSlotEditError(null);
+  };
+
+  const handleCancelEditAvailableSlot = () => {
+    editingAvailableSlotIdRef.current = null;
+    setEditingAvailableSlotId(null);
+    setEditAvailableSlotDraft({ date: '', time: '' });
+    setAvailableSlotEditError(null);
+  };
+
+  const handleSaveEditAvailableSlot = (slotId: string): boolean => {
+    const currentToday = businessDate();
+    const res = updateExaminerAvailableDateSlot({
+      slots: formData.rotationAvailability?.availableDates ?? [],
+      slotId,
+      date: editAvailableSlotDraft.date,
+      time: editAvailableSlotDraft.time,
+      today: currentToday,
+    });
+    if (!res.ok) {
+      setAvailableSlotEditError(res.error);
+      return false;
+    }
+    availableDatesDirtyRef.current = true;
+    setFormData(prev => ({
+      ...prev,
+      rotationAvailability: {
+        ...(prev.rotationAvailability ?? {}),
+        schoolIds: [...(prev.rotationAvailability?.schoolIds ?? [])],
+        availableDates: res.availableDates,
+      },
+    }));
+    editingAvailableSlotIdRef.current = null;
+    setEditingAvailableSlotId(null);
+    setEditAvailableSlotDraft({ date: '', time: '' });
+    setAvailableSlotEditError(null);
+    return true;
+  };
+
+  const handleRemoveAvailableSlot = (slotId: string) => {
+    const currentToday = businessDate();
+    const nextDates = removeExaminerAvailableDateSlot({
+      slots: formData.rotationAvailability?.availableDates ?? [],
+      slotId,
+      today: currentToday,
+    });
+    availableDatesDirtyRef.current = true;
+    setFormData(prev => ({
+      ...prev,
+      rotationAvailability: {
+        ...(prev.rotationAvailability ?? {}),
+        schoolIds: [...(prev.rotationAvailability?.schoolIds ?? [])],
+        availableDates: nextDates,
+      },
+    }));
+    if (editingAvailableSlotId === slotId) {
+      editingAvailableSlotIdRef.current = null;
+      setEditingAvailableSlotId(null);
+      setEditAvailableSlotDraft({ date: '', time: '' });
+    }
+    setAvailableSlotEditError(null);
+  };
+
   const handleSave = async (e: React.FormEvent) => {
     e.preventDefault();
+    const currentToday = businessDate();
+    let baseAvailableDates = formData.rotationAvailability?.availableDates ?? editing?.rotationAvailability?.availableDates;
+    if (editingAvailableSlotId) {
+      const committed = updateExaminerAvailableDateSlot({
+        slots: baseAvailableDates ?? [],
+        slotId: editingAvailableSlotId,
+        date: editAvailableSlotDraft.date,
+        time: editAvailableSlotDraft.time,
+        today: currentToday,
+      });
+      if (!committed.ok) {
+        setModalTab('RODIZIO');
+        setAvailableSlotEditError(committed.error);
+        return;
+      }
+      baseAvailableDates = committed.availableDates;
+      availableDatesDirtyRef.current = true;
+      editingAvailableSlotIdRef.current = null;
+      setEditingAvailableSlotId(null);
+      setAvailableSlotEditError(null);
+    }
     const hasMudanca = formData.categories.some(c => ['C', 'D', 'E'].includes(c));
     const cleanedAvailableDates = filterUpcomingExaminerRotationDates(
-      formData.rotationAvailability?.availableDates ?? editing?.rotationAvailability?.availableDates,
-      businessDate(),
+      baseAvailableDates,
+      currentToday,
     );
     const payload = {
       ...formData,
@@ -3267,6 +3370,10 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
           examinerId: newEx.id
         });
       }
+      availableDatesDirtyRef.current = false;
+      editingAvailableSlotIdRef.current = null;
+      setEditingAvailableSlotId(null);
+      setAvailableSlotEditError(null);
       setIsModalOpen(false);
       await Promise.all([fetch(), syncSchoolsRotationAfterExaminerChange()]);
       loadScheduleContext(true);
@@ -3767,8 +3874,13 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                             )}
                           </div>
                           <p className="text-xs text-gray-500">
-                            As datas e horários abaixo são cadastrados pelo próprio examinador no celular. Datas que já passaram são ocultadas automaticamente.
+                            Datas e horários cadastrados pelo examinador no celular. Aqui você pode editar data e horário ou excluir lançamentos futuros. Datas que já passaram são ocultadas automaticamente.
                           </p>
+                          {availableSlotEditError && (
+                            <div role="alert" className="rounded border border-red-200 bg-red-50 px-3 py-2 text-xs text-red-700 font-medium">
+                              {availableSlotEditError}
+                            </div>
+                          )}
                           {upcomingAvailableDates.length === 0 ? (
                             <div className="rounded border border-dashed border-gray-300 bg-gray-50 p-4 text-center text-xs text-gray-500 italic">
                               Nenhuma data futura cadastrada pelo examinador até o momento.
@@ -3776,21 +3888,30 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                           ) : (
                             <div className="max-h-56 overflow-y-auto border rounded-lg bg-white">
                               <table className="w-full text-sm text-left">
-                                <thead className="bg-gray-50 text-gray-600 border-b sticky top-0">
+                                <thead className="bg-gray-50 text-gray-600 border-b sticky top-0 z-10">
                                   <tr>
                                     <th className="px-3 py-2 font-semibold">Data</th>
                                     <th className="px-3 py-2 font-semibold">Horário</th>
-                                    <th className="px-3 py-2 font-semibold text-right">Status</th>
+                                    <th className="px-3 py-2 font-semibold">Status</th>
+                                    <th className="px-3 py-2 font-semibold text-right">Ações</th>
                                   </tr>
                                 </thead>
                                 <tbody className="divide-y divide-gray-100">
                                   {upcomingAvailableDates.map(slot => {
+                                    const isEditingSlot = editingAvailableSlotId === slot.id;
+                                    const effectiveDate = isEditingSlot && isCalendarDate(editAvailableSlotDraft.date)
+                                      ? editAvailableSlotDraft.date
+                                      : slot.date;
+                                    const normalizedDraftTime = normalizeScaleTime(editAvailableSlotDraft.time);
+                                    const effectiveTime = isEditingSlot && isValidScaleTime(normalizedDraftTime)
+                                      ? normalizedDraftTime
+                                      : slot.time;
                                     const scheduledSchools = editing?.id
                                       ? findSchoolsSchedulingExaminerRotationSlot({
                                           examinerId: editing.id,
                                           examinerName: formData.name || editing.name,
-                                          date: slot.date,
-                                          time: slot.time,
+                                          date: effectiveDate,
+                                          time: effectiveTime,
                                           schools,
                                         })
                                       : [];
@@ -3798,27 +3919,72 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                                       ? getExaminerAvailableSlotStatus({
                                           examinerId: editing.id,
                                           examinerName: formData.name || editing.name,
-                                          date: slot.date,
-                                          time: slot.time,
+                                          date: effectiveDate,
+                                          time: effectiveTime,
                                           schools,
                                         })
                                       : 'Disponível';
                                     const isScheduled = slotStatus === 'Agendado';
                                     return (
-                                      <tr key={slot.id} className="hover:bg-gray-50">
+                                      <tr key={slot.id} className={isEditingSlot ? 'bg-blue-50/50' : 'hover:bg-gray-50'}>
                                         <td className="px-3 py-2 whitespace-nowrap">
-                                          <div className="flex items-center gap-2 font-medium text-gray-800">
-                                            <Calendar className="h-4 w-4 text-blue-600 shrink-0" />
-                                            <span>{formatRotationDateBR(slot.date)}</span>
-                                            <span className="text-xs text-gray-400">({scaleWeekday(slot.date)})</span>
-                                          </div>
+                                          {isEditingSlot ? (
+                                            <input
+                                              type="date"
+                                              aria-label={`Editar data de ${formatRotationDateBR(slot.date)}`}
+                                              min={today}
+                                              value={editAvailableSlotDraft.date}
+                                              onChange={e => {
+                                                setEditAvailableSlotDraft(d => ({ ...d, date: e.target.value }));
+                                                setAvailableSlotEditError(null);
+                                              }}
+                                              onKeyDown={e => {
+                                                if (e.key === 'Enter') {
+                                                  e.preventDefault();
+                                                  handleSaveEditAvailableSlot(slot.id);
+                                                } else if (e.key === 'Escape') {
+                                                  e.preventDefault();
+                                                  handleCancelEditAvailableSlot();
+                                                }
+                                              }}
+                                              className="border border-blue-300 rounded px-2 py-1 text-xs bg-white text-gray-900"
+                                            />
+                                          ) : (
+                                            <div className="flex items-center gap-2 font-medium text-gray-800">
+                                              <Calendar className="h-4 w-4 text-blue-600 shrink-0" />
+                                              <span>{formatRotationDateBR(slot.date)}</span>
+                                              <span className="text-xs text-gray-400">({scaleWeekday(slot.date)})</span>
+                                            </div>
+                                          )}
                                         </td>
                                         <td className="px-3 py-2 whitespace-nowrap">
-                                          <span className="inline-flex items-center bg-blue-50 text-blue-800 border border-blue-200 px-2.5 py-0.5 rounded font-bold text-xs">
-                                            {slot.time}
-                                          </span>
+                                          {isEditingSlot ? (
+                                            <input
+                                              type="time"
+                                              aria-label={`Editar horário de ${formatRotationDateBR(slot.date)}`}
+                                              value={editAvailableSlotDraft.time}
+                                              onChange={e => {
+                                                setEditAvailableSlotDraft(d => ({ ...d, time: e.target.value }));
+                                                setAvailableSlotEditError(null);
+                                              }}
+                                              onKeyDown={e => {
+                                                if (e.key === 'Enter') {
+                                                  e.preventDefault();
+                                                  handleSaveEditAvailableSlot(slot.id);
+                                                } else if (e.key === 'Escape') {
+                                                  e.preventDefault();
+                                                  handleCancelEditAvailableSlot();
+                                                }
+                                              }}
+                                              className="border border-blue-300 rounded px-2 py-1 text-xs bg-white text-gray-900 w-auto min-w-[8rem]"
+                                            />
+                                          ) : (
+                                            <span className="inline-flex items-center bg-blue-50 text-blue-800 border border-blue-200 px-2.5 py-0.5 rounded font-bold text-xs">
+                                              {slot.time}
+                                            </span>
+                                          )}
                                         </td>
-                                        <td className="px-3 py-2 whitespace-nowrap text-right">
+                                        <td className="px-3 py-2 whitespace-nowrap">
                                           <span
                                             title={
                                               isScheduled
@@ -3833,6 +3999,53 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                                           >
                                             {slotStatus}
                                           </span>
+                                        </td>
+                                        <td className="px-3 py-2 whitespace-nowrap text-right">
+                                          <div className="inline-flex items-center gap-1.5">
+                                            {isEditingSlot ? (
+                                              <>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleSaveEditAvailableSlot(slot.id)}
+                                                  aria-label={`Confirmar alteração de ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                                  title="Confirmar alteração"
+                                                  className="p-1 rounded text-green-600 hover:text-green-800 hover:bg-green-50 transition-colors"
+                                                >
+                                                  <Check className="h-4 w-4" />
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={handleCancelEditAvailableSlot}
+                                                  aria-label={`Cancelar edição de ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                                  title="Cancelar"
+                                                  className="p-1 rounded text-gray-500 hover:text-gray-700 hover:bg-gray-100 transition-colors"
+                                                >
+                                                  <X className="h-4 w-4" />
+                                                </button>
+                                              </>
+                                            ) : (
+                                              <>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleStartEditAvailableSlot(slot)}
+                                                  aria-label={`Editar disponibilidade ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                                  title="Editar data e horário"
+                                                  className="p-1 rounded text-blue-600 hover:text-blue-800 hover:bg-blue-50 transition-colors"
+                                                >
+                                                  <Pencil className="h-4 w-4" />
+                                                </button>
+                                                <button
+                                                  type="button"
+                                                  onClick={() => handleRemoveAvailableSlot(slot.id)}
+                                                  aria-label={`Excluir disponibilidade ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                                  title="Excluir data e horário"
+                                                  className="p-1 rounded text-red-600 hover:text-red-800 hover:bg-red-50 transition-colors"
+                                                >
+                                                  <Trash2 className="h-4 w-4" />
+                                                </button>
+                                              </>
+                                            )}
+                                          </div>
                                         </td>
                                       </tr>
                                     );

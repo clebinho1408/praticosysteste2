@@ -4,7 +4,12 @@ import {
   validateExaminerRotationDatesUpdate,
   type ExaminerRotationDateSlot,
 } from './_school-rotation.js';
-import { businessDate } from './_school-schedule.js';
+import {
+  businessDate,
+  isCalendarDate,
+  isValidScaleTime,
+  normalizeScaleTime,
+} from './_school-schedule.js';
 
 export async function applyExaminerSelfRotationUpdate(
   db: any,
@@ -106,10 +111,30 @@ export function sanitizeAdminExaminerRotationAvailability(
       : undefined;
 
   if (rawDates !== undefined) {
+    const nowIso = new Date().toISOString();
+    const deduped: ExaminerRotationDateSlot[] = [];
+    const seenDt = new Set<string>();
+    if (Array.isArray(rawDates)) {
+      for (const raw of rawDates) {
+        if (!raw || typeof raw !== 'object') continue;
+        const cleanDate = String(raw.date ?? '').split('T')[0].trim();
+        const cleanTime = normalizeScaleTime(raw.time);
+        if (!isCalendarDate(cleanDate) || cleanDate < today || !isValidScaleTime(cleanTime)) continue;
+        const dtKey = `${cleanDate}|${cleanTime}`;
+        if (seenDt.has(dtKey)) continue;
+        seenDt.add(dtKey);
+        deduped.push({
+          id: typeof raw.id === 'string' && raw.id.trim() ? raw.id.trim() : crypto.randomUUID(),
+          date: cleanDate,
+          time: cleanTime,
+          createdAt: typeof raw.createdAt === 'string' && raw.createdAt.trim() ? raw.createdAt : nowIso,
+        });
+      }
+    }
     return {
       ...(schoolIds !== undefined ? { schoolIds } : {}),
       cityIds,
-      availableDates: filterUpcomingExaminerRotationDates(rawDates, today),
+      availableDates: filterUpcomingExaminerRotationDates(deduped, today),
     };
   }
 

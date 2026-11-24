@@ -14,7 +14,11 @@ import {
   buildExaminerUpcomingSchedules,
   findSchoolsSchedulingExaminerRotationSlot,
   getExaminerAvailableSlotStatus,
+  removeExaminerAvailableDateSlot,
+  syncAllSchoolsRotationSchedules,
+  updateExaminerAvailableDateSlot,
 } from '../functions/_school-rotation.js';
+import { sanitizeAdminExaminerRotationAvailability } from '../functions/_examiner-self-rotation.js';
 import {
   cleanupDerivedSchedulesOnSchoolDelete,
   syncDerivedSchedulesOnSchoolUpdate,
@@ -490,3 +494,136 @@ test('cleanupDerivedSchedulesOnSchoolDelete removes future empty FIXA slots and 
   assert.equal(mem.store.get(cfcScheduleSlots)!.length, 0);
   assert.equal(mem.store.get(examSchedules)!.length, 0);
 });
+
+test('updateExaminerAvailableDateSlot edits date and time, validates rules, and preserves metadata', () => {
+  const initialSlots = [
+    { id: 'slot-1', date: '2026-12-01', time: '08:30', createdAt: '2026-11-20T10:00:00Z' },
+    { id: 'slot-2', date: '2026-12-03', time: '14:00', createdAt: '2026-11-20T11:00:00Z' },
+  ];
+
+  // Edits slot-1 to a later date/time and checks sorting + HH:mm normalization + preserved id/createdAt
+  const edited = updateExaminerAvailableDateSlot({
+    slots: initialSlots,
+    slotId: 'slot-1',
+    date: '2026-12-05',
+    time: '9:05',
+    today: '2026-11-24',
+  });
+  assert.equal(edited.ok, true);
+  if (edited.ok) {
+    assert.deepEqual(
+      edited.availableDates.map(s => ({ id: s.id, date: s.date, time: s.time, createdAt: s.createdAt })),
+      [
+        { id: 'slot-2', date: '2026-12-03', time: '14:00', createdAt: '2026-11-20T11:00:00Z' },
+        { id: 'slot-1', date: '2026-12-05', time: '09:05', createdAt: '2026-11-20T10:00:00Z' },
+      ],
+    );
+  }
+
+  // Rejects duplicate date+time against another slot
+  const dup = updateExaminerAvailableDateSlot({
+    slots: initialSlots,
+    slotId: 'slot-1',
+    date: '2026-12-03',
+    time: '14:00',
+    today: '2026-11-24',
+  });
+  assert.equal(dup.ok, false);
+
+  // Rejects past date
+  const past = updateExaminerAvailableDateSlot({
+    slots: initialSlots,
+    slotId: 'slot-1',
+    date: '2026-11-20',
+    time: '08:30',
+    today: '2026-11-24',
+  });
+  assert.equal(past.ok, false);
+
+  // Rejects invalid time
+  const badTime = updateExaminerAvailableDateSlot({
+    slots: initialSlots,
+    slotId: 'slot-1',
+    date: '2026-12-01',
+    time: '99:99',
+    today: '2026-11-24',
+  });
+  assert.equal(badTime.ok, false);
+});
+
+test('removeExaminerAvailableDateSlot and sanitizeAdminExaminerRotationAvailability persist edits/deletions and resync rotation', () => {
+  const initialSlots = [
+    { id: 'slot-1', date: '2026-12-01', time: '08:30', createdAt: '2026-11-20T10:00:00Z' },
+    { id: 'slot-2', date: '2026-12-03', time: '14:00', createdAt: '2026-11-20T11:00:00Z' },
+  ];
+
+  const afterRemove = removeExaminerAvailableDateSlot({
+    slots: initialSlots,
+    slotId: 'slot-1',
+    today: '2026-11-24',
+  });
+  assert.deepEqual(afterRemove.map(s => s.id), ['slot-2']);
+
+  const sanitized = sanitizeAdminExaminerRotationAvailability(
+    {
+      schoolIds: ['school-rot'],
+      availableDates: [
+        { id: 'slot-2', date: '2026-12-08', time: '9:00', createdAt: '2026-11-20T11:00:00Z' },
+        { id: 'dup', date: '2026-12-08', time: '09:00', createdAt: '2026-11-20T12:00:00Z' },
+        { id: 'past', date: '2026-11-10', time: '08:00', createdAt: '2026-11-01T10:00:00Z' },
+      ],
+    },
+    { schoolIds: ['school-rot'], availableDates: initialSlots },
+    '2026-11-24',
+  );
+  assert.deepEqual(sanitized.availableDates, [
+    { id: 'slot-2', date: '2026-12-08', time: '09:00', createdAt: '2026-11-20T11:00:00Z' },
+  ]);
+
+  // School had an auto entry on 2026-12-01 08:30 for ex-a; after admin moves slot to 2026-12-08 09:00, sync moves entry cleanly
+  const schools = [
+    {
+      id: 'school-rot',
+      name: 'AUTOESCOLA RODIZIO',
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        days: ['TER'],
+        slots: [],
+        rotationConfig: { days: ['TER'], startTime: '08:00', endTime: '12:00' },
+        rotationEntries: [
+          { id: 'auto-old', date: '2026-12-01', time: '08:30', examiner: 'ex-a', manual: false },
+        ],
+      },
+    },
+  ];
+  const updatedExaminers = [
+    {
+      id: 'ex-a',
+      name: 'EXAMINADOR ALFA',
+      examRotation: true,
+      rotationAvailability: sanitized,
+    },
+  ];
+  const resync = syncAllSchoolsRotationSchedules({
+    schools: schools as any,
+    examiners: updatedExaminers as any,
+    cities: [],
+    today: '2026-11-24',
+    horizonDays: 30,
+  });
+
+  const syncedEntries = resync.schools[0].mainSchedule!.rotationEntries!;
+  assert.equal(syncedEntries.some(e => e.date === '2026-12-01'), false);
+  assert.equal(syncedEntries.some(e => e.date === '2026-12-08' && e.time === '09:00' && e.examiner === 'ex-a'), true);
+  assert.equal(
+    getExaminerAvailableSlotStatus({
+      examinerId: 'ex-a',
+      date: '2026-12-08',
+      time: '09:00',
+      schools: resync.schools as any,
+    }),
+    'Agendado',
+  );
+});
+

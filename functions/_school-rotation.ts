@@ -311,9 +311,69 @@ export function filterUpcomingExaminerRotationDates(
     )
     .map(s => ({
       ...s,
+      id: typeof s.id === 'string' && s.id.trim() ? s.id.trim() : `${s.date}|${normalizeScaleTime(s.time)}`,
       time: normalizeScaleTime(s.time),
     }))
-    .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || a.id.localeCompare(b.id));
+    .sort((a, b) => a.date.localeCompare(b.date) || a.time.localeCompare(b.time) || (a.id || '').localeCompare(b.id || ''));
+}
+
+export function updateExaminerAvailableDateSlot(input: {
+  slots: ExaminerRotationDateSlot[] | null | undefined;
+  slotId: string;
+  date: string;
+  time: string;
+  today?: string;
+}): { ok: true; availableDates: ExaminerRotationDateSlot[]; updatedSlot: ExaminerRotationDateSlot } | { ok: false; error: string } {
+  const today = input.today && isCalendarDate(input.today) ? input.today : businessDate();
+  const upcoming = filterUpcomingExaminerRotationDates(input.slots, today);
+  const target = upcoming.find(s => s.id === input.slotId);
+  if (!target) {
+    return { ok: false, error: 'Disponibilidade não encontrada.' };
+  }
+
+  const cleanDate = String(input.date ?? '').split('T')[0].trim();
+  const cleanTime = normalizeScaleTime(input.time);
+
+  if (!isCalendarDate(cleanDate)) {
+    return { ok: false, error: 'Informe uma data válida.' };
+  }
+  if (cleanDate < today) {
+    return { ok: false, error: `A data ${formatRotationDateBR(cleanDate)} já passou e não pode ser usada.` };
+  }
+  if (!isValidScaleTime(cleanTime)) {
+    return { ok: false, error: `Informe um horário válido para ${formatRotationDateBR(cleanDate)}.` };
+  }
+
+  const duplicate = upcoming.find(
+    s => s.id !== input.slotId && s.date === cleanDate && normalizeScaleTime(s.time) === cleanTime,
+  );
+  if (duplicate) {
+    return {
+      ok: false,
+      error: `Já existe disponibilidade cadastrada em ${formatRotationDateBR(cleanDate)} às ${cleanTime}.`,
+    };
+  }
+
+  const updatedSlot: ExaminerRotationDateSlot = {
+    ...target,
+    date: cleanDate,
+    time: cleanTime,
+  };
+  const nextSlots = upcoming.map(s => (s.id === input.slotId ? updatedSlot : s));
+  return {
+    ok: true,
+    availableDates: filterUpcomingExaminerRotationDates(nextSlots, today),
+    updatedSlot,
+  };
+}
+
+export function removeExaminerAvailableDateSlot(input: {
+  slots: ExaminerRotationDateSlot[] | null | undefined;
+  slotId: string;
+  today?: string;
+}): ExaminerRotationDateSlot[] {
+  const today = input.today && isCalendarDate(input.today) ? input.today : businessDate();
+  return filterUpcomingExaminerRotationDates(input.slots, today).filter(s => s.id !== input.slotId);
 }
 
 export function isRotationDateSlotEditable(
