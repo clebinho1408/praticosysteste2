@@ -1710,6 +1710,10 @@ export function buildExaminerUpcomingSchedules(
       );
 
       if (resolved.kind === 'ROTATION_DATES') {
+        const suppressedDates = Array.isArray(school.mainSchedule?.suppressedRotationDates)
+          ? school.mainSchedule!.suppressedRotationDates!
+          : [];
+        if (suppressedDates.includes(date)) continue;
         const rawEntries = Array.isArray(school.mainSchedule?.rotationEntries)
           ? school.mainSchedule!.rotationEntries
           : [];
@@ -1758,7 +1762,7 @@ export function buildExaminerUpcomingSchedules(
             });
           }
         }
-      } else if (resolved.kind === 'WEEKLY_SLOTS' && !school.examRotation) {
+      } else if (resolved.kind === 'WEEKLY_SLOTS' && (!school.examRotation || school.provisionalSchedule?.active)) {
         if (systemBlocked) continue;
         if (resolved.schedule.frequency === '15_DAYS') {
           if (resolved.slots.length === 0) continue;
@@ -1826,4 +1830,58 @@ export function formatExaminerUpcomingSchedulesWhatsApp(input: {
   return lines.join('\n');
 }
 
+export function findSchoolsSchedulingExaminerRotationSlot(input: {
+  examinerId: string;
+  examinerName?: string | null;
+  date: string;
+  time: string;
+  schools: OtherSchoolRotationLike[];
+}): { id: string; name: string }[] {
+  const examinerId = String(input.examinerId ?? '').trim();
+  const examinerNameUpper = String(input.examinerName ?? '').trim().toUpperCase();
+  const date = String(input.date ?? '').split('T')[0].trim();
+  const time = normalizeScaleTime(input.time);
+  if ((!examinerId && !examinerNameUpper) || !isCalendarDate(date) || !isValidScaleTime(time)) {
+    return [];
+  }
 
+  const matchesExaminer = (idOrName?: string | null): boolean => {
+    const raw = String(idOrName ?? '').trim();
+    if (!raw) return false;
+    if (examinerId && raw === examinerId) return true;
+    return examinerNameUpper !== '' && raw.toUpperCase() === examinerNameUpper;
+  };
+
+  const matched: { id: string; name: string }[] = [];
+  for (const school of input.schools ?? []) {
+    if (!school?.id || !school.examRotation) continue;
+    const paused = Array.isArray(school.mainSchedule?.pausedDates) ? school.mainSchedule!.pausedDates! : [];
+    if (paused.includes(date)) continue;
+    const suppressed = Array.isArray(school.mainSchedule?.suppressedRotationDates)
+      ? school.mainSchedule!.suppressedRotationDates!
+      : [];
+    if (suppressed.includes(date)) continue;
+    const entries = Array.isArray(school.mainSchedule?.rotationEntries) ? school.mainSchedule!.rotationEntries! : [];
+    const hasMatch = entries.some(entry => {
+      if (!entry) return false;
+      const entryDate = String(entry.date ?? '').split('T')[0].trim();
+      if (entryDate !== date) return false;
+      if (normalizeScaleTime(entry.time) !== time) return false;
+      return matchesExaminer(entry.examiner);
+    });
+    if (hasMatch) {
+      matched.push({ id: school.id, name: school.name || school.id });
+    }
+  }
+  return matched;
+}
+
+export function getExaminerAvailableSlotStatus(input: {
+  examinerId: string;
+  examinerName?: string | null;
+  date: string;
+  time: string;
+  schools: OtherSchoolRotationLike[];
+}): 'Agendado' | 'Disponível' {
+  return findSchoolsSchedulingExaminerRotationSlot(input).length > 0 ? 'Agendado' : 'Disponível';
+}

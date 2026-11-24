@@ -15,6 +15,8 @@ import { mergePreservedAutoCnhBancaLinks, syncCnhRotationBancasOnDb } from "../.
 import { applyExaminerSelfRotationUpdate, sanitizeAdminExaminerRotationAvailability } from "../../../../functions/_examiner-self-rotation.js";
 // @ts-ignore Shared school rotation helpers.
 import { getExaminerMaxPerDayForDate, getExaminerRotationTimesForDate, isExaminerEligibleForSchool } from "../../../../functions/_school-rotation.js";
+// @ts-ignore Shared school update propagation to confirmed slots and CNH bancas.
+import { cleanupDerivedSchedulesOnSchoolDelete, syncDerivedSchedulesOnSchoolUpdate } from "../../../../functions/_school-sync-propagation.js";
 import { db } from "@workspace/db";
 import {
   users, drivingSchools, examiners, instructors, vehicles,
@@ -418,7 +420,7 @@ router.post("/schools", async (req, res) => {
     const synced = await syncCnhRotationBancasOnDb(db, {
       drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
     });
-    if (synced.created.length > 0) broadcast("schedules_updated", synced.created[0]);
+    broadcast("schedules_updated", synced.created[0] ?? { schoolId: item[0]?.id });
     const refreshed = item[0]?.id
       ? (await db.select().from(drivingSchools).where(eq(drivingSchools.id, item[0].id)).limit(1))[0]
       : item[0];
@@ -442,10 +444,20 @@ router.put("/schools", async (req, res) => {
     const conflict = cnhSchoolScaleConflict({ ...current, ...updates, id }, existing);
     if (conflict) return res.status(409).json({ error: conflict });
     const item = await db.update(drivingSchools).set(updates).where(eq(drivingSchools.id, id)).returning();
-    const synced = await syncCnhRotationBancasOnDb(db, {
+    const updatedSchool = item[0] ?? { ...current, ...updates, id };
+    await syncDerivedSchedulesOnSchoolUpdate(
+      db,
+      {
+        drivingSchools, examiners, examSchedules, cfcScheduleSlots,
+        cfcRequests, cnhbrasilRequests, blockedDates, systemSettings,
+      },
+      { currentSchool: current, updatedSchool },
+    );
+    await syncCnhRotationBancasOnDb(db, {
       drivingSchools, examSchedules, examiners, cities, examLocations, blockedDates, systemSettings,
     });
-    if (synced.created.length > 0) broadcast("schedules_updated", synced.created[0]);
+    broadcast("schedules_updated", { schoolId: id });
+    broadcast("requests_updated", { schoolId: id });
     const refreshed = (await db.select().from(drivingSchools).where(eq(drivingSchools.id, id)).limit(1))[0];
     return res.json(refreshed ?? item[0]);
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
@@ -454,7 +466,18 @@ router.delete("/schools", async (req, res) => {
   if ((req as any).authorizedRoute !== "schools") return res.status(403).json({ error: "Acesso negado." });
   try {
     const { id } = req.query as any;
+    const [existingSchool] = id
+      ? await db.select().from(drivingSchools).where(eq(drivingSchools.id, id)).limit(1)
+      : [];
+    if (existingSchool) {
+      await cleanupDerivedSchedulesOnSchoolDelete(
+        db,
+        { cfcScheduleSlots, examSchedules, cnhbrasilRequests },
+        { school: existingSchool },
+      );
+    }
     await db.delete(drivingSchools).where(eq(drivingSchools.id, id));
+    broadcast("schedules_updated", { schoolId: id });
     return res.json({ success: true });
   } catch (err: any) { return res.status(500).json({ error: err.message }); }
 });

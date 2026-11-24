@@ -8,6 +8,9 @@ import {
   examLocations,
   blockedDates,
   systemSettings,
+  cfcScheduleSlots,
+  cfcRequests,
+  cnhbrasilRequests,
 } from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { schoolPauseValidation } from '../_school-schedule.js';
@@ -17,6 +20,10 @@ import {
   mergePreservedAutoCnhBancaLinks,
   syncCnhRotationBancasOnDb,
 } from '../_cnh-auto-bancas.js';
+import {
+  cleanupDerivedSchedulesOnSchoolDelete,
+  syncDerivedSchedulesOnSchoolUpdate,
+} from '../_school-sync-propagation.js';
 
 import { isD1 } from '../_d1.js';
 
@@ -98,6 +105,21 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       const conflict = cnhSchoolScaleConflict({ ...current, ...updates, id }, existing);
       if (conflict) return error(conflict, 409);
       const updated = await db.update(drivingSchools).set(updates).where(eq(drivingSchools.id, id)).returning();
+      const updatedSchool = updated[0] ?? { ...current, ...updates, id };
+      await syncDerivedSchedulesOnSchoolUpdate(
+        db,
+        {
+          drivingSchools,
+          examiners,
+          examSchedules,
+          cfcScheduleSlots,
+          cfcRequests,
+          cnhbrasilRequests,
+          blockedDates,
+          systemSettings,
+        },
+        { currentSchool: current, updatedSchool },
+      );
       await syncCnhRotationBancasOnDb(db, {
         drivingSchools,
         examSchedules,
@@ -115,6 +137,14 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
       if ((data as any)?.authorizedRoute !== 'schools') return error('Acesso negado.', 403);
       const id = query.id;
       if (!id) return error('ID obrigatório', 400);
+      const [existingSchool] = await db.select().from(drivingSchools).where(eq(drivingSchools.id, id)).limit(1);
+      if (existingSchool) {
+        await cleanupDerivedSchedulesOnSchoolDelete(
+          db,
+          { cfcScheduleSlots, examSchedules, cnhbrasilRequests },
+          { school: existingSchool },
+        );
+      }
       await db.delete(drivingSchools).where(eq(drivingSchools.id, id));
       return json({ success: true });
     }

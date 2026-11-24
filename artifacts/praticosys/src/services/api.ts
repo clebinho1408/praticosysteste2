@@ -65,6 +65,7 @@ async function request<T>(endpoint: string, options?: RequestInit): Promise<T> {
   const authHeaders = getAuthHeaders();
   const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
+    cache: options?.cache ?? 'no-store',
     headers: {
       'Content-Type': 'application/json',
       ...authHeaders,                // Bearer token em todas as requisições

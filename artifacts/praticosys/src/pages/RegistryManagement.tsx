@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, findSchoolsSchedulingExaminerRotationSlot, getExaminerAvailableSlotStatus, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -2971,12 +2971,12 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       onConfirm: () => {}
   });
 
-  const fetch = async () => {
+  const fetch = async (): Promise<Examiner[]> => {
     const todayStr = new Date().toISOString().split('T')[0];
-    const examiners = await api.getExaminersAsync();
+    const examinersList = await api.getExaminersAsync();
 
     // ── Auto-remove expired blockedPeriods from DB ──
-    const examinersWithExpired = examiners.filter(ex => {
+    const examinersWithExpired = examinersList.filter(ex => {
       const periods = Array.isArray(ex.blockedPeriods) ? ex.blockedPeriods : [];
       return periods.some(p => p.endDate < todayStr);
     });
@@ -2985,10 +2985,12 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
         const activePeriods = (ex.blockedPeriods || []).filter(p => p.endDate >= todayStr);
         return api.updateExaminer(ex.id, { blockedPeriods: activePeriods });
       }));
-      setExaminers(await api.getExaminersAsync());
-    } else {
-      setExaminers(examiners);
+      const freshList = await api.getExaminersAsync();
+      setExaminers(freshList);
+      return freshList;
     }
+    setExaminers(examinersList);
+    return examinersList;
   };
   const loadScheduleContext = async (silent = false) => {
     if (!silent) setSchedulesLoading(true);
@@ -3015,6 +3017,43 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     }
   };
 
+  const refreshExaminerAndSchedules = async (silent = true) => {
+    const currentToday = businessDate();
+    setToday(currentToday);
+    const [freshExaminers] = await Promise.all([
+      fetch().catch(() => null as Examiner[] | null),
+      loadScheduleContext(silent),
+    ]);
+    if (Array.isArray(freshExaminers)) {
+      setEditing(prev => {
+        if (!prev) return prev;
+        const match = freshExaminers.find(ex => ex.id === prev.id);
+        if (!match) return prev;
+        const freshDates = filterUpcomingExaminerRotationDates(
+          match.rotationAvailability?.availableDates,
+          currentToday,
+        );
+        setFormData(fd => ({
+          ...fd,
+          rotationAvailability: fd.rotationAvailability
+            ? {
+                ...fd.rotationAvailability,
+                availableDates: freshDates,
+              }
+            : match.rotationAvailability
+              ? {
+                  schoolIds: Array.isArray(match.rotationAvailability.schoolIds)
+                    ? [...match.rotationAvailability.schoolIds]
+                    : [],
+                  availableDates: freshDates,
+                }
+              : null,
+        }));
+        return match;
+      });
+    }
+  };
+
   useEffect(() => {
     fetch();
     loadScheduleContext();
@@ -3022,18 +3061,13 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   }, []);
 
   useEffect(() => {
-    const refreshAll = () => {
-      setToday(businessDate());
-      loadScheduleContext(true);
-    };
     const onVisibility = () => {
-      if (!document.hidden) refreshAll();
+      if (!document.hidden) void refreshExaminerAndSchedules(true);
     };
     const onSchedulesChanged = () => {
-      fetch().catch(() => {});
-      loadScheduleContext(true);
+      void refreshExaminerAndSchedules(true);
     };
-    window.addEventListener('focus', refreshAll);
+    window.addEventListener('focus', onSchedulesChanged);
     window.addEventListener(PRATICOSYS_SCHEDULES_CHANGED_EVENT, onSchedulesChanged);
     document.addEventListener('visibilitychange', onVisibility);
     let channel: BroadcastChannel | null = null;
@@ -3044,7 +3078,7 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       }
     } catch {}
     return () => {
-      window.removeEventListener('focus', refreshAll);
+      window.removeEventListener('focus', onSchedulesChanged);
       window.removeEventListener(PRATICOSYS_SCHEDULES_CHANGED_EVENT, onSchedulesChanged);
       document.removeEventListener('visibilitychange', onVisibility);
       channel?.close();
@@ -3053,10 +3087,10 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
 
   useEffect(() => {
     if (!isModalOpen) return;
-    loadScheduleContext(true);
-    if (modalTab !== 'ESCALAS') return;
+    void refreshExaminerAndSchedules(true);
+    if (modalTab !== 'ESCALAS' && modalTab !== 'RODIZIO') return;
     const interval = window.setInterval(() => {
-      loadScheduleContext(true);
+      void refreshExaminerAndSchedules(true);
     }, 4000);
     return () => window.clearInterval(interval);
   }, [isModalOpen, modalTab]);
@@ -3740,19 +3774,71 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                               Nenhuma data futura cadastrada pelo examinador até o momento.
                             </div>
                           ) : (
-                            <div className="max-h-56 overflow-y-auto border rounded-lg divide-y divide-gray-100 bg-white">
-                              {upcomingAvailableDates.map(slot => (
-                                <div key={slot.id} className="flex items-center justify-between px-3 py-2 text-sm">
-                                  <div className="flex items-center gap-2 font-medium text-gray-800">
-                                    <Calendar className="h-4 w-4 text-blue-600 shrink-0" />
-                                    <span>{formatRotationDateBR(slot.date)}</span>
-                                    <span className="text-xs text-gray-400">({scaleWeekday(slot.date)})</span>
-                                  </div>
-                                  <span className="inline-flex items-center bg-blue-50 text-blue-800 border border-blue-200 px-2.5 py-0.5 rounded font-bold text-xs">
-                                    {slot.time}
-                                  </span>
-                                </div>
-                              ))}
+                            <div className="max-h-56 overflow-y-auto border rounded-lg bg-white">
+                              <table className="w-full text-sm text-left">
+                                <thead className="bg-gray-50 text-gray-600 border-b sticky top-0">
+                                  <tr>
+                                    <th className="px-3 py-2 font-semibold">Data</th>
+                                    <th className="px-3 py-2 font-semibold">Horário</th>
+                                    <th className="px-3 py-2 font-semibold text-right">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-gray-100">
+                                  {upcomingAvailableDates.map(slot => {
+                                    const scheduledSchools = editing?.id
+                                      ? findSchoolsSchedulingExaminerRotationSlot({
+                                          examinerId: editing.id,
+                                          examinerName: formData.name || editing.name,
+                                          date: slot.date,
+                                          time: slot.time,
+                                          schools,
+                                        })
+                                      : [];
+                                    const slotStatus = editing?.id
+                                      ? getExaminerAvailableSlotStatus({
+                                          examinerId: editing.id,
+                                          examinerName: formData.name || editing.name,
+                                          date: slot.date,
+                                          time: slot.time,
+                                          schools,
+                                        })
+                                      : 'Disponível';
+                                    const isScheduled = slotStatus === 'Agendado';
+                                    return (
+                                      <tr key={slot.id} className="hover:bg-gray-50">
+                                        <td className="px-3 py-2 whitespace-nowrap">
+                                          <div className="flex items-center gap-2 font-medium text-gray-800">
+                                            <Calendar className="h-4 w-4 text-blue-600 shrink-0" />
+                                            <span>{formatRotationDateBR(slot.date)}</span>
+                                            <span className="text-xs text-gray-400">({scaleWeekday(slot.date)})</span>
+                                          </div>
+                                        </td>
+                                        <td className="px-3 py-2 whitespace-nowrap">
+                                          <span className="inline-flex items-center bg-blue-50 text-blue-800 border border-blue-200 px-2.5 py-0.5 rounded font-bold text-xs">
+                                            {slot.time}
+                                          </span>
+                                        </td>
+                                        <td className="px-3 py-2 whitespace-nowrap text-right">
+                                          <span
+                                            title={
+                                              isScheduled
+                                                ? `Agendado em: ${scheduledSchools.map(s => s.name).join(', ')}`
+                                                : 'Disponível para seleção na Escala Rodízio'
+                                            }
+                                            className={`inline-flex items-center px-2.5 py-0.5 rounded text-xs font-semibold border ${
+                                              isScheduled
+                                                ? 'bg-green-100 text-green-800 border-green-200'
+                                                : 'bg-slate-100 text-slate-700 border-slate-200'
+                                            }`}
+                                          >
+                                            {slotStatus}
+                                          </span>
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
                             </div>
                           )}
                         </div>
