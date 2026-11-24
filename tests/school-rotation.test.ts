@@ -24,6 +24,7 @@ import {
   resolveSchoolScaleForDate,
   activeSchoolScale,
   matchesSchoolScale,
+  scaleWeekday,
 } from '../functions/_school-schedule.js';
 import { planFixedScales } from '../artifacts/praticosys/src/lib/cfcFixedRotation.js';
 
@@ -32,21 +33,62 @@ const cities = [
   { id: 'c2', name: 'TIJUCAS' },
 ];
 
-const makeExaminer = (id: string, overrides: Record<string, any> = {}) => ({
-  id,
-  name: id.toUpperCase(),
-  examRotation: true,
-  canExamCommon: true,
-  rotationAvailability: {
+const expandAvailableDates = (
+  days: string[],
+  times: string[],
+  start = '2026-11-21',
+  daysAhead = 40,
+) => {
+  const slots: { id: string; date: string; time: string; createdAt: string }[] = [];
+  for (let i = 0; i <= daysAhead; i++) {
+    const date = addCalendarDays(start, i);
+    if (!days.includes(scaleWeekday(date))) continue;
+    for (const time of times) {
+      if (!time) continue;
+      slots.push({
+        id: `slot-${date}-${time}`,
+        date,
+        time,
+        createdAt: '2026-11-20T12:00:00Z',
+      });
+    }
+  }
+  return slots;
+};
+
+const makeExaminer = (id: string, overrides: Record<string, any> = {}) => {
+  const rawAv = overrides.rotationAvailability;
+  const defaultAv = {
     days: ['SEG', 'QUA'],
     defaultTime: '14:00',
     secondDefaultTime: '',
     examsPerDay: 1 as const,
     cityIds: ['c1'],
-  },
-  blockedPeriods: [],
-  ...overrides,
-});
+  };
+  let rotationAvailability = rawAv === undefined ? defaultAv : rawAv;
+  if (
+    rotationAvailability &&
+    !Array.isArray(rotationAvailability.availableDates) &&
+    Array.isArray(rotationAvailability.days)
+  ) {
+    const times = rotationAvailability.examsPerDay === 2
+      ? [rotationAvailability.defaultTime ?? '', rotationAvailability.secondDefaultTime ?? '']
+      : [rotationAvailability.defaultTime ?? ''];
+    rotationAvailability = {
+      ...rotationAvailability,
+      availableDates: expandAvailableDates(rotationAvailability.days, times),
+    };
+  }
+  return {
+    id,
+    name: id.toUpperCase(),
+    examRotation: true,
+    canExamCommon: true,
+    blockedPeriods: [],
+    ...overrides,
+    rotationAvailability,
+  };
+};
 
 test('validates examiner examRotation, city, days, and time window 10:00 - 16:00', () => {
   const exValidSecondTime = makeExaminer('ex-valid', {
@@ -82,6 +124,7 @@ test('validates examiner examRotation, city, days, and time window 10:00 - 16:00
     config,
     examiners: [exValidSecondTime, exNoRotation, exOtherCity, exWrongTime],
     cities,
+    today: '2026-11-23',
   });
 
   assert.deepEqual(result.eligible.map(e => e.id), ['ex-valid']);
@@ -692,7 +735,7 @@ test('resolveExaminerDefaultRotationTime picks examiner default time respecting 
   const exSingle = makeExaminer('ex-single', {
     rotationAvailability: { days: ['SEG'], defaultTime: '15:00', examsPerDay: 1 as const, cityIds: ['c1'] },
   });
-  assert.equal(resolveExaminerDefaultRotationTime(exSingle, config, '2026-11-23'), '15:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exSingle, config, '2026-11-23', '2026-11-23'), '15:00');
 
   const exSecondInWindow = makeExaminer('ex-second', {
     rotationAvailability: {
@@ -703,7 +746,7 @@ test('resolveExaminerDefaultRotationTime picks examiner default time respecting 
       cityIds: ['c1'],
     },
   });
-  assert.equal(resolveExaminerDefaultRotationTime(exSecondInWindow, config, '2026-11-23'), '14:30');
+  assert.equal(resolveExaminerDefaultRotationTime(exSecondInWindow, config, '2026-11-23', '2026-11-23'), '14:30');
 
   const exHalfDayBlock = makeExaminer('ex-half-block', {
     rotationAvailability: {
@@ -717,17 +760,17 @@ test('resolveExaminerDefaultRotationTime picks examiner default time respecting 
       { id: 'b1', startDate: '2026-11-23', endDate: '2026-11-23', description: 'Médico', period: 'MORNING' },
     ],
   });
-  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-23'), '14:00');
-  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-25'), '10:30');
+  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-23', '2026-11-23'), '14:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exHalfDayBlock, config, '2026-11-30', '2026-11-23'), '10:30');
 
   const exOutsideWindowOnly = makeExaminer('ex-out', {
     rotationAvailability: { days: ['SEG'], defaultTime: '08:00', examsPerDay: 1 as const, cityIds: ['c1'] },
   });
-  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, config, '2026-11-23'), '08:00');
-  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, null), '08:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, config, '2026-11-23', '2026-11-23'), '08:00');
+  assert.equal(resolveExaminerDefaultRotationTime(exOutsideWindowOnly, null, undefined, '2026-11-23'), '08:00');
 
   const exNoAvail = makeExaminer('ex-none', { rotationAvailability: null });
-  assert.equal(resolveExaminerDefaultRotationTime(exNoAvail, config, '2026-11-23'), null);
+  assert.equal(resolveExaminerDefaultRotationTime(exNoAvail, config, '2026-11-23', '2026-11-23'), null);
   assert.equal(resolveExaminerDefaultRotationTime(null, config), null);
 });
 
@@ -1039,7 +1082,7 @@ test('formatExaminerUpcomingSchedulesWhatsApp formats title, items, and footer n
   ]);
 });
 
-test('validateExaminerRotationDatesUpdate enforces 60-day range, blockedDates/weekends, 48h edit/delete lock, and auto-hides past dates', () => {
+test('validateExaminerRotationDatesUpdate enforces 60-day range, blockedDates/weekends, immediate post-save lock, and auto-hides past dates', () => {
   const now = new Date('2026-11-23T12:00:00Z');
   const today = '2026-11-23';
   const maxAllowed = addCalendarDays(today, 60); // 2027-01-22
@@ -1100,55 +1143,55 @@ test('validateExaminerRotationDatesUpdate enforces 60-day range, blockedDates/we
     assert.equal(validRes.availableDates[0].createdAt, now.toISOString());
   }
 
-  // 5. Regra de 48h: dentro de 48h permite editar/excluir (preservando createdAt original); >48h bloqueia edição/exclusão
-  const within48h = new Date(now.getTime() - 47 * 3600 * 1000).toISOString();
-  const over48h = new Date(now.getTime() - 49 * 3600 * 1000).toISOString();
+  // 5. Bloqueio imediato após salvar: qualquer slot salvo (mesmo recém-salvo há segundos) não pode ser editado ou excluído
+  const justSaved = new Date(now.getTime() - 10 * 1000).toISOString();
+  const olderSaved = new Date(now.getTime() - 49 * 3600 * 1000).toISOString();
   const existingSlots = [
-    { id: 'past-1', date: '2026-11-20', time: '09:00', createdAt: over48h }, // já passou → ocultado automaticamente
-    { id: 'locked-1', date: '2026-12-01', time: '10:00', createdAt: over48h },
-    { id: 'editable-1', date: '2026-12-02', time: '11:00', createdAt: within48h },
+    { id: 'past-1', date: '2026-11-20', time: '09:00', createdAt: olderSaved }, // já passou → ocultado automaticamente
+    { id: 'locked-1', date: '2026-12-01', time: '10:00', createdAt: olderSaved },
+    { id: 'locked-recent', date: '2026-12-02', time: '11:00', createdAt: justSaved },
   ];
 
   assert.equal(isRotationDateSlotEditable(existingSlots[1], now).editable, false);
-  assert.equal(isRotationDateSlotEditable(existingSlots[2], now).editable, true);
+  assert.equal(isRotationDateSlotEditable(existingSlots[2], now).editable, false);
 
-  // Tentar excluir ou editar slot > 48h deve falhar
-  const tryDeleteLocked = validateExaminerRotationDatesUpdate({
+  // Tentar excluir ou editar qualquer slot salvo deve falhar
+  const tryDeleteRecentSaved = validateExaminerRotationDatesUpdate({
     existingSlots,
-    nextSlots: [existingSlots[2]], // omitiu locked-1
+    nextSlots: [existingSlots[1]], // omitiu locked-recent
     today,
     now,
   });
-  assert.equal(tryDeleteLocked.ok, false);
+  assert.equal(tryDeleteRecentSaved.ok, false);
 
-  const tryEditLocked = validateExaminerRotationDatesUpdate({
+  const tryEditRecentSaved = validateExaminerRotationDatesUpdate({
     existingSlots,
-    nextSlots: [{ ...existingSlots[1], time: '15:00' }, existingSlots[2]],
+    nextSlots: [existingSlots[1], { ...existingSlots[2], time: '15:00' }],
     today,
     now,
   });
-  assert.equal(tryEditLocked.ok, false);
+  assert.equal(tryEditRecentSaved.ok, false);
 
-  // Editar slot dentro de 48h mantendo locked-1 intacto deve funcionar e preservar createdAt original
-  const editWithin48 = validateExaminerRotationDatesUpdate({
+  // Adicionar nova disponibilidade mantendo todas as já salvas funciona e preserva createdAt original
+  const addNewKeepingSaved = validateExaminerRotationDatesUpdate({
     existingSlots,
     nextSlots: [
       existingSlots[1],
-      { ...existingSlots[2], time: '15:30' },
+      existingSlots[2],
+      { id: 'new-1', date: '2026-12-03', time: '15:30', createdAt: now.toISOString() },
     ],
     today,
     now,
   });
-  assert.equal(editWithin48.ok, true);
-  if (editWithin48.ok) {
-    assert.equal(editWithin48.availableDates.length, 2);
-    assert.equal(editWithin48.availableDates[1].time, '15:30');
-    assert.equal(editWithin48.availableDates[1].createdAt, within48h);
+  assert.equal(addNewKeepingSaved.ok, true);
+  if (addNewKeepingSaved.ok) {
+    assert.equal(addNewKeepingSaved.availableDates.length, 3);
+    assert.equal(addNewKeepingSaved.availableDates[1].createdAt, justSaved);
   }
 
   // filterUpcomingExaminerRotationDates oculta automaticamente datas anteriores a hoje
   const filtered = filterUpcomingExaminerRotationDates(existingSlots, today);
-  assert.deepEqual(filtered.map(s => s.id), ['locked-1', 'editable-1']);
+  assert.deepEqual(filtered.map(s => s.id), ['locked-1', 'locked-recent']);
 });
 
 test('school rotation & fixed scale planning work with examiner explicit availableDates', () => {
@@ -1355,6 +1398,67 @@ test('resolveExaminerSchoolRotationConstraints and validateExaminerRotationDates
     assert.equal(validSave.availableDates.length, 3);
   }
 });
+
+test('syncRollingRotationSchedule reads strictly from examiner availableDates and ignores legacy days/defaultTime without availableDates', () => {
+  const legacyOnlyExaminer = {
+    id: 'ex-legacy-only',
+    name: 'EXAMINADOR LEGADO',
+    examRotation: true,
+    canExamCommon: true,
+    rotationAvailability: {
+      schoolIds: ['sch-1'],
+      days: ['SEG', 'QUA'],
+      defaultTime: '10:00',
+      examsPerDay: 1 as const,
+    },
+    blockedPeriods: [],
+  };
+  const explicitExaminer = {
+    id: 'ex-explicit',
+    name: 'EXAMINADOR CELULAR',
+    examRotation: true,
+    canExamCommon: true,
+    rotationAvailability: {
+      schoolIds: ['sch-1'],
+      availableDates: [
+        { id: 'slot-1', date: '2026-11-23', time: '09:30', createdAt: '2026-11-22T12:00:00Z' },
+        { id: 'slot-2', date: '2026-11-30', time: '11:00', createdAt: '2026-11-22T12:00:00Z' },
+      ],
+    },
+    blockedPeriods: [],
+  };
+  const config = { days: ['SEG', 'QUA'], startTime: '08:00', endTime: '12:00' };
+
+  const elig = findEligibleExaminersForSchool({
+    schoolId: 'sch-1',
+    schoolCity: 'ITAPEMA',
+    config,
+    examiners: [legacyOnlyExaminer, explicitExaminer],
+    cities,
+    today: '2026-11-23',
+  });
+  assert.deepEqual(elig.eligible.map(e => e.id), ['ex-explicit']);
+  assert.equal(resolveExaminerDefaultRotationTime(legacyOnlyExaminer, config, '2026-11-23', '2026-11-23'), null);
+  assert.equal(resolveExaminerDefaultRotationTime(explicitExaminer, config, '2026-11-23', '2026-11-23'), '09:30');
+
+  const synced = syncRollingRotationSchedule({
+    currentSchoolId: 'sch-1',
+    schoolCity: 'ITAPEMA',
+    config,
+    examiners: [legacyOnlyExaminer, explicitExaminer],
+    cities,
+    today: '2026-11-23',
+    horizonDays: 14,
+  });
+  assert.deepEqual(
+    synced.entries.map(e => `${e.date}|${e.time}|${e.examiner}`),
+    [
+      '2026-11-23|09:30|ex-explicit',
+      '2026-11-30|11:00|ex-explicit',
+    ],
+  );
+});
+
 
 
 

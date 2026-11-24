@@ -5,9 +5,9 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
-import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
+import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
 
 type Tab = 'USERS' | 'SCHOOLS' | 'EXAMINERS' | 'INSTRUCTORS';
@@ -2361,6 +2361,9 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     } : { days: [], startTime: '10:00', endTime: '16:00' });
                     setRotationConfigError('');
                     setIsRotationConfigOpen(true);
+                    api.getExaminersAsync().then(fresh => {
+                      if (Array.isArray(fresh)) setExaminers(fresh);
+                    }).catch(() => {});
                   };
 
                   const handleCheckboxChange = (checked: boolean) => {
@@ -2438,50 +2441,15 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     updateEntriesAndSuppressed(remaining, nextSuppressed);
                   };
 
-                  const handleRefreshSchedule = () => {
+                  const handleRefreshSchedule = async () => {
                     if (!rotationConfig) return;
-                    setFormData(applyRotationSyncToForm(formData, rotationConfig, {
+                    const freshExaminers = await api.getExaminersAsync().catch(() => examiners);
+                    setExaminers(freshExaminers);
+                    setFormData(prev => applyRotationSyncToForm(prev, rotationConfig, {
                       forceRebalanceAuto: true,
                       activateMain: true,
+                      exList: freshExaminers,
                     }));
-                  };
-
-                  const handleShuffleSchedule = () => {
-                    if (!rotationConfig) return;
-                    const currentMain = formData.mainSchedule ?? initialFormData.mainSchedule!;
-                    const shuffled = shuffleRotationSchedule({
-                      currentSchoolId: formData.id ?? editing?.id ?? null,
-                      schoolCity: formData.city,
-                      config: rotationConfig,
-                      existingEntries: currentMain.rotationEntries ?? [],
-                      suppressedDates: currentMain.suppressedRotationDates ?? [],
-                      pausedDates: currentMain.pausedDates ?? [],
-                      otherSchools: schools,
-                      examiners,
-                      cities,
-                      blockedDates,
-                      systemSettings,
-                      today,
-                    });
-                    const nextMain: SchoolSchedule = {
-                      ...currentMain,
-                      active: true,
-                      days: [...rotationConfig.days],
-                      rotationConfig,
-                      rotationEntries: shuffled.entries,
-                      suppressedRotationDates: shuffled.suppressedDates,
-                    };
-                    const nextProv = formData.provisionalSchedule
-                      ? { ...formData.provisionalSchedule, active: false }
-                      : formData.provisionalSchedule;
-                    setRotationWarnings(shuffled.warnings);
-                    setRotationDistribution(shuffled.distribution);
-                    setFormData({
-                      ...formData,
-                      examRotation: true,
-                      mainSchedule: nextMain,
-                      provisionalSchedule: nextProv,
-                    });
                   };
 
                   const distributionToShow = rotationDistribution.length > 0
@@ -2519,24 +2487,14 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                 Configurar Dias e Horários
                               </button>
                               {rotationConfig && (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={handleRefreshSchedule}
-                                    className="px-3 py-1.5 text-xs font-semibold rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 inline-flex items-center gap-1"
-                                  >
-                                    <RefreshCw className="h-3.5 w-3.5" />
-                                    Atualizar 30 Dias
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={handleShuffleSchedule}
-                                    className="px-3 py-1.5 text-xs font-semibold rounded border border-purple-200 bg-white text-purple-700 hover:bg-purple-50 inline-flex items-center gap-1"
-                                  >
-                                    <Shuffle className="h-3.5 w-3.5" />
-                                    Embaralhar
-                                  </button>
-                                </>
+                                <button
+                                  type="button"
+                                  onClick={handleRefreshSchedule}
+                                  className="px-3 py-1.5 text-xs font-semibold rounded border border-slate-200 bg-white text-slate-700 hover:bg-slate-100 inline-flex items-center gap-1"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                  Atualizar 30 Dias
+                                </button>
                               )}
                             </div>
                           )}
@@ -2705,16 +2663,22 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                         onChange={e => handleUpdateEntry(entry.id, 'examiner', e.target.value)}
                                       >
                                         <option value="">Selecione...</option>
-                                        {examiners.map(ex => {
-                                          const blk = entry.date
-                                            ? isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, entry.time)
-                                            : { blocked: false };
-                                          return (
-                                            <option key={ex.id} value={ex.id} disabled={blk.blocked}>
-                                              {blk.blocked ? `🔒 ${ex.name} — ${blk.reason}` : ex.name}
-                                            </option>
-                                          );
-                                        })}
+                                        {examiners
+                                          .filter(ex => isExaminerEligibleForSchool(
+                                            ex,
+                                            { id: formData.id ?? editing?.id ?? null, city: formData.city ?? null },
+                                            cities,
+                                          ))
+                                          .map(ex => {
+                                            const blk = entry.date
+                                              ? isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, entry.time)
+                                              : { blocked: false };
+                                            return (
+                                              <option key={ex.id} value={ex.id} disabled={blk.blocked}>
+                                                {blk.blocked ? `🔒 ${ex.name} — ${blk.reason}` : ex.name}
+                                              </option>
+                                            );
+                                          })}
                                       </select>
                                       {exBlock.blocked && (
                                         <p className="text-[10px] text-red-600 font-semibold mt-0.5 leading-tight">
@@ -2924,7 +2888,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
               </button>
               <button
                 type="button"
-                onClick={() => {
+                onClick={async () => {
                   const start = normalizeScaleTime(rotationConfigDraft.startTime);
                   const end = normalizeScaleTime(rotationConfigDraft.endTime);
                   if (rotationConfigDraft.days.length === 0) {
@@ -2944,9 +2908,12 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     startTime: start,
                     endTime: end,
                   };
+                  const freshExaminers = await api.getExaminersAsync().catch(() => examiners);
+                  setExaminers(freshExaminers);
                   setFormData(prev => applyRotationSyncToForm(prev, normalizedConfig, {
                     forceRebalanceAuto: true,
                     activateMain: true,
+                    exList: freshExaminers,
                   }));
                   setIsRotationConfigOpen(false);
                 }}

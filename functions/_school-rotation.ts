@@ -317,32 +317,14 @@ export function filterUpcomingExaminerRotationDates(
 }
 
 export function isRotationDateSlotEditable(
-  slot: Pick<ExaminerRotationDateSlot, 'createdAt'> | null | undefined,
-  now = new Date(),
+  _slot: Pick<ExaminerRotationDateSlot, 'createdAt'> | null | undefined,
+  _now = new Date(),
 ): { editable: boolean; remainingMs: number; remainingHours: number; reason?: string } {
-  const createdMs = slot?.createdAt ? Date.parse(slot.createdAt) : Number.NaN;
-  if (!Number.isFinite(createdMs)) {
-    return {
-      editable: false,
-      remainingMs: 0,
-      remainingHours: 0,
-      reason: 'Prazo de 48h expirado (sem data de registro válida).',
-    };
-  }
-  const elapsed = now.getTime() - createdMs;
-  if (elapsed > ROTATION_EDIT_WINDOW_MS) {
-    return {
-      editable: false,
-      remainingMs: 0,
-      remainingHours: 0,
-      reason: 'Prazo de 48h após o cadastro expirado para editar ou excluir.',
-    };
-  }
-  const remainingMs = Math.max(0, ROTATION_EDIT_WINDOW_MS - Math.max(0, elapsed));
   return {
-    editable: true,
-    remainingMs,
-    remainingHours: Math.max(1, Math.ceil(remainingMs / (60 * 60 * 1000))),
+    editable: false,
+    remainingMs: 0,
+    remainingHours: 0,
+    reason: 'Após salvar, não é possível editar ou excluir este cadastro.',
   };
 }
 
@@ -387,8 +369,6 @@ export function validateExaminerRotationDatesUpdate(input: {
   }
 
   for (const stored of existingUpcoming) {
-    const windowState = isRotationDateSlotEditable(stored, now);
-    if (windowState.editable) continue;
     const matched = incomingById.get(stored.id);
     if (
       !matched ||
@@ -397,7 +377,7 @@ export function validateExaminerRotationDatesUpdate(input: {
     ) {
       return {
         ok: false,
-        error: `A disponibilidade de ${formatRotationDateBR(stored.date)} às ${normalizeScaleTime(stored.time)} já ultrapassou 48h do cadastro e não pode ser editada ou excluída.`,
+        error: `A disponibilidade de ${formatRotationDateBR(stored.date)} às ${normalizeScaleTime(stored.time)} já foi salva e não pode ser editada ou excluída.`,
       };
     }
   }
@@ -427,7 +407,7 @@ export function validateExaminerRotationDatesUpdate(input: {
       return { ok: false, error: `Informe um horário válido para ${formatRotationDateBR(date)}.` };
     }
 
-    const isLockedStored = stored && !isRotationDateSlotEditable(stored, now).editable;
+    const isLockedStored = Boolean(stored);
     const dateChanged = !stored || stored.date !== date;
     const timeChanged = !stored || normalizeScaleTime(stored.time) !== time;
 
@@ -500,29 +480,34 @@ export function getExaminerRotationTimesInWindow(
   today = businessDate(),
 ): string[] {
   const av = examiner.rotationAvailability;
-  if (!av) return [];
-  if (Array.isArray(av.availableDates)) {
-    const configDays = new Set(config.days ?? []);
-    const unique = new Set<string>();
-    for (const slot of filterUpcomingExaminerRotationDates(av.availableDates, today)) {
-      if (configDays.size > 0 && !configDays.has(scaleWeekday(slot.date))) continue;
-      if (isTimeWithinWindow(slot.time, config.startTime, config.endTime)) {
-        unique.add(slot.time);
-      }
-    }
-    return [...unique];
-  }
-  const rawTimes = av.examsPerDay === 2
-    ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
-    : [av.defaultTime ?? ''];
+  if (!av || !Array.isArray(av.availableDates)) return [];
+  const configDays = new Set(config.days ?? []);
   const unique = new Set<string>();
-  for (const raw of rawTimes) {
-    const t = normalizeScaleTime(raw);
-    if (isValidScaleTime(t) && isTimeWithinWindow(t, config.startTime, config.endTime)) {
-      unique.add(t);
+  for (const slot of filterUpcomingExaminerRotationDates(av.availableDates, today)) {
+    if (configDays.size > 0 && !configDays.has(scaleWeekday(slot.date))) continue;
+    if (isTimeWithinWindow(slot.time, config.startTime, config.endTime)) {
+      unique.add(slot.time);
     }
   }
   return [...unique];
+}
+
+export function getExaminerExplicitRotationTimesForDate(
+  examiner: RotationExaminerLike,
+  date: string,
+  config?: RotationConfig | null,
+): string[] {
+  const av = examiner.rotationAvailability;
+  if (!av || !Array.isArray(av.availableDates) || !isCalendarDate(date)) return [];
+  const unique = new Set<string>();
+  for (const slot of av.availableDates) {
+    if (!slot || slot.date !== date) continue;
+    const t = normalizeScaleTime(slot.time);
+    if (!isValidScaleTime(t)) continue;
+    if (config && !isTimeWithinWindow(t, config.startTime, config.endTime)) continue;
+    unique.add(t);
+  }
+  return [...unique].sort();
 }
 
 export function getExaminerRotationTimesForDate(
@@ -533,26 +518,19 @@ export function getExaminerRotationTimesForDate(
   const av = examiner.rotationAvailability;
   if (!av || !isCalendarDate(date)) return [];
   if (Array.isArray(av.availableDates)) {
-    const unique = new Set<string>();
-    for (const slot of av.availableDates) {
-      if (!slot || slot.date !== date) continue;
-      const t = normalizeScaleTime(slot.time);
-      if (!isValidScaleTime(t)) continue;
-      if (config && !isTimeWithinWindow(t, config.startTime, config.endTime)) continue;
-      unique.add(t);
-    }
-    return [...unique].sort();
+    return getExaminerExplicitRotationTimesForDate(examiner, date, config);
   }
   const weekday = scaleWeekday(date);
   if (!Array.isArray(av.days) || !av.days.includes(weekday)) return [];
-  if (config) return getExaminerRotationTimesInWindow(examiner, config);
   const rawTimes = av.examsPerDay === 2
     ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
     : [av.defaultTime ?? ''];
   const unique = new Set<string>();
   for (const raw of rawTimes) {
     const t = normalizeScaleTime(raw);
-    if (isValidScaleTime(t)) unique.add(t);
+    if (!isValidScaleTime(t)) continue;
+    if (config && !isTimeWithinWindow(t, config.startTime, config.endTime)) continue;
+    unique.add(t);
   }
   return [...unique];
 }
@@ -577,49 +555,23 @@ export function resolveExaminerDefaultRotationTime(
   today = businessDate(),
 ): string | null {
   const av = examiner?.rotationAvailability;
-  if (!av) return null;
+  if (!av || !Array.isArray(av.availableDates)) return null;
 
-  if (Array.isArray(av.availableDates)) {
-    const upcoming = filterUpcomingExaminerRotationDates(av.availableDates, today);
-    const matching = date && isCalendarDate(date)
-      ? upcoming.filter(s => s.date === date)
-      : upcoming;
-    const inWindow = config
-      ? matching.filter(s => isTimeWithinWindow(s.time, config.startTime, config.endTime))
-      : matching;
-    const pool = (inWindow.length > 0 ? inWindow : matching).map(s => s.time);
-    if (pool.length === 0) return null;
-    if (date && isCalendarDate(date)) {
-      const unblocked = pool.find(
-        t => !isExaminerBlockedOnDateTime(examiner?.blockedPeriods, date, t).blocked,
-      );
-      if (unblocked) return unblocked;
-    }
-    return pool[0];
-  }
-
-  const rawCandidates = av.examsPerDay === 2
-    ? [av.defaultTime ?? '', av.secondDefaultTime ?? '']
-    : [av.defaultTime ?? ''];
-  const allValid: string[] = [];
-  for (const raw of rawCandidates) {
-    const t = normalizeScaleTime(raw);
-    if (isValidScaleTime(t) && !allValid.includes(t)) {
-      allValid.push(t);
-    }
-  }
-  if (allValid.length === 0) return null;
-
-  const inWindow = config ? getExaminerRotationTimesInWindow(examiner!, config, today) : [];
-  const pool = inWindow.length > 0 ? inWindow : allValid;
-
+  const upcoming = filterUpcomingExaminerRotationDates(av.availableDates, today);
+  const matching = date && isCalendarDate(date)
+    ? upcoming.filter(s => s.date === date)
+    : upcoming;
+  const inWindow = config
+    ? matching.filter(s => isTimeWithinWindow(s.time, config.startTime, config.endTime))
+    : matching;
+  const pool = (inWindow.length > 0 ? inWindow : matching).map(s => s.time);
+  if (pool.length === 0) return null;
   if (date && isCalendarDate(date)) {
     const unblocked = pool.find(
       t => !isExaminerBlockedOnDateTime(examiner?.blockedPeriods, date, t).blocked,
     );
     if (unblocked) return unblocked;
   }
-
   return pool[0];
 }
 
@@ -649,21 +601,17 @@ export function findEligibleExaminersForSchool(input: {
       issue: 'Cidade da autoescola não informada ou não cadastrada para validar o rodízio.',
     };
   }
-  const configDays = new Set(input.config.days);
   const eligible = input.examiners.filter(ex => {
     if (!isExaminerEligibleForSchool(ex, schoolRef, input.cities)) return false;
     const av = ex.rotationAvailability!;
-    if (Array.isArray(av.availableDates)) {
-      return getExaminerRotationTimesInWindow(ex, input.config, today).length > 0;
-    }
-    if (!Array.isArray(av.days) || !av.days.some(d => configDays.has(d))) return false;
+    if (!Array.isArray(av.availableDates)) return false;
     return getExaminerRotationTimesInWindow(ex, input.config, today).length > 0;
   });
   if (eligible.length === 0) {
     return {
       cityId,
       eligible: [],
-      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", autoescola, datas e horários compatíveis.',
+      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", autoescola, datas e horários compatíveis em "Datas e horários disponíveis (via acesso do examinador)".',
     };
   }
   return { cityId, eligible };
@@ -950,7 +898,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     if (!normalizedConfig.days.includes(weekday)) return [];
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
     for (const ex of baseEligibility.eligible) {
-      const times = getExaminerRotationTimesForDate(ex, date, normalizedConfig);
+      const times = getExaminerExplicitRotationTimesForDate(ex, date, normalizedConfig);
       for (const time of times) {
         if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
           candidates.push({ examiner: ex, time });
@@ -968,7 +916,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     if (isSystemDateBlockedForRotation(entry.date, blockedDates, input.systemSettings).blocked) return false;
     const ex = examinerMap.get(entry.examiner);
     if (!isExaminerEligibleForSchool(ex, schoolRef, input.cities)) return false;
-    const validTimes = getExaminerRotationTimesForDate(ex!, entry.date, normalizedConfig);
+    const validTimes = getExaminerExplicitRotationTimesForDate(ex!, entry.date, normalizedConfig);
     const normalizedTime = normalizeScaleTime(entry.time);
     if (!validTimes.includes(normalizedTime)) return false;
     if (isExaminerBlockedOnDateTime(ex!.blockedPeriods, entry.date, normalizedTime).blocked) return false;
@@ -1278,7 +1226,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
 
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
     for (const ex of baseEligibility.eligible) {
-      const times = getExaminerRotationTimesForDate(ex, date, normalizedConfig);
+      const times = getExaminerExplicitRotationTimesForDate(ex, date, normalizedConfig);
       for (const time of times) {
         if (!isExaminerBlockedOnDateTime(ex.blockedPeriods, date, time).blocked) {
           candidates.push({ examiner: ex, time });

@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { fixedScaleDay, planFixedScales, rotationCandidates } from '../lib/cfcFixedRotation';
 import { businessDate, isCalendarDate, isValidScaleTime, normalizeScaleTime, resolveSchoolScaleForDate, scaleWeekday } from '../../../../functions/_school-schedule';
-import { MAX_ROTATION_AVAILABILITY_DAYS, addCalendarDays, filterUpcomingExaminerRotationDates, formatRotationDateBR, isRotationDateSlotEditable, isSystemDateBlockedForRotation, isTimeWithinWindow, resolveExaminerSchoolRotationConstraints, syncAllSchoolsRotationSchedules, validateExaminerRotationDatesUpdate } from '../../../../functions/_school-rotation';
+import { MAX_ROTATION_AVAILABILITY_DAYS, addCalendarDays, filterUpcomingExaminerRotationDates, formatRotationDateBR, isSystemDateBlockedForRotation, isTimeWithinWindow, resolveExaminerSchoolRotationConstraints, syncAllSchoolsRotationSchedules, validateExaminerRotationDatesUpdate } from '../../../../functions/_school-rotation';
 import type { FixedCommitment } from '../lib/cfcFixedRotation';
 import { isDateBlocked, isDateInPast } from '../lib/dateBlocking';
 import { examinerCoversRequest } from '../../../../functions/_cfc-interest';
@@ -55,6 +55,7 @@ import DatePicker from '../components/DatePicker';
 import ConfirmedAppointmentModal from '../components/cfc/ConfirmedAppointmentModal';
 import ExtraRequestModal from '../components/cfc/ExtraRequestModal';
 import { confirmedVacancies } from '../lib/cfcConfirmedVacancies';
+import { useIsMobileShell } from '../lib/mobileViewport';
 
 // Global reference to keep track of the WhatsApp window
 let whatsappWindowRef: Window | null = null;
@@ -111,6 +112,7 @@ interface CFCSchedulingCenterProps {
 }
 
 const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
+  const isMobileShell = useIsMobileShell();
   const isConsultant = user.role === UserRole.CONSULTANT;
   const canManageConfirmed = user.role === UserRole.ADMIN || user.role === UserRole.SUPERVISOR;
   const canEditExtraRequest = [UserRole.ADMIN, UserRole.SUPERVISOR, UserRole.OPERATOR].includes(user.role);
@@ -763,9 +765,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
 
   const handleStartEditRotationSlot = (slot: ExaminerRotationDateSlot) => {
     setRotationSaveSuccess('');
-    const stored = savedRotationSlotById.get(slot.id);
-    if (stored && !isRotationDateSlotEditable(stored).editable) {
-      setRotationFormError('Este horário já passou das 48h após o cadastro e não pode ser editado.');
+    if (savedRotationSlotById.has(slot.id)) {
+      setRotationFormError('Após salvar, este horário não pode mais ser editado.');
       return;
     }
     setRotationFormError('');
@@ -793,9 +794,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
 
   const handleRemoveRotationSlot = (slot: ExaminerRotationDateSlot) => {
     setRotationSaveSuccess('');
-    const stored = savedRotationSlotById.get(slot.id);
-    if (stored && !isRotationDateSlotEditable(stored).editable) {
-      setRotationFormError('Este horário já passou das 48h após o cadastro e não pode ser excluído.');
+    if (savedRotationSlotById.has(slot.id)) {
+      setRotationFormError('Após salvar, este horário não pode mais ser excluído.');
       return;
     }
     setRotationDatesDraft(prev => prev.filter(s => s.id !== slot.id));
@@ -2002,7 +2002,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                     <div className="bg-blue-50/60 border border-blue-100 rounded-lg p-3 text-xs text-blue-900 space-y-1.5">
                       <p className="font-semibold">Cadastre as datas e horários futuros em que estará disponível:</p>
                       <p>• Permitido até <strong>{MAX_ROTATION_AVAILABILITY_DAYS} dias no futuro</strong> (até {formatRotationDateBR(rotationMaxDate)}), respeitando o Bloqueio de Datas do sistema.</p>
-                      <p>• Edição e exclusão permitidas somente em até <strong>48h</strong> após o cadastro. Datas que já passaram são ocultadas automaticamente.</p>
+                      <p>• <strong>Atenção:</strong> após salvar, não será mais possível editar ou excluir os cadastros. Datas que já passaram são ocultadas automaticamente.</p>
                       {rotationConstraints.configuredRules.length > 0 && (
                         <div className="pt-1 border-t border-blue-200/70 space-y-0.5">
                           <p className="font-semibold text-blue-950">Regras das autoescolas vinculadas:</p>
@@ -2029,8 +2029,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
 
                     {/* Formulário de inclusão */}
                     <div className="p-3 border border-slate-200 rounded-xl bg-slate-50 space-y-3">
-                      <div className="grid grid-cols-1 sm:grid-cols-12 gap-3 items-end">
-                        <div className="sm:col-span-5">
+                      <div className={`grid gap-3 items-end ${isMobileShell ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-12'}`}>
+                        <div className={isMobileShell ? '' : 'sm:col-span-5'}>
                           <label className="block text-xs font-bold text-slate-700 mb-1">Data disponível</label>
                           <DatePicker
                             id="examiner-rotation-date"
@@ -2045,7 +2045,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             placeholder="Selecione a data"
                           />
                         </div>
-                        <div className="sm:col-span-4">
+                        <div className={isMobileShell ? '' : 'sm:col-span-4'}>
                           <label htmlFor="examiner-rotation-time" className="block text-xs font-bold text-slate-700 mb-1">Horário</label>
                           <input
                             id="examiner-rotation-time"
@@ -2054,10 +2054,10 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             max={newRotationTimeBounds.maxTime ?? undefined}
                             value={newRotationTime}
                             onChange={e => { setNewRotationTime(e.target.value); setRotationFormError(''); }}
-                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm bg-white text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
+                            className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-base bg-white text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
                           />
                         </div>
-                        <div className="sm:col-span-3">
+                        <div className={isMobileShell ? '' : 'sm:col-span-3'}>
                           <button
                             type="button"
                             onClick={handleAddRotationSlot}
@@ -2107,18 +2107,14 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                       ) : (
                         <div className="space-y-2">
                           {visibleRotationDraft.map(slot => {
-                            const stored = savedRotationSlotById.get(slot.id);
-                            const isNewUnsaved = !stored;
-                            const editWindow: ReturnType<typeof isRotationDateSlotEditable> = stored
-                              ? isRotationDateSlotEditable(stored)
-                              : { editable: true, remainingMs: 48 * 60 * 60 * 1000, remainingHours: 48 };
-                            const isEditingRow = editingRotationSlotId === slot.id;
+                            const isNewUnsaved = !savedRotationSlotById.has(slot.id);
+                            const isEditingRow = isNewUnsaved && editingRotationSlotId === slot.id;
 
                             return (
                               <div key={slot.id} className="p-3 border border-slate-200 rounded-xl bg-slate-50 space-y-2">
                                 {isEditingRow ? (
-                                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2 items-end">
-                                    <div className="sm:col-span-5">
+                                  <div className={`grid gap-2 items-end ${isMobileShell ? 'grid-cols-1' : 'grid-cols-1 sm:grid-cols-12'}`}>
+                                    <div className={isMobileShell ? '' : 'sm:col-span-5'}>
                                       <label className="block text-[11px] font-bold text-slate-600 mb-1">Data</label>
                                       <DatePicker
                                         value={editRotationDate}
@@ -2131,7 +2127,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                         settings={systemSettings}
                                       />
                                     </div>
-                                    <div className="sm:col-span-4">
+                                    <div className={isMobileShell ? '' : 'sm:col-span-4'}>
                                       <label className="block text-[11px] font-bold text-slate-600 mb-1">Horário</label>
                                       <input
                                         type="time"
@@ -2139,10 +2135,10 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                         max={editRotationTimeBounds.maxTime ?? undefined}
                                         value={editRotationTime}
                                         onChange={e => { setEditRotationTime(e.target.value); setRotationFormError(''); }}
-                                        className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm bg-white text-slate-900"
+                                        className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-base bg-white text-slate-900"
                                       />
                                     </div>
-                                    <div className="sm:col-span-3 flex gap-1.5 justify-end">
+                                    <div className={`${isMobileShell ? '' : 'sm:col-span-3'} flex gap-1.5 justify-end`}>
                                       <button
                                         type="button"
                                         onClick={() => handleConfirmEditRotationSlot(slot.id)}
@@ -2176,44 +2172,39 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                           <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-blue-700 bg-blue-50 border border-blue-200 px-2 py-0.5 rounded">
                                             Novo (não salvo)
                                           </span>
-                                        ) : editWindow.editable ? (
-                                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-700 bg-emerald-50 border border-emerald-200 px-2 py-0.5 rounded">
-                                            <Clock className="h-3 w-3" /> Editável ({editWindow.remainingHours}h restantes)
-                                          </span>
                                         ) : (
-                                          <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 bg-slate-200/80 border border-slate-300 px-2 py-0.5 rounded" title={editWindow.reason}>
-                                            <Lock className="h-3 w-3" /> Bloqueado (+48h)
+                                          <span
+                                            className="inline-flex items-center gap-1 text-[11px] font-semibold text-slate-600 bg-slate-200/80 border border-slate-300 px-2 py-0.5 rounded"
+                                            title="Após salvar, não é possível editar ou excluir este cadastro."
+                                          >
+                                            <Lock className="h-3 w-3" /> Salvo (bloqueado)
                                           </span>
                                         )}
                                       </div>
                                     </div>
 
-                                    <div className="flex items-center gap-1.5">
-                                      {(isNewUnsaved || editWindow.editable) ? (
-                                        <>
-                                          <button
-                                            type="button"
-                                            onClick={() => handleStartEditRotationSlot(slot)}
-                                            className="p-2 rounded-lg text-blue-600 hover:bg-blue-50 border border-blue-200 bg-white"
-                                            title="Editar data/horário"
-                                            aria-label={`Editar ${formatRotationDateBR(slot.date)} ${slot.time}`}
-                                          >
-                                            <Pencil className="h-4 w-4" />
-                                          </button>
-                                          <button
-                                            type="button"
-                                            onClick={() => handleRemoveRotationSlot(slot)}
-                                            className="p-2 rounded-lg text-red-600 hover:bg-red-50 border border-red-200 bg-white"
-                                            title="Excluir data/horário"
-                                            aria-label={`Excluir ${formatRotationDateBR(slot.date)} ${slot.time}`}
-                                          >
-                                            <Trash2 className="h-4 w-4" />
-                                          </button>
-                                        </>
-                                      ) : (
-                                        <span className="text-[11px] text-slate-400 italic px-2">Prazo 48h encerrado</span>
-                                      )}
-                                    </div>
+                                    {isNewUnsaved && (
+                                      <div className="flex items-center gap-1.5">
+                                        <button
+                                          type="button"
+                                          onClick={() => handleStartEditRotationSlot(slot)}
+                                          className="p-2 rounded-lg text-blue-600 hover:bg-blue-50 border border-blue-200 bg-white"
+                                          title="Editar data/horário"
+                                          aria-label={`Editar ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                        >
+                                          <Pencil className="h-4 w-4" />
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => handleRemoveRotationSlot(slot)}
+                                          className="p-2 rounded-lg text-red-600 hover:bg-red-50 border border-red-200 bg-white"
+                                          title="Excluir data/horário"
+                                          aria-label={`Excluir ${formatRotationDateBR(slot.date)} ${slot.time}`}
+                                        >
+                                          <Trash2 className="h-4 w-4" />
+                                        </button>
+                                      </div>
+                                    )}
                                   </div>
                                 )}
                               </div>
@@ -2223,7 +2214,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                       )}
                     </div>
 
-                    <div className="flex flex-col-reverse sm:flex-row sm:flex-wrap items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                    <div className={`flex flex-col-reverse items-stretch justify-end gap-2 pt-2 border-t border-slate-100 ${isMobileShell ? '' : 'sm:flex-row sm:flex-wrap sm:items-center'}`}>
                       {rotationDatesDirty && (
                         <button
                           type="button"
@@ -2233,7 +2224,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             setEditingRotationSlotId(null);
                             setRotationFormError('');
                           }}
-                          className="w-full sm:w-auto px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold text-center"
+                          className={`${isMobileShell ? 'w-full' : 'w-full sm:w-auto'} px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold text-center`}
                         >
                           Descartar alterações
                         </button>
@@ -2241,8 +2232,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                       <button
                         type="button"
                         onClick={handleOpenRotationConfirmModal}
-                        disabled={!rotationDatesDirty && visibleRotationDraft.length === 0}
-                        className="w-full sm:w-auto px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors"
+                        disabled={!rotationDatesDirty}
+                        className={`${isMobileShell ? 'w-full' : 'w-full sm:w-auto'} px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors`}
                       >
                         <Save className="h-4 w-4" /> Salvar Disponibilidade
                       </button>
@@ -2387,19 +2378,19 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             {reqs.map(req => {
                               const vacancies = confirmedVacancies(req, examiners);
                               return (
-                              <div key={req.id} className="p-4 border border-slate-200 rounded-xl bg-slate-50 space-y-3 shadow-sm">
-                                <div className="flex justify-between items-center border-b border-slate-200 pb-2">
-                                  <div className="flex flex-col">
+                              <div key={req.id} className="p-4 border border-slate-200 rounded-xl bg-slate-50 space-y-3 shadow-sm min-w-0">
+                                <div className="flex justify-between items-center gap-2 border-b border-slate-200 pb-2 min-w-0">
+                                  <div className="flex flex-col min-w-0">
                                     <span className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">Autoescola</span>
-                                    <div className="flex items-center gap-2">
-                                      <span className="font-black text-slate-800 uppercase text-sm">{getSchoolName(req.schoolId)}</span>
+                                    <div className="flex items-center gap-2 min-w-0">
+                                      <span className="font-black text-slate-800 uppercase text-sm break-words">{getSchoolName(req.schoolId)}</span>
                                       {req.schoolId && !['PCD', 'CNH_BRASIL'].includes(req.schoolId) && (
                                         <button 
                                           onClick={() => {
                                             const school = schools.find(s => s.id === req.schoolId);
                                             if (school) setSelectedSchoolForAddress(school);
                                           }}
-                                          className="p-1 text-blue-600 hover:bg-blue-50 rounded-full transition-colors"
+                                          className="p-1 text-blue-600 hover:bg-blue-50 rounded-full transition-colors shrink-0"
                                           title="Consultar Endereços"
                                         >
                                           <MapPin className="h-3.5 w-3.5" />
@@ -2407,7 +2398,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                       )}
                                     </div>
                                   </div>
-                                  <div className="bg-green-100 text-green-700 px-2 py-1 rounded text-[10px] font-bold uppercase">
+                                  <div className="bg-green-100 text-green-700 px-2 py-1 rounded text-[10px] font-bold uppercase shrink-0">
                                     Confirmada
                                   </div>
                                 </div>
@@ -4483,7 +4474,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
 
             <div className="p-5 space-y-4">
               <p className="text-sm text-slate-700">
-                Confira o resumo das datas e horários cadastrados. Após <strong>48h</strong> do cadastro, não será mais possível editar ou excluir.
+                Confira o resumo das datas e horários cadastrados. <strong>Após salvar, não será mais possível editar ou excluir.</strong>
               </p>
 
               <div className="max-h-60 overflow-y-auto border border-slate-200 rounded-xl divide-y divide-slate-100 bg-slate-50">

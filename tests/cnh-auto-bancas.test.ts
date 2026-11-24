@@ -29,10 +29,12 @@ const examiners: AutoBancaExaminerLike[] = [
     defaultMaxSlotsA: 8,
     defaultMaxSlotsB: 12,
     rotationAvailability: {
-      days: ['SEG', 'QUA', 'SEX'],
-      defaultTime: '10:30',
-      examsPerDay: 1,
       cityIds: ['city-itapema', 'city-bc'],
+      availableDates: [
+        { id: 'a1', date: '2026-11-23', time: '10:30', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 'a2', date: '2026-11-30', time: '10:30', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 'a3', date: '2026-12-07', time: '10:30', createdAt: '2026-11-18T12:00:00Z' },
+      ],
     },
     blockedPeriods: [],
   },
@@ -44,10 +46,12 @@ const examiners: AutoBancaExaminerLike[] = [
     defaultMaxSlotsA: 10,
     defaultMaxSlotsB: 10,
     rotationAvailability: {
-      days: ['SEG', 'QUA', 'SEX'],
-      defaultTime: '15:00',
-      examsPerDay: 1,
       cityIds: ['city-itapema', 'city-bc'],
+      availableDates: [
+        { id: 'b1', date: '2026-11-25', time: '15:00', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 'b2', date: '2026-12-02', time: '15:00', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 'b3', date: '2026-12-09', time: '15:00', createdAt: '2026-11-18T12:00:00Z' },
+      ],
     },
     blockedPeriods: [],
   },
@@ -59,10 +63,12 @@ const examiners: AutoBancaExaminerLike[] = [
     defaultMaxSlotsA: 6,
     defaultMaxSlotsB: 14,
     rotationAvailability: {
-      days: ['TER', 'QUI'],
-      defaultTime: '09:00',
-      examsPerDay: 1,
       cityIds: ['city-bc'],
+      availableDates: [
+        { id: 't1', date: '2026-11-24', time: '09:00', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 't2', date: '2026-11-26', time: '09:00', createdAt: '2026-11-18T12:00:00Z' },
+        { id: 't3', date: '2026-12-01', time: '09:00', createdAt: '2026-11-18T12:00:00Z' },
+      ],
     },
     blockedPeriods: [],
   },

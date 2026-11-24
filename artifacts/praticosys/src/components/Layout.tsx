@@ -4,6 +4,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { User, UserRole, OperatorModule } from '../types';
 import { Logo } from './Logo';
 import { ForcePasswordChangeModal } from './ForcePasswordChangeModal';
+import { useIsMobileShell } from '../lib/mobileViewport';
 import { 
   LayoutDashboard,
   FileText, 
@@ -55,6 +56,7 @@ const Layout: React.FC<LayoutProps> = ({ children, user, onLogout }) => {
   const navigate = useNavigate();
   const [openMenus, setOpenMenus] = useState<Record<string, boolean>>({});
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
+  const isMobileShell = useIsMobileShell();
   const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(() => {
     try {
       return window.localStorage.getItem('praticosys-sidebar-collapsed') === 'true';
@@ -237,7 +239,7 @@ const Layout: React.FC<LayoutProps> = ({ children, user, onLogout }) => {
           type="button"
           aria-label="Fechar menu"
           onClick={() => setIsMobileMenuOpen(false)}
-          className="md:hidden ml-auto text-slate-400 p-2 hover:bg-slate-800 rounded-lg"
+          className="ml-auto text-slate-400 p-2 hover:bg-slate-800 rounded-lg"
         >
            <X className="h-6 w-6" />
         </button>
@@ -344,7 +346,7 @@ const Layout: React.FC<LayoutProps> = ({ children, user, onLogout }) => {
   };
 
   return (
-    <div className="min-h-screen bg-gray-50 flex flex-col md:flex-row print:bg-white h-screen overflow-hidden print:h-auto print:overflow-visible">
+    <div className={`min-h-screen bg-gray-50 flex ${isMobileShell ? 'flex-col' : 'flex-row'} print:bg-white h-screen overflow-hidden print:h-auto print:overflow-visible`}>
       {showForcePassword && (
         <ForcePasswordChangeModal 
           user={user} 
@@ -353,79 +355,97 @@ const Layout: React.FC<LayoutProps> = ({ children, user, onLogout }) => {
       )}
       
       {/* Sidebar Desktop */}
-      <aside className={`hidden md:flex ${isSidebarCollapsed ? 'w-16' : 'w-64'} bg-slate-900 border-r border-slate-800 flex-col flex-shrink-0 print:hidden z-20 transition-[width] duration-200 ease-in-out`}>
-        <SidebarContent />
-      </aside>
+      {!isMobileShell && (
+        <aside className={`flex ${isSidebarCollapsed ? 'w-16' : 'w-64'} bg-slate-900 border-r border-slate-800 flex-col flex-shrink-0 print:hidden z-20 transition-[width] duration-200 ease-in-out`}>
+          <SidebarContent />
+        </aside>
+      )}
 
       {/* Mobile Sidebar Overlay */}
-      <div className={`md:hidden fixed inset-0 z-[100] transition-all duration-300 ${isMobileMenuOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
-          <div className="absolute inset-0 bg-slate-900/80 backdrop-blur-md" onClick={() => setIsMobileMenuOpen(false)}></div>
-          <aside className={`absolute top-0 left-0 h-full w-72 bg-slate-900 shadow-2xl transition-transform duration-300 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}>
-              <SidebarContent isMobile />
-          </aside>
-      </div>
+      {isMobileShell && (
+        <div className={`fixed inset-0 z-[100] transition-all duration-300 print:hidden ${isMobileMenuOpen ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+            <div className="absolute inset-0 bg-slate-900/80 backdrop-blur-md" onClick={() => setIsMobileMenuOpen(false)}></div>
+            <aside className={`absolute top-0 left-0 h-full w-72 bg-slate-900 shadow-2xl transition-transform duration-300 transform ${isMobileMenuOpen ? 'translate-x-0' : '-translate-x-full'}`}>
+                <SidebarContent isMobile />
+            </aside>
+        </div>
+      )}
 
       {/* Main Content */}
       <div className="flex-1 flex flex-col min-h-0 min-w-0 overflow-hidden bg-gray-50 print:h-auto print:overflow-visible">
-        <header className="h-16 bg-white border-b border-gray-200 flex justify-between items-center px-4 md:px-8 print:hidden shadow-sm z-10 shrink-0">
-            <div className="flex items-center gap-4">
-                <button
-                    type="button"
-                    aria-label={isSidebarCollapsed ? 'Expandir menu lateral' : 'Recolher menu lateral'}
-                    aria-controls="desktop-primary-navigation"
-                    aria-expanded={!isSidebarCollapsed}
-                    title={isSidebarCollapsed ? 'Expandir menu lateral' : 'Recolher menu lateral'}
-                    onClick={toggleSidebarCollapsed}
-                    className="hidden md:flex text-slate-500 p-2 hover:bg-slate-50 hover:text-blue-600 rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
-                >
-                    {isSidebarCollapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
-                </button>
-                <button onClick={() => setIsMobileMenuOpen(true)} className="md:hidden text-slate-500 p-2 hover:bg-slate-50 rounded-xl transition-colors">
-                    <Menu className="h-6 w-6" />
-                </button>
-                <div className="hidden md:block">
-                   <h2 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em]">
-                      {location.pathname.includes('cnhdobrasil/bancas') ? 'CNH do Brasil — Bancas' :
-                       location.pathname.includes('cnhdobrasil/candidatos') ? 'CNH do Brasil — Candidatos' :
-                       location.pathname.includes('cnhdobrasil/relatorios') ? 'CNH do Brasil — Relatórios' :
-                       location.pathname.includes('cnhdobrasil/dashboard') ? 'CNH do Brasil — Dashboard' :
-                       location.pathname.includes('cnhdobrasil') ? 'CNH do Brasil' :
-                       location.pathname.includes('cfc/agendamentos') ? (user.role === UserRole.SCHOOL ? 'Exame Prático CFC — Pedidos' : 'Exame Prático CFC — Agendamentos') :
-                       location.pathname.includes('cfc/relatorios') ? 'Exame Prático CFC — Relatórios' :
-                       location.pathname.includes('cfc/dashboard') ? 'Exame Prático CFC — Dashboard' :
-                       location.pathname.includes('pcd/agendamentos') ? 'Exame Prático PCD — Agendamentos' :
-                       location.pathname.includes('pcd/candidatos') ? 'Exame Prático PCD — Candidatos' :
-                       location.pathname.includes('pcd/relatorios') ? 'Exame Prático PCD — Relatórios' :
-                       location.pathname.includes('pcd/dashboard') ? 'Exame Prático PCD — Dashboard' :
-                       location.pathname.includes('usuarios') ? 'Administração' :
-                       location.pathname.includes('configuracoes') ? 'Configurações' :
-                       location.pathname === '/admin/dashboard' ? 'Painel de Controle' : 'Painel Principal'}
-                   </h2>
-                </div>
+        <header className={`h-16 bg-white border-b border-gray-200 flex justify-between items-center ${isMobileShell ? 'px-4' : 'px-8'} print:hidden shadow-sm z-10 shrink-0`}>
+            <div className="flex items-center gap-4 min-w-0">
+                {!isMobileShell && (
+                  <button
+                      type="button"
+                      aria-label={isSidebarCollapsed ? 'Expandir menu lateral' : 'Recolher menu lateral'}
+                      aria-controls="desktop-primary-navigation"
+                      aria-expanded={!isSidebarCollapsed}
+                      title={isSidebarCollapsed ? 'Expandir menu lateral' : 'Recolher menu lateral'}
+                      onClick={toggleSidebarCollapsed}
+                      className="flex text-slate-500 p-2 hover:bg-slate-50 hover:text-blue-600 rounded-xl transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
+                  >
+                      {isSidebarCollapsed ? <PanelLeftOpen className="h-5 w-5" /> : <PanelLeftClose className="h-5 w-5" />}
+                  </button>
+                )}
+                {isMobileShell && (
+                  <button
+                      type="button"
+                      aria-label="Abrir menu"
+                      title="Abrir menu"
+                      onClick={() => setIsMobileMenuOpen(true)}
+                      className="text-slate-500 p-2 hover:bg-slate-50 rounded-xl transition-colors"
+                  >
+                      <Menu className="h-6 w-6" />
+                  </button>
+                )}
+                {!isMobileShell && (
+                  <div className="min-w-0">
+                     <h2 className="text-xs font-black text-slate-400 uppercase tracking-[0.2em] truncate">
+                        {location.pathname.includes('cnhdobrasil/bancas') ? 'CNH do Brasil — Bancas' :
+                         location.pathname.includes('cnhdobrasil/candidatos') ? 'CNH do Brasil — Candidatos' :
+                         location.pathname.includes('cnhdobrasil/relatorios') ? 'CNH do Brasil — Relatórios' :
+                         location.pathname.includes('cnhdobrasil/dashboard') ? 'CNH do Brasil — Dashboard' :
+                         location.pathname.includes('cnhdobrasil') ? 'CNH do Brasil' :
+                         location.pathname.includes('cfc/agendamentos') ? (user.role === UserRole.SCHOOL ? 'Exame Prático CFC — Pedidos' : 'Exame Prático CFC — Agendamentos') :
+                         location.pathname.includes('cfc/relatorios') ? 'Exame Prático CFC — Relatórios' :
+                         location.pathname.includes('cfc/dashboard') ? 'Exame Prático CFC — Dashboard' :
+                         location.pathname.includes('pcd/agendamentos') ? 'Exame Prático PCD — Agendamentos' :
+                         location.pathname.includes('pcd/candidatos') ? 'Exame Prático PCD — Candidatos' :
+                         location.pathname.includes('pcd/relatorios') ? 'Exame Prático PCD — Relatórios' :
+                         location.pathname.includes('pcd/dashboard') ? 'Exame Prático PCD — Dashboard' :
+                         location.pathname.includes('usuarios') ? 'Administração' :
+                         location.pathname.includes('configuracoes') ? 'Configurações' :
+                         location.pathname === '/admin/dashboard' ? 'Painel de Controle' : 'Painel Principal'}
+                     </h2>
+                  </div>
+                )}
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 shrink-0">
                 {/* Avatar — apenas mobile (desktop tem no sidebar) */}
-                <div className="md:hidden h-9 w-9 bg-slate-100 text-slate-600 rounded-xl flex items-center justify-center font-black text-sm border border-slate-200 shadow-sm">
-                    {user.name.charAt(0)}
-                </div>
+                {isMobileShell && (
+                  <div className="h-9 w-9 bg-slate-100 text-slate-600 rounded-xl flex items-center justify-center font-black text-sm border border-slate-200 shadow-sm">
+                      {user.name.charAt(0)}
+                  </div>
+                )}
                 {/* Botão Sair — visível em todos os tamanhos */}
                 <button
                     type="button"
                     onClick={handleLogout}
                     aria-label="Sair"
                     title="Sair"
-                    className="flex items-center gap-2 text-slate-400 hover:text-red-600 hover:bg-red-50 p-2 md:px-3 md:py-2 rounded-xl transition-all text-xs font-black uppercase tracking-wider"
+                    className={`flex items-center gap-2 text-slate-400 hover:text-red-600 hover:bg-red-50 ${isMobileShell ? 'p-2' : 'px-3 py-2'} rounded-xl transition-all text-xs font-black uppercase tracking-wider`}
                 >
                     <LogOut className="h-4 w-4" />
-                    <span className="hidden md:inline">Sair</span>
+                    {!isMobileShell && <span>Sair</span>}
                 </button>
             </div>
         </header>
 
-        <main className="flex-1 overflow-y-auto bg-gray-50/50 p-4 md:p-8 print:p-0 print:bg-white relative custom-scrollbar print:overflow-visible print:h-auto">
+        <main className={`flex-1 overflow-y-auto overflow-x-hidden bg-gray-50/50 ${isMobileShell ? 'p-4' : 'p-8'} print:p-0 print:bg-white relative custom-scrollbar print:overflow-visible print:h-auto`}>
           <div className="absolute top-0 left-0 w-full h-48 bg-gradient-to-b from-blue-100/20 to-transparent -z-10 pointer-events-none"></div>
-          <div className="max-w-7xl mx-auto print:max-w-none">
+          <div className="max-w-7xl mx-auto min-w-0 print:max-w-none">
             {children}
           </div>
         </main>
