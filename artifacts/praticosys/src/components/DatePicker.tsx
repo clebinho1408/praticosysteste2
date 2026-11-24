@@ -17,6 +17,7 @@ interface DatePickerProps {
   minDate?: string;
   maxDate?: string;
   allowedWeekdays?: number[];
+  hideDisallowedWeekdays?: boolean;
 }
 
 const DatePicker: React.FC<DatePickerProps> = ({
@@ -30,6 +31,7 @@ const DatePicker: React.FC<DatePickerProps> = ({
   minDate,
   maxDate,
   allowedWeekdays,
+  hideDisallowedWeekdays = true,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -107,17 +109,17 @@ const DatePicker: React.FC<DatePickerProps> = ({
             selected={selectedDate}
             onSelect={handleSelect}
             disabled={disabledDays}
-            hidden={allowedWeekdays === undefined ? undefined : { dayOfWeek: [0, 1, 2, 3, 4, 5, 6].filter(day => !allowedWeekdays.includes(day)) }}
+            hidden={!hideDisallowedWeekdays || allowedWeekdays === undefined ? undefined : { dayOfWeek: [0, 1, 2, 3, 4, 5, 6].filter(day => !allowedWeekdays.includes(day)) }}
             locale={ptBR}
             showOutsideDays
             classNames={{
               /* layout */
               root:          'select-none',
               months:        'flex flex-col',
-              month:         'space-y-2',
-              month_caption: 'flex items-center justify-between px-1 mb-1',
+              month:         'relative space-y-2',
+              month_caption: 'flex items-center justify-between px-1 mb-1 h-7 pr-16',
               caption_label: 'text-sm font-bold text-slate-800 capitalize',
-              nav:           'flex items-center gap-1',
+              nav:           'absolute right-0 top-0 flex items-center gap-1 z-10',
               /* nav buttons */
               button_previous: [
                 'flex items-center justify-center w-7 h-7 rounded-lg border border-slate-200',

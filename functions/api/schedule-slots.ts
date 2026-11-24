@@ -14,6 +14,7 @@ import {
 import {
   getExaminerMaxPerDayForDate,
   getExaminerRotationTimesForDate,
+  isExaminerEligibleForSchool,
 } from '../_school-rotation.js';
 
 async function runSlotWriteWithTriggerUpgrade<T>(db: any, isNonRotation: boolean, fn: () => Promise<T>): Promise<T> {
@@ -147,13 +148,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
             return error('Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa.', 409);
           }
         }
-        const targetCity = (school.city ?? '').trim().toUpperCase();
-        const city = school.examRotation && targetCity
-          ? (await db.select().from(cities)).find(c => c.name.trim().toUpperCase() === targetCity)
-          : null;
-        if (school.examRotation && !city) {
-          return error('Cidade da autoescola não cadastrada para o rodízio.', 409);
-        }
+        const allCities = school.examRotation ? await db.select().from(cities) : [];
         const existing = await db.select().from(cfcScheduleSlots).where(and(
           eq(cfcScheduleSlots.schoolId, schoolId), eq(cfcScheduleSlots.scheduledDate, date),
           eq(cfcScheduleSlots.requestType, 'FIXA')));
@@ -177,8 +172,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
               Boolean(availability?.days?.includes(day)) &&
               [1, 2].includes(availability?.examsPerDay as any);
             const explicitValid = usesExplicit && times.length > 0;
-            if (!examiner?.examRotation || examiner.canExamCommon === false ||
-              !availability?.cityIds?.includes(city!.id) ||
+            if (!isExaminerEligibleForSchool(examiner, school, allCities) ||
               (!legacyValid && !explicitValid) ||
               assigned.some((s: any) => !times.includes(s.scheduledTime))) {
               return error('Rodízio de Provas desativado ou disponibilidade incompatível para o examinador.', 409);

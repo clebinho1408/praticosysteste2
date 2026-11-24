@@ -5,6 +5,7 @@
  */
 import { eq } from 'drizzle-orm';
 import { examinerCoversRequest } from './_cfc-interest.js';
+import { isExaminerEligibleForSchool } from './_school-rotation.js';
 import { maskCpf } from '../db/pii-crypto.js';
 
 export class AccessDenied extends Error {
@@ -54,12 +55,15 @@ export async function accessPolicy(db: any, schema: any, user: any) {
   const globalReader = staff || user.role === 'CONSULTANT';
   let graphPromise: Promise<any> | undefined;
   const graph = () => graphPromise ??= (async () => {
-    const [schedules, instructors, schools, examiners, cnh, cfc, pcd, cfcSlots, pcdSlots] =
-      await Promise.all(['examSchedules', 'instructors', 'drivingSchools', 'examiners',
-        'cnhbrasilRequests', 'cfcRequests', 'pcdRequests', 'cfcScheduleSlots', 'pcdScheduleSlots']
-        .map(name => db.select().from(schema[name])));
+    const [schedules, instructors, schools, examiners, cnh, cfc, pcd, cfcSlots, pcdSlots, allCities] =
+      await Promise.all([
+        ...['examSchedules', 'instructors', 'drivingSchools', 'examiners',
+          'cnhbrasilRequests', 'cfcRequests', 'pcdRequests', 'cfcScheduleSlots', 'pcdScheduleSlots']
+          .map(name => db.select().from(schema[name])),
+        schema.cities ? db.select().from(schema.cities) : Promise.resolve([]),
+      ]);
     return { schedules, instructors, schools, examiners, requests: [...cnh, ...cfc, ...pcd],
-      slots: [...cfcSlots, ...pcdSlots] };
+      slots: [...cfcSlots, ...pcdSlots], cities: allCities };
   })();
   const hasValidLink = async () => {
     if (globalReader) return true;
@@ -112,6 +116,11 @@ export async function accessPolicy(db: any, schema: any, user: any) {
     // Instructors need the open CNH boards to view available exam dates.
     return user.role === 'INSTRUCTOR' && row.type === 'COMMON' && row.status === 'OPEN';
   };
+  const examinerAssignedToRotationSchool = (row: any, g: any) => {
+    if (user.role !== 'EXAMINER' || !row?.examRotation) return false;
+    const examiner = g.examiners.find((e: any) => e.id === user.examinerId);
+    return isExaminerEligibleForSchool(examiner, row, g.cities ?? []);
+  };
   const rowVisible = async (row: any, route: string) => {
     if (['requests', 'schedule-slots', 'banca-results'].includes(route)) return visible(row, route);
     if (route === 'schedules') return scheduleVisible(row);
@@ -128,6 +137,7 @@ export async function accessPolicy(db: any, schema: any, user: any) {
     const g = await graph();
     if (route === 'schools') {
       if (user.role === 'SCHOOL') return row.id === user.schoolId;
+      if (examinerAssignedToRotationSchool(row, g)) return true;
       for (const r of [...g.requests, ...g.slots]) if (r.schoolId === row.id && await visible(r, 'requests')) return true;
       return false;
     }
@@ -161,7 +171,26 @@ export async function accessPolicy(db: any, schema: any, user: any) {
           : ['id', 'name', 'categories', 'canExamCommon', 'canExamPCD'];
         result.push(pickFields(row, fields));
       } else if (!globalReader && route === 'schools') {
-        result.push(user.role === 'SCHOOL' && row.id === user.schoolId ? row : pickFields(row, ['id', 'name', 'city']));
+        if (user.role === 'SCHOOL' && row.id === user.schoolId) {
+          result.push(row);
+        } else if (user.role === 'EXAMINER' && row.examRotation) {
+          const g = await graph();
+          if (examinerAssignedToRotationSchool(row, g)) {
+            result.push({
+              ...pickFields(row, ['id', 'name', 'city', 'examRotation']),
+              mainSchedule: row.mainSchedule
+                ? {
+                    active: Boolean(row.mainSchedule.active),
+                    rotationConfig: row.mainSchedule.rotationConfig ?? null,
+                  }
+                : undefined,
+            });
+          } else {
+            result.push(pickFields(row, ['id', 'name', 'city']));
+          }
+        } else {
+          result.push(pickFields(row, ['id', 'name', 'city']));
+        }
       } else if (user.role === 'EXAMINER' && ['requests', 'schedule-slots'].includes(route) &&
         row.status === 'WAITING_SCHEDULING') {
         result.push({

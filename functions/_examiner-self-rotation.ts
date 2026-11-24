@@ -8,16 +8,18 @@ import { businessDate } from './_school-schedule.js';
 
 export async function applyExaminerSelfRotationUpdate(
   db: any,
-  tables: { examiners: any; blockedDates: any; systemSettings: any },
+  tables: { examiners: any; blockedDates: any; systemSettings: any; drivingSchools?: any; cities?: any },
   examinerId: string,
   incomingAvailability: any,
   now = new Date(),
 ): Promise<{ status: number; error?: string; updated?: any }> {
   const today = businessDate(now);
-  const [examinerRows, blockedRows, settingsRows] = await Promise.all([
+  const [examinerRows, blockedRows, settingsRows, schoolRows, cityRows] = await Promise.all([
     db.select().from(tables.examiners).where(eq(tables.examiners.id, examinerId)).limit(1),
     db.select().from(tables.blockedDates),
     db.select().from(tables.systemSettings),
+    tables.drivingSchools ? db.select().from(tables.drivingSchools) : Promise.resolve([]),
+    tables.cities ? db.select().from(tables.cities) : Promise.resolve([]),
   ]);
 
   const current = examinerRows[0];
@@ -38,6 +40,14 @@ export async function applyExaminerSelfRotationUpdate(
     nextSlots,
     blockedDates: blockedRows ?? [],
     systemSettings: settingsRows?.[0] ?? null,
+    examinerSchoolIds: Array.isArray(current.rotationAvailability?.schoolIds)
+      ? current.rotationAvailability.schoolIds
+      : undefined,
+    examinerCityIds: Array.isArray(current.rotationAvailability?.cityIds)
+      ? current.rotationAvailability.cityIds
+      : undefined,
+    schools: schoolRows ?? [],
+    cities: cityRows ?? [],
     today,
     now,
   });
@@ -47,6 +57,9 @@ export async function applyExaminerSelfRotationUpdate(
   }
 
   const nextAvailability = {
+    ...(Array.isArray(current.rotationAvailability?.schoolIds)
+      ? { schoolIds: current.rotationAvailability.schoolIds }
+      : {}),
     cityIds: Array.isArray(current.rotationAvailability?.cityIds)
       ? current.rotationAvailability.cityIds
       : [],
@@ -70,6 +83,18 @@ export function sanitizeAdminExaminerRotationAvailability(
   if (!incomingAvailability || typeof incomingAvailability !== 'object') {
     return incomingAvailability ?? null;
   }
+  const schoolIds = Array.isArray(incomingAvailability.schoolIds)
+    ? Array.from(
+        new Set(
+          incomingAvailability.schoolIds
+            .filter((s: unknown): s is string => typeof s === 'string' && s.trim().length > 0)
+            .map((s: string) => s.trim()),
+        ),
+      )
+    : Array.isArray(storedAvailability?.schoolIds)
+      ? storedAvailability.schoolIds
+      : undefined;
+
   const cityIds = Array.isArray(incomingAvailability.cityIds)
     ? incomingAvailability.cityIds.filter((c: unknown) => typeof c === 'string' && c.trim())
     : [];
@@ -82,6 +107,7 @@ export function sanitizeAdminExaminerRotationAvailability(
 
   if (rawDates !== undefined) {
     return {
+      ...(schoolIds !== undefined ? { schoolIds } : {}),
       cityIds,
       availableDates: filterUpcomingExaminerRotationDates(rawDates, today),
     };
@@ -89,6 +115,7 @@ export function sanitizeAdminExaminerRotationAvailability(
 
   return {
     ...incomingAvailability,
+    ...(schoolIds !== undefined ? { schoolIds } : {}),
     cityIds,
   };
 }

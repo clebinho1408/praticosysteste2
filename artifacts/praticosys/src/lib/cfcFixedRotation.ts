@@ -8,6 +8,7 @@ import {
 import {
   getExaminerMaxPerDayForDate,
   getExaminerRotationTimesForDate,
+  isExaminerEligibleForSchool,
 } from '../../../../functions/_school-rotation';
 
 export type FixedCommitment = {
@@ -47,17 +48,17 @@ export function rotationCandidates(
   if (!school.examRotation) {
     return { eligible: [], reason: 'Rodízio de Provas desativado para esta autoescola.' };
   }
-  // Autoescolas guardam o nome da cidade; a disponibilidade guarda IDs.
   const targetCity = (school.city ?? '').trim().toUpperCase();
   const city = targetCity ? cities.find(item => item.name.trim().toUpperCase() === targetCity) : undefined;
-  if (!city) return { eligible: [], reason: 'Cidade da autoescola não cadastrada ou não informada.' };
+  const hasSchoolBasedSelection = examiners.some(ex => Array.isArray(ex.rotationAvailability?.schoolIds));
+  if (!city && !hasSchoolBasedSelection) {
+    return { eligible: [], reason: 'Cidade da autoescola não cadastrada ou não informada.' };
+  }
 
   const today = businessDate();
   const eligible = examiners.filter(examiner => {
-    const availability = examiner.rotationAvailability;
-    if (!examiner.examRotation || examiner.canExamCommon === false || !availability?.cityIds?.includes(city.id)) {
-      return false;
-    }
+    if (!isExaminerEligibleForSchool(examiner, school, cities)) return false;
+    const availability = examiner.rotationAvailability!;
     if (Array.isArray(availability.availableDates)) {
       if (date) {
         return getExaminerRotationTimesForDate(examiner, date).length > 0;
@@ -76,7 +77,7 @@ export function rotationCandidates(
   });
   return eligible.length
     ? { eligible }
-    : { eligible: [], reason: 'Nenhum examinador com rodízio, data, cidade e horários compatíveis.' };
+    : { eligible: [], reason: 'Nenhum examinador com rodízio, autoescola, data e horários compatíveis.' };
 }
 
 export function planFixedScales(input: {

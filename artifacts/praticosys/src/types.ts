@@ -132,7 +132,8 @@ export interface ExaminerRotationDateSlot {
 }
 
 export interface ExaminerRotationAvailability {
-  cityIds: string[];
+  schoolIds?: string[];
+  cityIds?: string[];
   availableDates?: ExaminerRotationDateSlot[];
   days?: string[]; // Legado: SEG, TER, QUA, QUI, SEX, SAB, DOM
   defaultTime?: string; // Legado: HH:mm — primeira prova

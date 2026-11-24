@@ -66,7 +66,8 @@ export const examiners = pgTable('examinadores', {
   defaultMaxSlotsMudanca: integer('max_vagas_mudanca_padrao'),
   examRotation: boolean('rodizio_provas').notNull().default(false),
   rotationAvailability: jsonb('disponibilidade_rodizio').$type<{
-    cityIds: string[];
+    schoolIds?: string[];
+    cityIds?: string[];
     availableDates?: { id: string; date: string; time: string; createdAt: string }[];
     days?: string[];
     defaultTime?: string;

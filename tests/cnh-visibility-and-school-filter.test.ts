@@ -128,3 +128,68 @@ test('Autoescolas scale helper classifies and filters Principal, Provisória, an
   assert.equal(matchesSchoolScale(inactive, 'MAIN'), false);
   assert.equal(matchesSchoolScale(inactive, 'PROVISIONAL'), false);
 });
+
+test('EXAMINER in rotation sees rotationConfig only for assigned examRotation schools without leaking rotationEntries', async () => {
+  const schools = [
+    {
+      id: 'sch-rot-1',
+      name: 'CFC RODIZIO 1',
+      city: 'ITAPEMA',
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        rotationConfig: { days: ['SEG', 'QUA'], startTime: '08:00', endTime: '12:00' },
+        rotationEntries: [{ id: 'e1', date: '2026-12-07', time: '09:00', examiner: 'ex-other' }],
+      },
+    },
+    {
+      id: 'sch-rot-2',
+      name: 'CFC RODIZIO 2',
+      city: 'TIJUCAS',
+      examRotation: true,
+      mainSchedule: {
+        active: true,
+        rotationConfig: { days: ['SEX'], startTime: '14:00', endTime: '18:00' },
+        rotationEntries: [],
+      },
+    },
+  ];
+  const examiners = [
+    {
+      id: 'ex-1',
+      name: 'EXAMINADOR UM',
+      examRotation: true,
+      canExamCommon: true,
+      categories: ['A', 'B'],
+      rotationAvailability: { schoolIds: ['sch-rot-1'], availableDates: [] },
+    },
+  ];
+  const cfc = [
+    {
+      id: 'req-extra',
+      modulo: 'CFC',
+      examType: 'COMMON',
+      schoolId: 'sch-rot-2',
+      intendedCategory: 'B',
+      status: 'WAITING_SCHEDULING',
+      attendanceConfirmed: false,
+    },
+  ];
+  const db = createFakeDb({ schools, examiners, cfc });
+  const exPolicy = await accessPolicy(db, schema, { id: 'u-ex', role: 'EXAMINER', examinerId: 'ex-1' });
+  const visibleSchools = await exPolicy.project(schools, 'schools');
+
+  const sch1 = visibleSchools.find((s: any) => s.id === 'sch-rot-1');
+  const sch2 = visibleSchools.find((s: any) => s.id === 'sch-rot-2');
+  assert.ok(sch1);
+  assert.equal(sch1.examRotation, true);
+  assert.deepEqual(sch1.mainSchedule, {
+    active: true,
+    rotationConfig: { days: ['SEG', 'QUA'], startTime: '08:00', endTime: '12:00' },
+  });
+  assert.equal(Object.hasOwn(sch1.mainSchedule, 'rotationEntries'), false);
+
+  // sch-rot-2 aparece apenas pelo pedido extra na fila, sem expor mainSchedule/rotationConfig
+  assert.ok(sch2);
+  assert.deepEqual(sch2, { id: 'sch-rot-2', name: 'CFC RODIZIO 2', city: 'TIJUCAS' });
+});

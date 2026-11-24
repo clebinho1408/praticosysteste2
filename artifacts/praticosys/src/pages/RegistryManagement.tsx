@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, shuffleRotationSchedule, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, Shuffle, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -867,7 +867,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
   ) => {
     const examinerMap = new Map(exList.map(ex => [ex.id, ex]));
     const base = config
-      ? findEligibleExaminersForSchool({ schoolCity, config, examiners: exList, cities: cityList }).eligible
+      ? findEligibleExaminersForSchool({ schoolId: editing?.id ?? formData.id ?? null, schoolCity, config, examiners: exList, cities: cityList }).eligible
       : [];
     const ids = new Set<string>([
       ...base.map(e => e.id),
@@ -2799,7 +2799,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
             <div className="p-5 space-y-4">
               {!formData.city && (
                 <div className="bg-amber-50 border border-amber-200 rounded p-2.5 text-xs text-amber-800">
-                  Selecione a cidade da autoescola na aba <strong>Dados Principais</strong> para que o preenchimento automático encontre os examinadores compatíveis.
+                  Selecione a cidade da autoescola na aba <strong>Dados Principais</strong> e vincule os examinadores participantes em <strong>Examinadores → Rodízio</strong>.
                 </div>
               )}
 
@@ -2885,8 +2885,9 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                 </div>
               </div>
 
-              {formData.city && rotationConfigDraft.days.length > 0 && isValidScaleTime(rotationConfigDraft.startTime) && isValidScaleTime(rotationConfigDraft.endTime) && normalizeScaleTime(rotationConfigDraft.startTime) <= normalizeScaleTime(rotationConfigDraft.endTime) && (() => {
+              {(formData.id || editing?.id || formData.city) && rotationConfigDraft.days.length > 0 && isValidScaleTime(rotationConfigDraft.startTime) && isValidScaleTime(rotationConfigDraft.endTime) && normalizeScaleTime(rotationConfigDraft.startTime) <= normalizeScaleTime(rotationConfigDraft.endTime) && (() => {
                 const check = findEligibleExaminersForSchool({
+                  schoolId: formData.id ?? editing?.id ?? null,
                   schoolCity: formData.city,
                   config: {
                     days: rotationConfigDraft.days,
@@ -2898,7 +2899,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                 });
                 return check.eligible.length > 0 ? (
                   <div className="bg-green-50 border border-green-200 rounded p-2.5 text-xs text-green-800">
-                    ✓ {check.eligible.length} examinador(es) elegível(is) encontrado(s) para {formData.city}:{' '}
+                    ✓ {check.eligible.length} examinador(es) elegível(is) encontrado(s){formData.name ? ` para ${formData.name}` : ''}:{' '}
                     <strong>{check.eligible.map(e => e.name).join(', ')}</strong>
                   </div>
                 ) : (
@@ -2973,7 +2974,6 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   const [copiedExaminerSchedule, setCopiedExaminerSchedule] = useState(false);
   const [today, setToday] = useState(() => businessDate());
   const [cities, setCities] = useState<City[]>([]);
-  const [citiesError, setCitiesError] = useState('');
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [editing, setEditing] = useState<Examiner | null>(null);
   const [modalTab, setModalTab] = useState<'DADOS' | 'RODIZIO' | 'BLOQUEIOS' | 'ESCALAS'>('DADOS');
@@ -3051,7 +3051,7 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
   useEffect(() => {
     fetch();
     loadScheduleContext();
-    api.getCities().then(setCities).catch(() => setCitiesError('Não foi possível carregar as cidades.'));
+    api.getCities().then(setCities).catch(() => {});
   }, []);
 
   useEffect(() => {
@@ -3100,6 +3100,19 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     setCopiedExaminerSchedule(false);
     setToday(businessDate());
     loadScheduleContext(schools.length > 0);
+    const deriveInitialSchoolIds = (av?: ExaminerRotationAvailability | null): string[] => {
+      if (Array.isArray(av?.schoolIds)) return [...av.schoolIds];
+      if (Array.isArray(av?.cityIds) && av.cityIds.length > 0 && cities.length > 0) {
+        return schools
+          .filter(s => {
+            if (!s.examRotation) return false;
+            const cid = resolveCityIdByName(s.city, cities);
+            return Boolean(cid && av.cityIds!.includes(cid));
+          })
+          .map(s => s.id);
+      }
+      return [];
+    };
     setFormData(ex ? {
       name: ex.name,
       registrationNumber: ex.registrationNumber,
@@ -3110,11 +3123,12 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       examRotation: ex.examRotation ?? false,
       rotationAvailability: ex.rotationAvailability
         ? {
+            schoolIds: deriveInitialSchoolIds(ex.rotationAvailability),
             cityIds: [...(ex.rotationAvailability.cityIds ?? [])],
             availableDates: filterUpcomingExaminerRotationDates(ex.rotationAvailability.availableDates, businessDate()),
           }
         : null,
-    } : { name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: { cityIds: [], availableDates: [] } });
+    } : { name: '', registrationNumber: '', categories: [], defaultMaxSlotsA: '', defaultMaxSlotsB: '', defaultMaxSlotsMudanca: '', examRotation: false, rotationAvailability: { schoolIds: [], availableDates: [] } });
     setBlockedPeriods(ex?.blockedPeriods ? [...ex.blockedPeriods] : []);
     setNewPeriod({ startDate: '', endDate: '', description: '', period: 'ALL_DAY' });
     setEditingPeriodId(null);
@@ -3178,6 +3192,10 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
     () => filterUpcomingExaminerRotationDates(formData.rotationAvailability?.availableDates, today),
     [formData.rotationAvailability?.availableDates, today],
   );
+  const rotationSchools = useMemo(
+    () => schools.filter(s => Boolean(s.examRotation)).sort((a, b) => a.name.localeCompare(b.name)),
+    [schools],
+  );
 
   const syncSchoolsRotationAfterExaminerChange = async () => {
     const canPersistSchoolSync = user.role === UserRole.ADMIN ||
@@ -3224,11 +3242,11 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
       ...formData,
       rotationAvailability: formData.rotationAvailability
         ? {
-            cityIds: [...(formData.rotationAvailability.cityIds ?? [])],
+            schoolIds: [...(formData.rotationAvailability.schoolIds ?? [])],
             availableDates: cleanedAvailableDates,
           }
         : formData.examRotation
-          ? { cityIds: [], availableDates: cleanedAvailableDates }
+          ? { schoolIds: [], availableDates: cleanedAvailableDates }
           : null,
       defaultMaxSlotsA: formData.defaultMaxSlotsA !== '' ? Number(formData.defaultMaxSlotsA) : null,
       defaultMaxSlotsB: formData.defaultMaxSlotsB !== '' ? Number(formData.defaultMaxSlotsB) : null,
@@ -3476,9 +3494,11 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                 <td className="px-4 py-3 text-center text-sm">
                   {(() => {
                     const upcomingDates = filterUpcomingExaminerRotationDates(e.rotationAvailability?.availableDates, today);
-                    const hasCities = (e.rotationAvailability?.cityIds?.length ?? 0) > 0;
+                    const hasSchools = Array.isArray(e.rotationAvailability?.schoolIds)
+                      ? e.rotationAvailability!.schoolIds!.length > 0
+                      : (e.rotationAvailability?.cityIds?.length ?? 0) > 0;
                     const hasLegacyDays = (e.rotationAvailability?.days?.length ?? 0) > 0;
-                    if (e.examRotation && hasCities && (upcomingDates.length > 0 || hasLegacyDays)) {
+                    if (e.examRotation && hasSchools && (upcomingDates.length > 0 || hasLegacyDays)) {
                       const title = upcomingDates.length > 0
                         ? upcomingDates.map(d => `${formatRotationDateBR(d.date)} ${d.time}`).join(' | ')
                         : `Dias: ${(e.rotationAvailability?.days ?? []).join(', ')}`;
@@ -3663,7 +3683,7 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
                               ...prev,
                               examRotation: checked,
                               rotationAvailability: prev.rotationAvailability ?? {
-                                cityIds: [],
+                                schoolIds: [],
                                 availableDates: editing?.rotationAvailability?.availableDates ?? [],
                               },
                             }));
@@ -3679,37 +3699,58 @@ const ExaminersManager: React.FC<{ user: User }> = ({ user }) => {
 
                     {formData.examRotation && (
                       <>
-                        {/* Cidades atendidas */}
+                        {/* Autoescolas do Rodízio */}
                         <fieldset>
-                          <legend className="text-sm font-medium mb-2">Cidades atendidas</legend>
-                          {citiesError && <p className="text-sm text-red-600">{citiesError}</p>}
-                          {!citiesError && cities.length === 0 && <p className="text-sm text-gray-500">Nenhuma cidade cadastrada.</p>}
-                          <div className="max-h-40 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2 border rounded p-2.5 bg-gray-50">
-                            {cities.map(city => {
-                              const selectedCityIds = formData.rotationAvailability?.cityIds ?? [];
-                              return (
-                                <label key={city.id} className="flex items-center gap-2 text-sm cursor-pointer">
-                                  <input
-                                    type="checkbox"
-                                    checked={selectedCityIds.includes(city.id)}
-                                    onChange={e => {
-                                      const nextCityIds = e.target.checked
-                                        ? [...selectedCityIds, city.id]
-                                        : selectedCityIds.filter(id => id !== city.id);
-                                      setFormData(prev => ({
-                                        ...prev,
-                                        rotationAvailability: {
-                                          cityIds: nextCityIds,
-                                          availableDates: prev.rotationAvailability?.availableDates ?? [],
-                                        },
-                                      }));
-                                    }}
-                                  />
-                                  {city.name}
-                                </label>
-                              );
-                            })}
-                          </div>
+                          <legend className="text-sm font-medium mb-1">Autoescolas do Rodízio</legend>
+                          <p className="text-xs text-gray-500 mb-2">
+                            Somente autoescolas com &quot;Rodízio de Provas&quot; selecionado aparecem abaixo. O examinador só poderá cadastrar datas e horários compatíveis com a Escala Rodízio delas.
+                          </p>
+                          {rotationSchools.length === 0 ? (
+                            <div className="rounded border border-dashed border-gray-300 bg-gray-50 p-3 text-xs text-gray-500">
+                              Nenhuma autoescola está marcada com &quot;Rodízio de Provas&quot; no cadastro de Autoescolas.
+                            </div>
+                          ) : (
+                            <div className="max-h-48 overflow-y-auto grid grid-cols-1 sm:grid-cols-2 gap-2 border rounded p-2.5 bg-gray-50">
+                              {rotationSchools.map(school => {
+                                const selectedSchoolIds = formData.rotationAvailability?.schoolIds ?? [];
+                                const rotCfg = school.mainSchedule?.rotationConfig;
+                                const hasRotCfg = Boolean(rotCfg && rotCfg.days?.length > 0 && rotCfg.startTime && rotCfg.endTime);
+                                return (
+                                  <label
+                                    key={school.id}
+                                    className="flex items-start gap-2 text-sm cursor-pointer bg-white border border-gray-200 rounded p-2 hover:border-blue-300 transition-colors"
+                                  >
+                                    <input
+                                      type="checkbox"
+                                      className="mt-0.5"
+                                      checked={selectedSchoolIds.includes(school.id)}
+                                      onChange={e => {
+                                        const nextSchoolIds = e.target.checked
+                                          ? Array.from(new Set([...selectedSchoolIds, school.id]))
+                                          : selectedSchoolIds.filter(id => id !== school.id);
+                                        setFormData(prev => ({
+                                          ...prev,
+                                          rotationAvailability: {
+                                            schoolIds: nextSchoolIds,
+                                            availableDates: prev.rotationAvailability?.availableDates ?? [],
+                                          },
+                                        }));
+                                      }}
+                                    />
+                                    <span className="min-w-0 leading-tight">
+                                      <span className="block font-medium text-gray-900 truncate">{school.name}</span>
+                                      <span className="block text-[11px] text-gray-500">
+                                        {school.city ? `${school.city} • ` : ''}
+                                        {hasRotCfg
+                                          ? `${rotCfg!.days.join(', ')} (${rotCfg!.startTime}–${rotCfg!.endTime})`
+                                          : 'Escala Rodízio não configurada'}
+                                      </span>
+                                    </span>
+                                  </label>
+                                );
+                              })}
+                            </div>
+                          )}
                         </fieldset>
 
                         {/* Datas e horários cadastrados pelo examinador no acesso pelo celular */}

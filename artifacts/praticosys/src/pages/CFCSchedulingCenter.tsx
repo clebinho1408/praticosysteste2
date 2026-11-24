@@ -18,7 +18,7 @@ import {
 } from '../types';
 import { fixedScaleDay, planFixedScales, rotationCandidates } from '../lib/cfcFixedRotation';
 import { businessDate, isCalendarDate, isValidScaleTime, normalizeScaleTime, resolveSchoolScaleForDate, scaleWeekday } from '../../../../functions/_school-schedule';
-import { MAX_ROTATION_AVAILABILITY_DAYS, addCalendarDays, filterUpcomingExaminerRotationDates, formatRotationDateBR, isRotationDateSlotEditable, isSystemDateBlockedForRotation, syncAllSchoolsRotationSchedules, validateExaminerRotationDatesUpdate } from '../../../../functions/_school-rotation';
+import { MAX_ROTATION_AVAILABILITY_DAYS, addCalendarDays, filterUpcomingExaminerRotationDates, formatRotationDateBR, isRotationDateSlotEditable, isSystemDateBlockedForRotation, isTimeWithinWindow, resolveExaminerSchoolRotationConstraints, syncAllSchoolsRotationSchedules, validateExaminerRotationDatesUpdate } from '../../../../functions/_school-rotation';
 import type { FixedCommitment } from '../lib/cfcFixedRotation';
 import { isDateBlocked, isDateInPast } from '../lib/dateBlocking';
 import { examinerCoversRequest } from '../../../../functions/_cfc-interest';
@@ -119,6 +119,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
   const [loading, setLoading] = useState(true);
   const [requests, setRequests] = useState<ExamRequest[]>([]);
   const [schools, setSchools] = useState<DrivingSchool[]>([]);
+  const [cities, setCities] = useState<City[]>([]);
   const [examiners, setExaminers] = useState<Examiner[]>([]);
   const [systemSettings, setSystemSettings] = useState<SystemSettings | null>(null);
   const [blockedDates, setBlockedDates] = useState<BlockedDate[]>([]);
@@ -446,10 +447,11 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
   const fetchData = async (silent = false) => {
     if (!silent) setLoading(true);
     try {
-      const [reqs, slots, schs, exms, settings, blocked, results] = await Promise.all([
+      const [reqs, slots, schs, citiesData, exms, settings, blocked, results] = await Promise.all([
         api.getRequests(),
         api.getScheduleSlots().catch(() => [] as any[]),   // nova tabela — fallback vazio se não existir ainda
         api.getSchoolsAsync(),
+        api.getCities().catch(() => [] as City[]),
         api.getExaminersAsync(),
         api.getSettings(),
         api.getBlockedDates(),
@@ -511,6 +513,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
       // Mescla candidatos reais + slots de escala — slots sempre no final
       setRequests([...cfcReqs, ...cfcSlots]);
       setSchools(schs);
+      setCities(citiesData);
       setSystemSettings(settings);
       setBlockedDates(blocked);
       setAllBancaResults(results);
@@ -677,12 +680,39 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
     [rotationDatesDraft, rotationToday],
   );
 
+  const rotationConstraints = useMemo(
+    () =>
+      resolveExaminerSchoolRotationConstraints({
+        examinerSchoolIds: currentExaminer?.rotationAvailability?.schoolIds,
+        examinerCityIds: currentExaminer?.rotationAvailability?.cityIds,
+        schools,
+        cities,
+      }),
+    [
+      currentExaminer?.rotationAvailability?.schoolIds,
+      currentExaminer?.rotationAvailability?.cityIds,
+      schools,
+      cities,
+    ],
+  );
+  const newRotationTimeBounds = useMemo(
+    () => rotationConstraints.timeBoundsForDate(newRotationDate),
+    [rotationConstraints, newRotationDate],
+  );
+  const editRotationTimeBounds = useMemo(
+    () => rotationConstraints.timeBoundsForDate(editRotationDate),
+    [rotationConstraints, editRotationDate],
+  );
+
   useEffect(() => {
     if (user.role !== UserRole.EXAMINER || rotationDatesDirty || isRotationConfirmModalOpen) return;
     setRotationDatesDraft(savedUpcomingRotationDates);
   }, [user.role, savedUpcomingRotationDates, rotationDatesDirty, isRotationConfirmModalOpen]);
 
   const validateSingleRotationEntry = (dateRaw: string, timeRaw: string, ignoreId?: string): string | null => {
+    if (!rotationConstraints.hasSelection || !rotationConstraints.hasConfiguredRules) {
+      return rotationConstraints.issue ?? 'Sem regra de Escala Rodízio configurada para as suas autoescolas.';
+    }
     const cleanDate = String(dateRaw ?? '').split('T')[0].trim();
     const normTime = normalizeScaleTime(timeRaw);
     if (!isCalendarDate(cleanDate)) return 'Selecione uma data válida.';
@@ -694,7 +724,16 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
     if (blockCheck.blocked) {
       return `Data bloqueada em Configurações → Bloqueio de Datas: ${blockCheck.reason}.`;
     }
+    const weekday = scaleWeekday(cleanDate);
+    const dayRules = rotationConstraints.windowsForWeekday(weekday);
+    if (dayRules.length === 0) {
+      return `A data ${formatRotationDateBR(cleanDate)} (${weekday}) não está nos dias permitidos pela Escala Rodízio (${rotationConstraints.allowedDays.join(', ')}).`;
+    }
     if (!isValidScaleTime(normTime)) return 'Informe um horário válido (HH:mm).';
+    if (!dayRules.some(r => isTimeWithinWindow(normTime, r.startTime, r.endTime))) {
+      const windowsLabel = dayRules.map(r => `${r.schoolName}: ${r.startTime} às ${r.endTime}`).join('; ');
+      return `O horário ${normTime} em ${formatRotationDateBR(cleanDate)} (${weekday}) deve estar dentro do intervalo da Escala Rodízio (${windowsLabel}).`;
+    }
     const duplicate = visibleRotationDraft.some(
       s => s.id !== ignoreId && s.date === cleanDate && normalizeScaleTime(s.time) === normTime,
     );
@@ -772,6 +811,10 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
       nextSlots: visibleRotationDraft,
       blockedDates,
       systemSettings,
+      examinerSchoolIds: currentExaminer?.rotationAvailability?.schoolIds,
+      examinerCityIds: currentExaminer?.rotationAvailability?.cityIds,
+      schools,
+      cities,
       today: rotationToday,
     });
     if (!check.ok) {
@@ -1956,11 +1999,33 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
 
                 {expandedSections.rodizioCnhBrasil && (
                   <div className="p-4 bg-white rounded-b-lg space-y-4">
-                    <div className="bg-blue-50/60 border border-blue-100 rounded-lg p-3 text-xs text-blue-900 space-y-1">
+                    <div className="bg-blue-50/60 border border-blue-100 rounded-lg p-3 text-xs text-blue-900 space-y-1.5">
                       <p className="font-semibold">Cadastre as datas e horários futuros em que estará disponível:</p>
                       <p>• Permitido até <strong>{MAX_ROTATION_AVAILABILITY_DAYS} dias no futuro</strong> (até {formatRotationDateBR(rotationMaxDate)}), respeitando o Bloqueio de Datas do sistema.</p>
                       <p>• Edição e exclusão permitidas somente em até <strong>48h</strong> após o cadastro. Datas que já passaram são ocultadas automaticamente.</p>
+                      {rotationConstraints.configuredRules.length > 0 && (
+                        <div className="pt-1 border-t border-blue-200/70 space-y-0.5">
+                          <p className="font-semibold text-blue-950">Regras das autoescolas vinculadas:</p>
+                          {rotationConstraints.configuredRules.map(rule => (
+                            <p key={rule.schoolId}>
+                              • <strong>{rule.schoolName}</strong>: {rule.days.join(', ')} — entre <strong>{rule.startTime}</strong> e <strong>{rule.endTime}</strong>
+                            </p>
+                          ))}
+                        </div>
+                      )}
+                      {rotationConstraints.unconfiguredSchools.length > 0 && rotationConstraints.configuredRules.length > 0 && (
+                        <p className="text-amber-800">
+                          ⚠️ Sem Escala Rodízio configurada em: {rotationConstraints.unconfiguredSchools.map(s => s.name).join(', ')}.
+                        </p>
+                      )}
                     </div>
+
+                    {(!rotationConstraints.hasSelection || !rotationConstraints.hasConfiguredRules) && (
+                      <div className="bg-amber-50 border border-amber-200 text-amber-900 text-xs font-medium px-3 py-2.5 rounded-lg flex items-start gap-2">
+                        <AlertTriangle className="h-4 w-4 text-amber-600 shrink-0 mt-0.5" />
+                        <span>{rotationConstraints.issue}</span>
+                      </div>
+                    )}
 
                     {/* Formulário de inclusão */}
                     <div className="p-3 border border-slate-200 rounded-xl bg-slate-50 space-y-3">
@@ -1973,6 +2038,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             onChange={val => { setNewRotationDate(val); setRotationFormError(''); }}
                             minDate={rotationToday}
                             maxDate={rotationMaxDate}
+                            allowedWeekdays={rotationConstraints.hasConfiguredRules ? rotationConstraints.allowedJsWeekdays : []}
+                            hideDisallowedWeekdays={false}
                             blockedDates={blockedDates}
                             settings={systemSettings}
                             placeholder="Selecione a data"
@@ -1983,6 +2050,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                           <input
                             id="examiner-rotation-time"
                             type="time"
+                            min={newRotationTimeBounds.minTime ?? undefined}
+                            max={newRotationTimeBounds.maxTime ?? undefined}
                             value={newRotationTime}
                             onChange={e => { setNewRotationTime(e.target.value); setRotationFormError(''); }}
                             className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm bg-white text-slate-900 outline-none focus:ring-2 focus:ring-blue-500"
@@ -1992,12 +2061,19 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                           <button
                             type="button"
                             onClick={handleAddRotationSlot}
-                            className="w-full bg-blue-600 hover:bg-blue-700 text-white px-3 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-1.5 shadow-sm transition-colors"
+                            disabled={!rotationConstraints.hasConfiguredRules}
+                            className="w-full bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white px-3 py-2 rounded-lg font-bold text-sm flex items-center justify-center gap-1.5 shadow-sm transition-colors"
                           >
                             <Plus className="h-4 w-4" /> Adicionar
                           </button>
                         </div>
                       </div>
+                      {rotationConstraints.hasConfiguredRules && newRotationTimeBounds.rules.length > 0 && (
+                        <p className="text-[11px] text-slate-600">
+                          Horários aceitos{newRotationDate ? ` em ${scaleWeekday(newRotationDate)}` : ''}:{' '}
+                          {newRotationTimeBounds.rules.map(r => `${r.schoolName} (${r.startTime}–${r.endTime})`).join(' • ')}
+                        </p>
+                      )}
                       {rotationFormError && (
                         <div className="bg-red-50 border border-red-200 text-red-700 text-xs font-medium px-3 py-2 rounded-lg">
                           {rotationFormError}
@@ -2049,6 +2125,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                         onChange={val => { setEditRotationDate(val); setRotationFormError(''); }}
                                         minDate={rotationToday}
                                         maxDate={rotationMaxDate}
+                                        allowedWeekdays={rotationConstraints.hasConfiguredRules ? rotationConstraints.allowedJsWeekdays : []}
+                                        hideDisallowedWeekdays={false}
                                         blockedDates={blockedDates}
                                         settings={systemSettings}
                                       />
@@ -2057,6 +2135,8 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                                       <label className="block text-[11px] font-bold text-slate-600 mb-1">Horário</label>
                                       <input
                                         type="time"
+                                        min={editRotationTimeBounds.minTime ?? undefined}
+                                        max={editRotationTimeBounds.maxTime ?? undefined}
                                         value={editRotationTime}
                                         onChange={e => { setEditRotationTime(e.target.value); setRotationFormError(''); }}
                                         className="w-full border border-slate-200 rounded-lg px-2.5 py-2 text-sm bg-white text-slate-900"
@@ -2143,7 +2223,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                       )}
                     </div>
 
-                    <div className="flex flex-wrap items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                    <div className="flex flex-col-reverse sm:flex-row sm:flex-wrap items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-slate-100">
                       {rotationDatesDirty && (
                         <button
                           type="button"
@@ -2153,7 +2233,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                             setEditingRotationSlotId(null);
                             setRotationFormError('');
                           }}
-                          className="px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold"
+                          className="w-full sm:w-auto px-4 py-2 rounded-lg border border-slate-200 text-slate-600 hover:bg-slate-50 text-xs font-bold text-center"
                         >
                           Descartar alterações
                         </button>
@@ -2162,7 +2242,7 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                         type="button"
                         onClick={handleOpenRotationConfirmModal}
                         disabled={!rotationDatesDirty && visibleRotationDraft.length === 0}
-                        className="px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-sm flex items-center gap-2 shadow-sm transition-colors"
+                        className="w-full sm:w-auto px-5 py-2.5 rounded-lg bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white font-bold text-sm flex items-center justify-center gap-2 shadow-sm transition-colors"
                       >
                         <Save className="h-4 w-4" /> Salvar Disponibilidade
                       </button>
@@ -4463,6 +4543,9 @@ const CFCSchedulingCenter: React.FC<CFCSchedulingCenterProps> = ({ user }) => {
                   try {
                     const updated = await api.updateExaminer(currentExaminer.id, {
                       rotationAvailability: {
+                        ...(Array.isArray(currentExaminer.rotationAvailability?.schoolIds)
+                          ? { schoolIds: currentExaminer.rotationAvailability.schoolIds }
+                          : {}),
                         cityIds: currentExaminer.rotationAvailability?.cityIds ?? [],
                         availableDates: visibleRotationDraft,
                       },

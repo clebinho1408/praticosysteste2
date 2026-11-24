@@ -42,7 +42,8 @@ export interface RotationExaminerLike {
   canExamCommon?: boolean | null;
   examRotation?: boolean | null;
   rotationAvailability?: {
-    cityIds: string[];
+    schoolIds?: string[];
+    cityIds?: string[];
     availableDates?: ExaminerRotationDateSlot[];
     days?: string[];
     defaultTime?: string;
@@ -155,6 +156,147 @@ export function resolveCityIdByName(schoolCity: string | undefined | null, citie
   return match?.id ?? null;
 }
 
+const ROTATION_WEEKDAY_ORDER = ['DOM', 'SEG', 'TER', 'QUA', 'QUI', 'SEX', 'SAB'] as const;
+
+export function isExaminerEligibleForSchool(
+  examiner: RotationExaminerLike | null | undefined,
+  school: { id?: string | null; city?: string | null } | null | undefined,
+  cities: RotationCityLike[] = [],
+): boolean {
+  const av = examiner?.rotationAvailability;
+  if (!examiner?.examRotation || examiner.canExamCommon === false || !av || !school) return false;
+  if (Array.isArray(av.schoolIds)) {
+    return Boolean(school.id && av.schoolIds.includes(school.id));
+  }
+  const cityId = resolveCityIdByName(school.city, cities);
+  return Boolean(cityId && Array.isArray(av.cityIds) && av.cityIds.includes(cityId));
+}
+
+export interface ExaminerRotationSchoolRule {
+  schoolId: string;
+  schoolName: string;
+  city?: string | null;
+  days: string[];
+  startTime: string;
+  endTime: string;
+}
+
+export interface ExaminerRotationConstraints {
+  selectedSchools: OtherSchoolRotationLike[];
+  configuredRules: ExaminerRotationSchoolRule[];
+  unconfiguredSchools: OtherSchoolRotationLike[];
+  allowedDays: string[];
+  allowedJsWeekdays: number[];
+  overallStartTime: string | null;
+  overallEndTime: string | null;
+  hasSelection: boolean;
+  hasConfiguredRules: boolean;
+  issue?: string;
+  windowsForWeekday: (weekday: string) => ExaminerRotationSchoolRule[];
+  timeBoundsForDate: (date: string) => {
+    minTime: string | null;
+    maxTime: string | null;
+    rules: ExaminerRotationSchoolRule[];
+  };
+}
+
+export function resolveExaminerSchoolRotationConstraints(input: {
+  examinerSchoolIds?: string[] | null;
+  examinerCityIds?: string[] | null;
+  schools: OtherSchoolRotationLike[];
+  cities?: RotationCityLike[];
+}): ExaminerRotationConstraints {
+  const rotationSchools = (input.schools ?? []).filter(s => Boolean(s && s.examRotation));
+  const useSchoolIds = Array.isArray(input.examinerSchoolIds);
+  const schoolIdSet = new Set(useSchoolIds ? input.examinerSchoolIds! : []);
+  const cityIdSet = new Set(!useSchoolIds && Array.isArray(input.examinerCityIds) ? input.examinerCityIds! : []);
+
+  const selectedSchools = rotationSchools.filter(school => {
+    if (useSchoolIds) return schoolIdSet.has(school.id);
+    if (cityIdSet.size > 0 && Array.isArray(input.cities)) {
+      const cityId = resolveCityIdByName(school.city, input.cities);
+      return Boolean(cityId && cityIdSet.has(cityId));
+    }
+    return false;
+  });
+
+  const configuredRules: ExaminerRotationSchoolRule[] = [];
+  const unconfiguredSchools: OtherSchoolRotationLike[] = [];
+
+  for (const school of selectedSchools) {
+    const cfg = school.mainSchedule?.rotationConfig;
+    const rawDays = Array.isArray(cfg?.days) ? cfg.days : [];
+    const days = ROTATION_WEEKDAY_ORDER.filter(d => rawDays.includes(d));
+    const startTime = normalizeScaleTime(cfg?.startTime);
+    const endTime = normalizeScaleTime(cfg?.endTime);
+    if (days.length > 0 && isValidScaleTime(startTime) && isValidScaleTime(endTime) && startTime <= endTime) {
+      configuredRules.push({
+        schoolId: school.id,
+        schoolName: school.name || school.id,
+        city: school.city,
+        days,
+        startTime,
+        endTime,
+      });
+    } else {
+      unconfiguredSchools.push(school);
+    }
+  }
+
+  const allowedDaySet = new Set(configuredRules.flatMap(r => r.days));
+  const allowedDays = ROTATION_WEEKDAY_ORDER.filter(d => allowedDaySet.has(d));
+  const allowedJsWeekdays = allowedDays.map(d => ROTATION_WEEKDAY_ORDER.indexOf(d));
+
+  const overallStartTime = configuredRules.length > 0
+    ? configuredRules.reduce((min, r) => (r.startTime < min ? r.startTime : min), configuredRules[0].startTime)
+    : null;
+  const overallEndTime = configuredRules.length > 0
+    ? configuredRules.reduce((max, r) => (r.endTime > max ? r.endTime : max), configuredRules[0].endTime)
+    : null;
+
+  const hasSelection = selectedSchools.length > 0;
+  const hasConfiguredRules = configuredRules.length > 0;
+  let issue: string | undefined;
+  if (!hasSelection) {
+    issue = 'Nenhuma autoescola do rodízio está vinculada a você em Cadastros → Examinadores → Rodízio.';
+  } else if (!hasConfiguredRules) {
+    issue = 'As autoescolas selecionadas ainda não possuem "Configurar Escala Rodízio" definida (Dias da semana e Entre quais horários).';
+  }
+
+  const windowsForWeekday = (weekday: string) =>
+    configuredRules.filter(r => r.days.includes(weekday));
+
+  const timeBoundsForDate = (date: string) => {
+    if (!isCalendarDate(date)) {
+      return { minTime: overallStartTime, maxTime: overallEndTime, rules: configuredRules };
+    }
+    const rules = windowsForWeekday(scaleWeekday(date));
+    if (rules.length === 0) {
+      return { minTime: null, maxTime: null, rules: [] };
+    }
+    return {
+      minTime: rules.reduce((min, r) => (r.startTime < min ? r.startTime : min), rules[0].startTime),
+      maxTime: rules.reduce((max, r) => (r.endTime > max ? r.endTime : max), rules[0].endTime),
+      rules,
+    };
+  };
+
+  return {
+    selectedSchools,
+    configuredRules,
+    unconfiguredSchools,
+    allowedDays,
+    allowedJsWeekdays,
+    overallStartTime,
+    overallEndTime,
+    hasSelection,
+    hasConfiguredRules,
+    issue,
+    windowsForWeekday,
+    timeBoundsForDate,
+  };
+}
+
 export const MAX_ROTATION_AVAILABILITY_DAYS = 60;
 export const ROTATION_EDIT_WINDOW_MS = 48 * 60 * 60 * 1000;
 
@@ -209,6 +351,10 @@ export function validateExaminerRotationDatesUpdate(input: {
   nextSlots: ExaminerRotationDateSlot[];
   blockedDates?: RotationBlockedDateLike[];
   systemSettings?: RotationSystemSettingsLike | null;
+  examinerSchoolIds?: string[] | null;
+  examinerCityIds?: string[] | null;
+  schools?: OtherSchoolRotationLike[];
+  cities?: RotationCityLike[];
   today?: string;
   now?: Date;
   maxDaysAhead?: number;
@@ -220,6 +366,14 @@ export function validateExaminerRotationDatesUpdate(input: {
   const maxDate = addCalendarDays(today, maxDaysAhead);
   const blockedDates = input.blockedDates ?? [];
   const createId = input.createId ?? (() => crypto.randomUUID());
+  const constraints = Array.isArray(input.schools)
+    ? resolveExaminerSchoolRotationConstraints({
+        examinerSchoolIds: input.examinerSchoolIds,
+        examinerCityIds: input.examinerCityIds,
+        schools: input.schools,
+        cities: input.cities,
+      })
+    : null;
 
   if (!Array.isArray(input.nextSlots)) {
     return { ok: false, error: 'Lista de datas e horários inválida.' };
@@ -275,6 +429,7 @@ export function validateExaminerRotationDatesUpdate(input: {
 
     const isLockedStored = stored && !isRotationDateSlotEditable(stored, now).editable;
     const dateChanged = !stored || stored.date !== date;
+    const timeChanged = !stored || normalizeScaleTime(stored.time) !== time;
 
     if (!isLockedStored && date > maxDate) {
       return {
@@ -289,6 +444,27 @@ export function validateExaminerRotationDatesUpdate(input: {
         return {
           ok: false,
           error: `A data ${formatRotationDateBR(date)} está bloqueada (${blockCheck.reason}).`,
+        };
+      }
+    }
+
+    if (constraints && !isLockedStored && (!stored || dateChanged || timeChanged)) {
+      if (!constraints.hasSelection || !constraints.hasConfiguredRules) {
+        return { ok: false, error: constraints.issue! };
+      }
+      const weekday = scaleWeekday(date);
+      const dayRules = constraints.windowsForWeekday(weekday);
+      if (dayRules.length === 0) {
+        return {
+          ok: false,
+          error: `A data ${formatRotationDateBR(date)} (${weekday}) não faz parte dos dias configurados na Escala Rodízio das suas autoescolas (${constraints.allowedDays.join(', ')}).`,
+        };
+      }
+      if (!dayRules.some(r => isTimeWithinWindow(time, r.startTime, r.endTime))) {
+        const windowsLabel = dayRules.map(r => `${r.schoolName}: ${r.startTime} às ${r.endTime}`).join('; ');
+        return {
+          ok: false,
+          error: `O horário ${time} em ${formatRotationDateBR(date)} (${weekday}) está fora do intervalo da Escala Rodízio (${windowsLabel}).`,
         };
       }
     }
@@ -448,6 +624,7 @@ export function resolveExaminerDefaultRotationTime(
 }
 
 export function findEligibleExaminersForSchool(input: {
+  schoolId?: string | null;
   schoolCity?: string | null;
   config: RotationConfig;
   examiners: RotationExaminerLike[];
@@ -460,7 +637,12 @@ export function findEligibleExaminersForSchool(input: {
 } {
   const today = input.today ?? businessDate();
   const cityId = resolveCityIdByName(input.schoolCity, input.cities);
-  if (!cityId) {
+  const schoolRef = { id: input.schoolId ?? null, city: input.schoolCity ?? null };
+  const hasSchoolBasedSelection = Boolean(
+    input.schoolId &&
+    input.examiners.some(ex => Array.isArray(ex.rotationAvailability?.schoolIds)),
+  );
+  if (!cityId && !hasSchoolBasedSelection) {
     return {
       cityId: null,
       eligible: [],
@@ -469,9 +651,8 @@ export function findEligibleExaminersForSchool(input: {
   }
   const configDays = new Set(input.config.days);
   const eligible = input.examiners.filter(ex => {
-    if (!ex.examRotation || ex.canExamCommon === false) return false;
-    const av = ex.rotationAvailability;
-    if (!av || !Array.isArray(av.cityIds) || !av.cityIds.includes(cityId)) return false;
+    if (!isExaminerEligibleForSchool(ex, schoolRef, input.cities)) return false;
+    const av = ex.rotationAvailability!;
     if (Array.isArray(av.availableDates)) {
       return getExaminerRotationTimesInWindow(ex, input.config, today).length > 0;
     }
@@ -482,7 +663,7 @@ export function findEligibleExaminersForSchool(input: {
     return {
       cityId,
       eligible: [],
-      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", cidade, datas e horários compatíveis.',
+      issue: 'Nenhum examinador elegível com "Participar do Rodízio de Provas", autoescola, datas e horários compatíveis.',
     };
   }
   return { cityId, eligible };
@@ -749,12 +930,13 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
   ).sort();
   const suppressedSet = new Set(cleanedSuppressed);
 
-  const cityId = resolveCityIdByName(input.schoolCity, input.cities);
+  const schoolRef = { id: input.currentSchoolId ?? null, city: input.schoolCity ?? null };
   const examinerMap = new Map(input.examiners.map(ex => [ex.id, ex]));
   const crossIndex = buildCrossSchoolUsageIndex(input.otherSchools, input.currentSchoolId, today);
   const hasOtherSchools = crossIndex.weekSchoolSets.size > 0;
 
   const baseEligibility = findEligibleExaminersForSchool({
+    schoolId: input.currentSchoolId,
     schoolCity: input.schoolCity,
     config: normalizedConfig,
     examiners: input.examiners,
@@ -763,7 +945,7 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
   });
 
   const listCandidatesForDate = (date: string): { examiner: RotationExaminerLike; time: string }[] => {
-    if (!cityId) return [];
+    if (baseEligibility.eligible.length === 0) return [];
     const weekday = scaleWeekday(date);
     if (!normalizedConfig.days.includes(weekday)) return [];
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
@@ -784,15 +966,12 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     const weekday = scaleWeekday(entry.date);
     if (!normalizedConfig.days.includes(weekday)) return false;
     if (isSystemDateBlockedForRotation(entry.date, blockedDates, input.systemSettings).blocked) return false;
-    if (!cityId) return false;
     const ex = examinerMap.get(entry.examiner);
-    if (!ex || !ex.examRotation || ex.canExamCommon === false) return false;
-    const av = ex.rotationAvailability;
-    if (!av || !av.cityIds?.includes(cityId)) return false;
-    const validTimes = getExaminerRotationTimesForDate(ex, entry.date, normalizedConfig);
+    if (!isExaminerEligibleForSchool(ex, schoolRef, input.cities)) return false;
+    const validTimes = getExaminerRotationTimesForDate(ex!, entry.date, normalizedConfig);
     const normalizedTime = normalizeScaleTime(entry.time);
     if (!validTimes.includes(normalizedTime)) return false;
-    if (isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, normalizedTime).blocked) return false;
+    if (isExaminerBlockedOnDateTime(ex!.blockedPeriods, entry.date, normalizedTime).blocked) return false;
     return true;
   };
 
@@ -913,7 +1092,6 @@ export function syncRollingRotationSchedule(input: SyncRotationScheduleInput): S
     const weekday = scaleWeekday(date);
     if (!normalizedConfig.days.includes(weekday)) continue;
     if (isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked) continue;
-    if (!cityId) continue;
 
     const candidates = listCandidatesForDate(date);
     if (candidates.length === 0) {
@@ -1057,7 +1235,6 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
   ).sort();
   const suppressedSet = new Set(cleanedSuppressed);
 
-  const cityId = resolveCityIdByName(input.schoolCity, input.cities);
   const examinerMap = new Map(input.examiners.map(ex => [ex.id, ex]));
   const crossIndex = buildCrossSchoolUsageIndex(input.otherSchools, input.currentSchoolId, today);
 
@@ -1078,6 +1255,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
 
   const coveredDates = new Set(manualEntries.map(e => e.date));
   const baseEligibility = findEligibleExaminersForSchool({
+    schoolId: input.currentSchoolId,
     schoolCity: input.schoolCity,
     config: normalizedConfig,
     examiners: input.examiners,
@@ -1096,7 +1274,7 @@ export function shuffleRotationSchedule(input: ShuffleRotationScheduleInput): Sy
     const weekday = scaleWeekday(date);
     if (!normalizedConfig.days.includes(weekday)) continue;
     if (isSystemDateBlockedForRotation(date, blockedDates, input.systemSettings).blocked) continue;
-    if (!cityId) continue;
+    if (baseEligibility.eligible.length === 0) continue;
 
     const candidates: { examiner: RotationExaminerLike; time: string }[] = [];
     for (const ex of baseEligibility.eligible) {
@@ -1285,6 +1463,7 @@ export function syncAllSchoolsRotationSchedules<TSchool extends OtherSchoolRotat
     .map(s => {
       const config = s.mainSchedule!.rotationConfig!;
       const eligibleCount = findEligibleExaminersForSchool({
+        schoolId: s.id,
         schoolCity: s.city,
         config,
         examiners: input.examiners,

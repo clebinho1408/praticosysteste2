@@ -1,6 +1,6 @@
 // functions/api/examiners.ts  →  GET|POST|PUT|DELETE /api/examiners
 import { getDb, json, error, parseBody, getQuery } from '../_db.js';
-import { examiners, blockedDates, systemSettings } from '../../db/schema.js';
+import { examiners, blockedDates, systemSettings, drivingSchools, cities } from '../../db/schema.js';
 import { eq, sql } from 'drizzle-orm';
 import { applyExaminerSelfRotationUpdate, sanitizeAdminExaminerRotationAvailability } from '../_examiner-self-rotation.js';
 
@@ -63,7 +63,7 @@ export const onRequest: PagesFunction<{ DATABASE_URL: string }> = async ({ reque
         }
         const res = await applyExaminerSelfRotationUpdate(
           db,
-          { examiners, blockedDates, systemSettings },
+          { examiners, blockedDates, systemSettings, drivingSchools, cities },
           sessionExaminerId,
           body.rotationAvailability,
         );

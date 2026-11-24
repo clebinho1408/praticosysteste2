@@ -14,7 +14,7 @@ import { mergePreservedAutoCnhBancaLinks, syncCnhRotationBancasOnDb } from "../.
 // @ts-ignore Shared examiner self-rotation and rotation capacity helpers.
 import { applyExaminerSelfRotationUpdate, sanitizeAdminExaminerRotationAvailability } from "../../../../functions/_examiner-self-rotation.js";
 // @ts-ignore Shared school rotation helpers.
-import { getExaminerMaxPerDayForDate, getExaminerRotationTimesForDate } from "../../../../functions/_school-rotation.js";
+import { getExaminerMaxPerDayForDate, getExaminerRotationTimesForDate, isExaminerEligibleForSchool } from "../../../../functions/_school-rotation.js";
 import { db } from "@workspace/db";
 import {
   users, drivingSchools, examiners, instructors, vehicles,
@@ -488,7 +488,7 @@ router.put("/examiners", async (req, res) => {
       }
       const result = await applyExaminerSelfRotationUpdate(
         db,
-        { examiners, blockedDates, systemSettings },
+        { examiners, blockedDates, systemSettings, drivingSchools, cities },
         sessionUser.examinerId,
         req.body.rotationAvailability,
       );
@@ -1387,13 +1387,7 @@ router.post("/schedule-slots", async (req, res) => {
           return res.status(409).json({ error: "Rodízio de Provas desativado para a autoescola; use os horários e examinadores da escala fixa." });
         }
       }
-      const targetCity = (school.city ?? "").trim().toUpperCase();
-      const city = school.examRotation && targetCity
-        ? (await db.select().from(cities)).find(c => c.name.trim().toUpperCase() === targetCity)
-        : null;
-      if (school.examRotation && !city) {
-        return res.status(409).json({ error: "Cidade da autoescola não cadastrada para o rodízio." });
-      }
+      const allCities = school.examRotation ? await db.select().from(cities) : [];
       const existing = await db.select().from(cfcScheduleSlots).where(and(
         eq(cfcScheduleSlots.schoolId, schoolId), eq(cfcScheduleSlots.scheduledDate, date),
         eq(cfcScheduleSlots.requestType, "FIXA")));
@@ -1417,8 +1411,7 @@ router.post("/schedule-slots", async (req, res) => {
             Boolean(availability?.days?.includes(day)) &&
             [1, 2].includes(availability?.examsPerDay as any);
           const explicitValid = usesExplicit && times.length > 0;
-          if (!examiner?.examRotation || examiner.canExamCommon === false ||
-            !availability?.cityIds?.includes(city!.id) ||
+          if (!isExaminerEligibleForSchool(examiner, school, allCities) ||
             (!legacyValid && !explicitValid) ||
             assigned.some((s: any) => !times.includes(s.scheduledTime))) {
             return res.status(409).json({ error: "Rodízio de Provas desativado ou disponibilidade incompatível para o examinador." });

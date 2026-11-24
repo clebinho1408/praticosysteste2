@@ -16,6 +16,8 @@ import {
   filterUpcomingExaminerRotationDates,
   isRotationDateSlotEditable,
   validateExaminerRotationDatesUpdate,
+  isExaminerEligibleForSchool,
+  resolveExaminerSchoolRotationConstraints,
   addCalendarDays,
 } from '../functions/_school-rotation.js';
 import {
@@ -1210,6 +1212,148 @@ test('school rotation & fixed scale planning work with examiner explicit availab
   assert.equal(planned.issues.length, 0);
   assert.equal(planned.plans[0].slots[0].examinerId, 'ex-mobile');
   assert.equal(planned.plans[0].slots[0].scheduledTime, '15:00');
+});
+
+test('schoolIds eligibility matches only selected rotation schools and ignores city-only legacy fallback once schoolIds is set', () => {
+  const schoolA = { id: 'sch-a', name: 'AUTOESCOLA A', city: 'ITAPEMA', examRotation: true };
+  const schoolB = { id: 'sch-b', name: 'AUTOESCOLA B', city: 'ITAPEMA', examRotation: true };
+  const schoolNoCity = { id: 'sch-nc', name: 'SEM CIDADE', city: '', examRotation: true };
+
+  const exBySchool = makeExaminer('ex-sch', {
+    rotationAvailability: {
+      schoolIds: ['sch-a', 'sch-nc'],
+      cityIds: ['c1'],
+      availableDates: [{ id: 'd1', date: '2026-11-23', time: '10:00', createdAt: '2026-11-22T10:00:00Z' }],
+    },
+  });
+
+  assert.equal(isExaminerEligibleForSchool(exBySchool, schoolA, cities), true);
+  assert.equal(isExaminerEligibleForSchool(exBySchool, schoolB, cities), false);
+  assert.equal(isExaminerEligibleForSchool(exBySchool, schoolNoCity, cities), true);
+
+  const eligA = findEligibleExaminersForSchool({
+    schoolId: 'sch-a',
+    schoolCity: 'ITAPEMA',
+    config: { days: ['SEG'], startTime: '08:00', endTime: '12:00' },
+    examiners: [exBySchool],
+    cities,
+    today: '2026-11-23',
+  });
+  assert.deepEqual(eligA.eligible.map(e => e.id), ['ex-sch']);
+
+  const eligB = findEligibleExaminersForSchool({
+    schoolId: 'sch-b',
+    schoolCity: 'ITAPEMA',
+    config: { days: ['SEG'], startTime: '08:00', endTime: '12:00' },
+    examiners: [exBySchool],
+    cities,
+    today: '2026-11-23',
+  });
+  assert.equal(eligB.eligible.length, 0);
+});
+
+test('resolveExaminerSchoolRotationConstraints and validateExaminerRotationDatesUpdate enforce selected schools Configurar Escala Rodízio days and hours', () => {
+  const now = new Date('2026-11-23T12:00:00Z'); // Segunda
+  const today = '2026-11-23';
+  const schools = [
+    {
+      id: 'sch-seg',
+      name: 'CFC SEGUNDA',
+      city: 'ITAPEMA',
+      examRotation: true,
+      mainSchedule: { active: true, rotationConfig: { days: ['SEG'], startTime: '08:00', endTime: '12:00' } },
+    },
+    {
+      id: 'sch-qua',
+      name: 'CFC QUARTA',
+      city: 'TIJUCAS',
+      examRotation: true,
+      mainSchedule: { active: true, rotationConfig: { days: ['QUA'], startTime: '14:00', endTime: '18:00' } },
+    },
+    {
+      id: 'sch-unselected',
+      name: 'CFC SEXTA',
+      city: 'ITAPEMA',
+      examRotation: true,
+      mainSchedule: { active: true, rotationConfig: { days: ['SEX'], startTime: '08:00', endTime: '18:00' } },
+    },
+    {
+      id: 'sch-non-rot',
+      name: 'CFC FIXA',
+      city: 'ITAPEMA',
+      examRotation: false,
+      mainSchedule: { active: true, rotationConfig: { days: ['TER'], startTime: '08:00', endTime: '18:00' } },
+    },
+  ];
+
+  // Sem autoescola selecionada → bloqueia inclusão
+  const noSelection = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 'n1', date: '2026-11-30', time: '09:00', createdAt: now.toISOString() }],
+    examinerSchoolIds: [],
+    schools,
+    cities,
+    today,
+    now,
+  });
+  assert.equal(noSelection.ok, false);
+
+  const constraints = resolveExaminerSchoolRotationConstraints({
+    examinerSchoolIds: ['sch-seg', 'sch-qua', 'sch-non-rot'],
+    schools,
+    cities,
+  });
+  assert.deepEqual(constraints.allowedDays, ['SEG', 'QUA']);
+  assert.deepEqual(constraints.allowedJsWeekdays, [1, 3]);
+  assert.equal(constraints.timeBoundsForDate('2026-11-30').minTime, '08:00');
+  assert.equal(constraints.timeBoundsForDate('2026-11-30').maxTime, '12:00');
+  assert.equal(constraints.timeBoundsForDate('2026-12-02').minTime, '14:00');
+  assert.equal(constraints.timeBoundsForDate('2026-12-02').maxTime, '18:00');
+
+  // Rejeita dia da semana de autoescola não selecionada (SEXTA) ou não-rodízio (TERÇA)
+  const wrongDay = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 'w1', date: '2026-11-27', time: '10:00', createdAt: now.toISOString() }], // sexta
+    examinerSchoolIds: ['sch-seg', 'sch-qua'],
+    schools,
+    cities,
+    today,
+    now,
+  });
+  assert.equal(wrongDay.ok, false);
+
+  // Rejeita horário fora da janela específica da segunda-feira (15:00 pertence só à quarta!)
+  const wrongTimeForMonday = validateExaminerRotationDatesUpdate({
+    existingSlots: [],
+    nextSlots: [{ id: 'w2', date: '2026-11-30', time: '15:00', createdAt: now.toISOString() }], // segunda
+    examinerSchoolIds: ['sch-seg', 'sch-qua'],
+    schools,
+    cities,
+    today,
+    now,
+  });
+  assert.equal(wrongTimeForMonday.ok, false);
+
+  // Aceita datas e horários dentro das respectivas janelas de cada escola e preserva slot >48h já gravado
+  const over48h = new Date(now.getTime() - 50 * 3600 * 1000).toISOString();
+  const lockedHistorical = { id: 'old-locked', date: '2026-11-27', time: '10:00', createdAt: over48h };
+  const validSave = validateExaminerRotationDatesUpdate({
+    existingSlots: [lockedHistorical],
+    nextSlots: [
+      lockedHistorical,
+      { id: 'ok-seg', date: '2026-11-30', time: '09:30', createdAt: now.toISOString() },
+      { id: 'ok-qua', date: '2026-12-02', time: '16:00', createdAt: now.toISOString() },
+    ],
+    examinerSchoolIds: ['sch-seg', 'sch-qua'],
+    schools,
+    cities,
+    today,
+    now,
+  });
+  assert.equal(validSave.ok, true);
+  if (validSave.ok) {
+    assert.equal(validSave.availableDates.length, 3);
+  }
 });
 
 
