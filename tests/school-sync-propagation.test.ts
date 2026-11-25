@@ -15,6 +15,7 @@ import {
   findSchoolsSchedulingExaminerRotationSlot,
   getExaminerAvailableSlotStatus,
   removeExaminerAvailableDateSlot,
+  resolveExaminerAvailableTimeForSelectedDate,
   syncAllSchoolsRotationSchedules,
   updateExaminerAvailableDateSlot,
 } from '../functions/_school-rotation.js';
@@ -626,4 +627,49 @@ test('removeExaminerAvailableDateSlot and sanitizeAdminExaminerRotationAvailabil
     'Agendado',
   );
 });
+
+test('resolveExaminerAvailableTimeForSelectedDate returns examiner available time only when selected date matches availableDates', () => {
+  const config = { days: ['TER', 'QUI'], startTime: '08:00', endTime: '12:00' };
+  const examiner = {
+    id: 'ex-time-1',
+    name: 'EXAMINADOR HORARIO',
+    examRotation: true,
+    blockedPeriods: [
+      { id: 'bp1', startDate: '2026-12-03', endDate: '2026-12-03', period: 'MORNING' },
+    ],
+    rotationAvailability: {
+      schoolIds: ['school-1'],
+      availableDates: [
+        { id: 's1', date: '2026-12-01', time: '9:15', createdAt: '2026-11-24T10:00:00Z' },
+        { id: 's2', date: '2026-12-03', time: '09:00', createdAt: '2026-11-24T10:00:00Z' },
+        { id: 's3', date: '2026-12-03', time: '14:30', createdAt: '2026-11-24T10:00:00Z' },
+      ],
+    },
+  };
+
+  // Matching exact date returns normalized time
+  assert.equal(
+    resolveExaminerAvailableTimeForSelectedDate({ examiner, date: '2026-12-01', config }),
+    '09:15',
+  );
+
+  // Morning blocked on 2026-12-03 -> skips 09:00 and picks unblocked 14:30
+  assert.equal(
+    resolveExaminerAvailableTimeForSelectedDate({ examiner, date: '2026-12-03', config }),
+    '14:30',
+  );
+
+  // Date not in examiner availableDates -> null (must not steal another date's time)
+  assert.equal(
+    resolveExaminerAvailableTimeForSelectedDate({ examiner, date: '2026-12-08', config }),
+    null,
+  );
+
+  // Empty/invalid date -> null
+  assert.equal(
+    resolveExaminerAvailableTimeForSelectedDate({ examiner, date: '', config }),
+    null,
+  );
+});
+
 

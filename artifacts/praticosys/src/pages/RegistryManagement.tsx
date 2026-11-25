@@ -5,7 +5,7 @@ import { User, UserRole, OperatorModule, DrivingSchool, SchoolYard, SchoolYardTy
 import { isDateBlocked, canPauseScheduleOn } from '../lib/dateBlocking';
 import DatePicker from '../components/DatePicker';
 import { businessDate, visibleProvisionalDates, matchesSchoolScale, SchoolScaleFilter, isCalendarDate, scaleWeekday, normalizeScaleTime, isValidScaleTime } from '../../../../functions/_school-schedule';
-import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerDefaultRotationTime, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, updateExaminerAvailableDateSlot, removeExaminerAvailableDateSlot, findSchoolsSchedulingExaminerRotationSlot, getExaminerAvailableSlotStatus, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
+import { syncRollingRotationSchedule, syncAllSchoolsRotationSchedules, findCrossSchoolWeeklyRepeats, filterUpcomingRotationNext7Days, findEligibleExaminersForSchool, isExaminerEligibleForSchool, isExaminerBlockedOnDateTime, isSystemDateBlockedForRotation, isTimeWithinWindow, formatRotationDateBR, resolveExaminerAvailableTimeForSelectedDate, resolveCityIdByName, buildExaminerUpcomingSchedules, formatExaminerUpcomingSchedulesWhatsApp, filterUpcomingExaminerRotationDates, updateExaminerAvailableDateSlot, removeExaminerAvailableDateSlot, findSchoolsSchedulingExaminerRotationSlot, getExaminerAvailableSlotStatus, ExaminerScheduleSlotLike, ExaminerExamRequestLike, ExaminerCnhScheduleLike } from '../../../../functions/_school-rotation';
 import { YARD_TYPES, YARD_TYPE_LABEL, effectiveYards } from '../../../../functions/_school-yards';
 import { Plus, Edit2, Trash2, Search, Building2, Users, GraduationCap, Save, Lock, Car, User as UserIcon, Bike, CheckCircle2, XCircle, MapPin, X, Pencil, Copy, Check, RefreshCw, AlertTriangle, Calendar } from 'lucide-react';
 import { AlertModal, ConfirmModal } from '../components/CustomModals';
@@ -857,6 +857,12 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
     setSystemSettings(settingsData);
   };
   useEffect(() => { fetch(); }, []);
+  useEffect(() => {
+    if (!isModalOpen || modalTab !== 'RODIZIOS') return;
+    api.getExaminersAsync().then(fresh => {
+      if (Array.isArray(fresh)) setExaminers(fresh);
+    }).catch(() => {});
+  }, [isModalOpen, modalTab]);
 
   const computeDistributionSummary = (
     entries: RotationScheduleEntry[],
@@ -2174,7 +2180,7 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                       <div>
                         <label className="block text-sm font-medium">E-mail</label>
-                        <input type="email" className="w-full border rounded p-2 bg-white text-gray-900" value={formData.email} onChange={e => setFormData({...formData, email: formatEmail(e.target.value)})} />
+                        <input type="email" className="w-full border rounded p-2 bg-white text-gray-900" value={formData.email ?? ''} onChange={e => setFormData({...formData, email: formatEmail(e.target.value)})} />
                       </div>
                       <div>
                         <label className="block text-sm font-medium">Endereço</label>
@@ -2200,6 +2206,18 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                           ))}
                         </select>
                       </div>
+                    </div>
+                    <div className="rounded border bg-gray-50 p-4">
+                      <label className="flex items-center gap-3 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={formData.cnhBrasilProfile ?? false}
+                          onChange={e => setFormData({ ...formData, cnhBrasilProfile: e.target.checked })}
+                          className="w-4 h-4 text-blue-600"
+                        />
+                        <span className="text-sm font-medium">Perfil CNH do Brasil</span>
+                      </label>
+                      <p className="text-xs text-gray-500 mt-1 ml-7">Quando ativado, esta autoescola utiliza o perfil CNH do Brasil para agendamentos.</p>
                     </div>
                   </div>
                 )}
@@ -2411,9 +2429,15 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                       const updated: RotationScheduleEntry = { ...entry, [field]: value, manual: true };
                       if (field === 'examiner') {
                         const ex = examiners.find(e => e.id === value);
-                        const defaultTime = ex ? resolveExaminerDefaultRotationTime(ex, rotationConfig, updated.date) : null;
-                        if (defaultTime) {
-                          updated.time = defaultTime;
+                        const availableTime = ex
+                          ? resolveExaminerAvailableTimeForSelectedDate({
+                              examiner: ex,
+                              date: updated.date,
+                              config: rotationConfig,
+                            })
+                          : null;
+                        if (availableTime) {
+                          updated.time = availableTime;
                         }
                       } else if (field === 'date' || field === 'time') {
                         const ex = examiners.find(e => e.id === updated.examiner);
@@ -2670,8 +2694,13 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                                             cities,
                                           ))
                                           .map(ex => {
+                                            const candidateTime = resolveExaminerAvailableTimeForSelectedDate({
+                                              examiner: ex,
+                                              date: entry.date,
+                                              config: rotationConfig,
+                                            }) ?? entry.time;
                                             const blk = entry.date
-                                              ? isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, entry.time)
+                                              ? isExaminerBlockedOnDateTime(ex.blockedPeriods, entry.date, candidateTime)
                                               : { blocked: false };
                                             return (
                                               <option key={ex.id} value={ex.id} disabled={blk.blocked}>
@@ -2711,19 +2740,6 @@ const SchoolsManager: React.FC<{ user: User }> = ({ user }) => {
                           )}
                         </div>
                       )}
-
-                      <div className="rounded border bg-gray-50 p-4">
-                        <label className="flex items-center gap-3 cursor-pointer">
-                          <input
-                            type="checkbox"
-                            checked={formData.cnhBrasilProfile ?? false}
-                            onChange={e => setFormData({ ...formData, cnhBrasilProfile: e.target.checked })}
-                            className="w-4 h-4 text-blue-600"
-                          />
-                          <span className="text-sm font-medium">Perfil CNH do Brasil</span>
-                        </label>
-                        <p className="text-xs text-gray-500 mt-1 ml-7">Quando ativado, esta autoescola utiliza o perfil CNH do Brasil para agendamentos.</p>
-                      </div>
                     </div>
                   );
                 })()}

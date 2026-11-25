@@ -635,6 +635,43 @@ export function resolveExaminerDefaultRotationTime(
   return pool[0];
 }
 
+export function resolveExaminerAvailableTimeForSelectedDate(input: {
+  examiner: RotationExaminerLike | null | undefined;
+  date: string | null | undefined;
+  config?: RotationConfig | null;
+}): string | null {
+  const av = input.examiner?.rotationAvailability;
+  const cleanDate = String(input.date ?? '').split('T')[0].trim();
+  if (!av || !Array.isArray(av.availableDates) || !isCalendarDate(cleanDate)) {
+    return null;
+  }
+
+  const matchingTimes = Array.from(
+    new Set(
+      av.availableDates
+        .filter(slot => slot && String(slot.date ?? '').split('T')[0].trim() === cleanDate)
+        .map(slot => normalizeScaleTime(slot.time))
+        .filter(isValidScaleTime),
+    ),
+  ).sort();
+
+  if (matchingTimes.length === 0) return null;
+
+  const unblocked = matchingTimes.filter(
+    t => !isExaminerBlockedOnDateTime(input.examiner?.blockedPeriods, cleanDate, t).blocked,
+  );
+  const candidates = unblocked.length > 0 ? unblocked : matchingTimes;
+
+  const startTime = normalizeScaleTime(input.config?.startTime);
+  const endTime = normalizeScaleTime(input.config?.endTime);
+  if (input.config && isValidScaleTime(startTime) && isValidScaleTime(endTime)) {
+    const inWindow = candidates.filter(t => isTimeWithinWindow(t, startTime, endTime));
+    if (inWindow.length > 0) return inWindow[0];
+  }
+
+  return candidates[0];
+}
+
 export function findEligibleExaminersForSchool(input: {
   schoolId?: string | null;
   schoolCity?: string | null;
